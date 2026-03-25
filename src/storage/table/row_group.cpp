@@ -9,6 +9,9 @@
 #include "duckdb/execution/adaptive_filter.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/filter/tablefilter_internal_functions.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/storage/checkpoint/table_data_writer.hpp"
 #include "duckdb/storage/metadata/metadata_reader.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
@@ -526,7 +529,10 @@ bool RowGroup::CheckZonemap(ScanFilterInfo &filters) {
 		if (prune_result == FilterPropagateResult::FILTER_ALWAYS_FALSE) {
 			return false;
 		}
-		if (filter.filter_type == TableFilterType::OPTIONAL_FILTER) {
+		if (filter.filter_type == TableFilterType::OPTIONAL_FILTER ||
+		    (filter.filter_type == TableFilterType::EXPRESSION_FILTER &&
+		     filter.Cast<ExpressionFilter>().expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+		     filter.Cast<ExpressionFilter>().expr->Cast<BoundFunctionExpression>().function.name == OptionalFilterScalarFun::NAME)) {
 			// these are only for row group checking, set as always true so we don't check it
 			filters.SetFilterAlwaysTrue(i);
 		} else if (prune_result == FilterPropagateResult::FILTER_ALWAYS_TRUE) {
@@ -569,7 +575,9 @@ bool RowGroup::CheckZonemapSegments(CollectionScanState &state) {
 		}
 		D_ASSERT(target_row >= row_start);
 		D_ASSERT(target_row <= row_start + this->count);
-		idx_t target_vector_index = (target_row - row_start) / STANDARD_VECTOR_SIZE;
+		// target_vector_index must be row-group-relative (same coordinate space as state.vector_index)
+//		idx_t target_vector_index = (target_row - row_start) / STANDARD_VECTOR_SIZE;
+		idx_t target_vector_index = target_row / STANDARD_VECTOR_SIZE;
 
 		if (!target_vector_index_max.IsValid() || target_vector_index_max.GetIndex() < target_vector_index) {
 			target_vector_index_max = target_vector_index;
