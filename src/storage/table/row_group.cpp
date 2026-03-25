@@ -10,8 +10,6 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
-#include "duckdb/planner/filter/tablefilter_internal_functions.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/storage/checkpoint/table_data_writer.hpp"
 #include "duckdb/storage/metadata/metadata_reader.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
@@ -529,10 +527,7 @@ bool RowGroup::CheckZonemap(ScanFilterInfo &filters) {
 		if (prune_result == FilterPropagateResult::FILTER_ALWAYS_FALSE) {
 			return false;
 		}
-		if (filter.filter_type == TableFilterType::OPTIONAL_FILTER ||
-		    (filter.filter_type == TableFilterType::EXPRESSION_FILTER &&
-		     filter.Cast<ExpressionFilter>().expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
-		     filter.Cast<ExpressionFilter>().expr->Cast<BoundFunctionExpression>().function.name == OptionalFilterScalarFun::NAME)) {
+		if (ExpressionFilter::IsOptionalFilter(filter)) {
 			// these are only for row group checking, set as always true so we don't check it
 			filters.SetFilterAlwaysTrue(i);
 		} else if (prune_result == FilterPropagateResult::FILTER_ALWAYS_TRUE) {
