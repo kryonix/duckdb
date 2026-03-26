@@ -1419,7 +1419,7 @@ AsyncResult ParquetReader::Scan(ClientContext &context, ParquetReaderScanState &
 					// check if any filter is non-optional
 					bool has_non_optional_filter = false;
 					for (auto &entry : *filters) {
-						if (entry.Filter().filter_type != TableFilterType::OPTIONAL_FILTER) {
+						if (!ExpressionFilter::IsRootOptionalFilter(entry.Filter())) {
 							has_non_optional_filter = true;
 						}
 					}
@@ -1436,7 +1436,7 @@ AsyncResult ParquetReader::Scan(ClientContext &context, ParquetReaderScanState &
 					bool has_filter = false;
 					if (filters) {
 						auto filter = filters->TryGetFilterByColumnIndex(col_idx);
-						if (filter && filter->filter_type != TableFilterType::OPTIONAL_FILTER) {
+						if (filter && !ExpressionFilter::IsRootOptionalFilter(*filter)) {
 							has_filter = true;
 						}
 					}
