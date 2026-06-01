@@ -184,6 +184,10 @@ enum class DestroyBufferUpon : uint8_t;
 
 enum class DistinctType : uint8_t;
 
+enum class DuckPLParseDefinitionType : uint8_t;
+
+enum class DuckPLParseStatementType : uint8_t;
+
 enum class ErrorType : uint16_t;
 
 enum class ExceptionFormatValueType : uint8_t;
@@ -772,6 +776,12 @@ const char* EnumUtil::ToChars<DestroyBufferUpon>(DestroyBufferUpon value);
 
 template<>
 const char* EnumUtil::ToChars<DistinctType>(DistinctType value);
+
+template<>
+const char* EnumUtil::ToChars<DuckPLParseDefinitionType>(DuckPLParseDefinitionType value);
+
+template<>
+const char* EnumUtil::ToChars<DuckPLParseStatementType>(DuckPLParseStatementType value);
 
 template<>
 const char* EnumUtil::ToChars<ErrorType>(ErrorType value);
@@ -1541,6 +1551,12 @@ DestroyBufferUpon EnumUtil::FromString<DestroyBufferUpon>(const char *value);
 
 template<>
 DistinctType EnumUtil::FromString<DistinctType>(const char *value);
+
+template<>
+DuckPLParseDefinitionType EnumUtil::FromString<DuckPLParseDefinitionType>(const char *value);
+
+template<>
+DuckPLParseStatementType EnumUtil::FromString<DuckPLParseStatementType>(const char *value);
 
 template<>
 ErrorType EnumUtil::FromString<ErrorType>(const char *value);

@@ -11,6 +11,7 @@ add_library_unity(
   detach_statement.cpp
   disconnect_statement.cpp
   delete_statement.cpp
+  duckpl_script_statement.cpp
   drop_statement.cpp
   execute_statement.cpp
   explain_statement.cpp
