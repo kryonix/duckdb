@@ -17,6 +17,7 @@ add_library_unity(
   create_collation_info.cpp
   create_coordinate_system_info.cpp
   create_copy_function_info.cpp
+  create_duckpl_function_info.cpp
   create_macro_info.cpp
   create_pragma_function_info.cpp
   create_secret_info.cpp

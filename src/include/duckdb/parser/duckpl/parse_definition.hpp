@@ -9,7 +9,7 @@
 #pragma once
 
 #include "duckdb/common/types.hpp"
-#include "duckdb/parser/function_parameter.hpp"
+#include "duckdb/parser/peg/ast/macro_parameter.hpp"
 #include "duckdb/parser/duckpl/parse_statement.hpp"
 
 namespace duckdb {
@@ -32,7 +32,7 @@ public:
 	static constexpr DuckPLParseDefinitionType TYPE = DuckPLParseDefinitionType::FUNCTION;
 
 public:
-	explicit DuckPLFunctionDefinition(string name_p, vector<FunctionParameter> parameters_p, bool returns_table_p,
+	explicit DuckPLFunctionDefinition(string name_p, vector<MacroParameter> parameters_p, bool returns_table_p,
 	                                  LogicalType return_type_p, unique_ptr<DuckPLBlockStatement> body_p,
 	                                  optional_idx location_p = optional_idx())
 	    : DuckPLParseDefinition(TYPE, location_p), name(std::move(name_p)), parameters(std::move(parameters_p)),
@@ -41,7 +41,7 @@ public:
 
 public:
 	string name;
-	vector<FunctionParameter> parameters;
+	vector<MacroParameter> parameters;
 	bool returns_table;
 	LogicalType return_type;
 	unique_ptr<DuckPLBlockStatement> body;
