@@ -81,6 +81,7 @@ SQLStatement:
     - CommitTransaction
     - RollbackTransaction
     - TriggerBody
+    - DuckPLScriptStatement
     - UpdateStatement
     - UseStatement
     - VacuumStatement
@@ -146,6 +147,7 @@ CreateStatement:
     - CreateSecretStmt
     - CreateSequenceStmt
     - CreateStatementVariation
+    - CreateFunctionStmt
     - CreateTableStmt
     - CreateIndexStmt
     - CreateMacroStmt
@@ -216,9 +218,26 @@ MacroFunction:
   type: "unique_ptr<MacroFunction>"
   by_value: true
   rules:
-    - MacroDefinition
     - TableMacroDefinition
     - ScalarMacroDefinition
+
+CreateRoutineDefinition:
+  type: "CreateRoutineDefinition"
+  by_value: true
+  rules:
+    - MacroDefinition
+    - DuckPLFunctionDefinition
+    - LegacyMacroFunctionDefinition
+    - LegacyTableMacroFunctionDefinition
+    - LegacyScalarMacroFunctionDefinition
+
+CreateRoutineDefinitionList:
+  type: "vector<CreateRoutineDefinition>"
+  by_value: true
+  rules:
+    - FunctionCreateDefinition
+    - DuckPLFunctionDefinitions
+    - LegacyMacroFunctionDefinitions
 
 OnConflictInfo:
   type: "unique_ptr<OnConflictInfo>"
@@ -437,6 +456,9 @@ Expression:
     - IndexElement
     - RelOptionArgumentOpt
     - ExpressionAlias
+    - DuckPLDeclarationDefault
+    - DuckPLForStepClause
+    - DuckPLWhenClause
 
 ColumnRefExpression:
   type: "unique_ptr<ColumnRefExpression>"
@@ -545,9 +567,12 @@ OrderByNodeList:
 
 MacroParameterList:
   type: "vector<MacroParameter>"
-  by_value: false
+  by_value: true
   rules:
     - MacroParameters
+    - DuckPLFunctionParameters
+    - DuckPLNonEmptyFunctionParameters
+    - EmptyDuckPLFunctionParameters
 
 StringList:
   type: "vector<string>"
@@ -850,6 +875,10 @@ String:
     - ExplainOptionAnalyze
     - DropNullability
     - SetNullability
+    - DuckPLLanguageSpec
+    - DuckPLLanguage
+    - DuckPLDuckLanguage
+    - DuckPLPlpgsqlLanguage
 
 Bool:
   type: "bool"
@@ -879,6 +908,7 @@ Bool:
     - DeallocatePrepare
     - CreateRecursive
     - ExplainAnalyze
+    - DuckPLReverse
 
 
 Int64:
@@ -894,6 +924,64 @@ LogicalType:
   rules:
     - Type
     - EnumStringLiteralList
+    - DuckPLReturns
+
+DuckPLScriptDefinition:
+  type: "shared_ptr<DuckPLScriptDefinition>"
+  rules:
+    - DuckPLWrappedDefinition
+
+DuckPLBlockStatement:
+  type: "unique_ptr<DuckPLBlockStatement>"
+  by_value: true
+  rules:
+    - DuckPLWrappedBody
+    - DuckPLStatements
+    - DuckPLCompoundRecursive
+    - DuckPLSimpleRecursive
+    - DuckPLCompoundTerminal
+    - DuckPLSimpleTerminal
+    - DuckPLBeginEndBlock
+    - DuckPLBraceBlock
+    - DuckPLClassicElseClause
+    - DuckPLBraceElseClause
+
+DuckPLParseStatement:
+  type: "unique_ptr<DuckPLParseStatement>"
+  by_value: true
+  rules:
+    - DuckPLDeclaration
+    - DuckPLCompoundStatement
+    - DuckPLSimpleStatement
+    - DuckPLAssignment
+    - DuckPLReturn
+    - DuckPLReturnNext
+    - DuckPLReturnQuery
+    - DuckPLReturnExpr
+    - DuckPLIf
+    - DuckPLIfClassic
+    - DuckPLIfBrace
+    - DuckPLLoop
+    - DuckPLLoopClassic
+    - DuckPLLoopBrace
+    - DuckPLWhile
+    - DuckPLWhileClassic
+    - DuckPLWhileBrace
+    - DuckPLFor
+    - DuckPLForClassic
+    - DuckPLForBrace
+    - DuckPLForeach
+    - DuckPLForeachClassic
+    - DuckPLForeachBrace
+    - DuckPLContinue
+    - DuckPLExit
+
+DuckPLIfBranch:
+  type: "DuckPLIfBranch"
+  by_value: true
+  rules:
+    - DuckPLClassicElseIfClause
+    - DuckPLBraceElseIfClause
 
 LogicalTypeList:
   type: "vector<LogicalType>"

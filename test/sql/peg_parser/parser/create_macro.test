@@ -1,5 +1,5 @@
 # name: test/sql/peg_parser/parser/create_macro.test
-# description: Test create table syntax in peg parser
+# description: Test create macro syntax in peg parser
 # group: [parser]
 
 require autocomplete
@@ -12,4 +12,3 @@ CALL check_peg_parser($TEST_PEG_PARSER$create macro m(s varchar) as s || 'c'$TES
 
 statement ok
 CALL check_peg_parser($TEST_PEG_PARSER$create or replace macro m(s varchar := 'cc') as s || 'c'$TEST_PEG_PARSER$);
-

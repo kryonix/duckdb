@@ -161,6 +161,7 @@
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include "duckdb/parallel/task.hpp"
 #include "duckdb/parser/constraint.hpp"
+#include "duckdb/parser/duckpl/parse_node.hpp"
 #include "duckdb/parser/expression/lambda_expression.hpp"
 #include "duckdb/parser/expression/parameter_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
@@ -1766,6 +1767,54 @@ const char* EnumUtil::ToChars<DistinctType>(DistinctType value) {
 template<>
 DistinctType EnumUtil::FromString<DistinctType>(const char *value) {
 	return static_cast<DistinctType>(StringUtil::StringToEnum(GetDistinctTypeValues(), 2, "DistinctType", value));
+}
+
+const StringUtil::EnumStringLiteral *GetDuckPLParseDefinitionTypeValues() {
+	static constexpr StringUtil::EnumStringLiteral values[] {
+		{ static_cast<uint32_t>(DuckPLParseDefinitionType::SCRIPT), "SCRIPT" },
+		{ static_cast<uint32_t>(DuckPLParseDefinitionType::FUNCTION), "FUNCTION" }
+	};
+	return values;
+}
+
+template<>
+const char* EnumUtil::ToChars<DuckPLParseDefinitionType>(DuckPLParseDefinitionType value) {
+	return StringUtil::EnumToString(GetDuckPLParseDefinitionTypeValues(), 2, "DuckPLParseDefinitionType", static_cast<uint32_t>(value));
+}
+
+template<>
+DuckPLParseDefinitionType EnumUtil::FromString<DuckPLParseDefinitionType>(const char *value) {
+	return static_cast<DuckPLParseDefinitionType>(StringUtil::StringToEnum(GetDuckPLParseDefinitionTypeValues(), 2, "DuckPLParseDefinitionType", value));
+}
+
+const StringUtil::EnumStringLiteral *GetDuckPLParseStatementTypeValues() {
+	static constexpr StringUtil::EnumStringLiteral values[] {
+		{ static_cast<uint32_t>(DuckPLParseStatementType::INVALID), "INVALID" },
+		{ static_cast<uint32_t>(DuckPLParseStatementType::BLOCK), "BLOCK" },
+		{ static_cast<uint32_t>(DuckPLParseStatementType::DECLARE), "DECLARE" },
+		{ static_cast<uint32_t>(DuckPLParseStatementType::ASSIGNMENT), "ASSIGNMENT" },
+		{ static_cast<uint32_t>(DuckPLParseStatementType::RETURN), "RETURN" },
+		{ static_cast<uint32_t>(DuckPLParseStatementType::RETURN_NEXT), "RETURN_NEXT" },
+		{ static_cast<uint32_t>(DuckPLParseStatementType::RETURN_QUERY), "RETURN_QUERY" },
+		{ static_cast<uint32_t>(DuckPLParseStatementType::IF), "IF" },
+		{ static_cast<uint32_t>(DuckPLParseStatementType::LOOP), "LOOP" },
+		{ static_cast<uint32_t>(DuckPLParseStatementType::WHILE), "WHILE" },
+		{ static_cast<uint32_t>(DuckPLParseStatementType::FOR), "FOR" },
+		{ static_cast<uint32_t>(DuckPLParseStatementType::FOREACH), "FOREACH" },
+		{ static_cast<uint32_t>(DuckPLParseStatementType::CONTINUE), "CONTINUE" },
+		{ static_cast<uint32_t>(DuckPLParseStatementType::EXIT), "EXIT" }
+	};
+	return values;
+}
+
+template<>
+const char* EnumUtil::ToChars<DuckPLParseStatementType>(DuckPLParseStatementType value) {
+	return StringUtil::EnumToString(GetDuckPLParseStatementTypeValues(), 14, "DuckPLParseStatementType", static_cast<uint32_t>(value));
+}
+
+template<>
+DuckPLParseStatementType EnumUtil::FromString<DuckPLParseStatementType>(const char *value) {
+	return static_cast<DuckPLParseStatementType>(StringUtil::StringToEnum(GetDuckPLParseStatementTypeValues(), 14, "DuckPLParseStatementType", value));
 }
 
 const StringUtil::EnumStringLiteral *GetErrorTypeValues() {
@@ -5039,6 +5088,7 @@ const StringUtil::EnumStringLiteral *GetStatementTypeValues() {
 		{ static_cast<uint32_t>(StatementType::LOAD_STATEMENT), "LOAD_STATEMENT" },
 		{ static_cast<uint32_t>(StatementType::RELATION_STATEMENT), "RELATION_STATEMENT" },
 		{ static_cast<uint32_t>(StatementType::EXTENSION_STATEMENT), "EXTENSION_STATEMENT" },
+		{ static_cast<uint32_t>(StatementType::DUCKPL_STATEMENT), "DUCKPL_STATEMENT" },
 		{ static_cast<uint32_t>(StatementType::LOGICAL_PLAN_STATEMENT), "LOGICAL_PLAN_STATEMENT" },
 		{ static_cast<uint32_t>(StatementType::ATTACH_STATEMENT), "ATTACH_STATEMENT" },
 		{ static_cast<uint32_t>(StatementType::DETACH_STATEMENT), "DETACH_STATEMENT" },
@@ -5054,12 +5104,12 @@ const StringUtil::EnumStringLiteral *GetStatementTypeValues() {
 
 template<>
 const char* EnumUtil::ToChars<StatementType>(StatementType value) {
-	return StringUtil::EnumToString(GetStatementTypeValues(), 33, "StatementType", static_cast<uint32_t>(value));
+	return StringUtil::EnumToString(GetStatementTypeValues(), 34, "StatementType", static_cast<uint32_t>(value));
 }
 
 template<>
 StatementType EnumUtil::FromString<StatementType>(const char *value) {
-	return static_cast<StatementType>(StringUtil::StringToEnum(GetStatementTypeValues(), 33, "StatementType", value));
+	return static_cast<StatementType>(StringUtil::StringToEnum(GetStatementTypeValues(), 34, "StatementType", value));
 }
 
 const StringUtil::EnumStringLiteral *GetStatisticsTypeValues() {

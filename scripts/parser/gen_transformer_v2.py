@@ -1085,6 +1085,7 @@ def main():
         # 'copy.gram',
         # 'create_index.gram',
         # 'create_macro.gram',
+        'create_function.gram',
         'create_schema.gram',
         'create_secret.gram',
         # 'create_sequence.gram',

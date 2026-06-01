@@ -230,6 +230,10 @@ void PEGTransformerFactory::RegisterCreateIndex() {
 	REGISTER_TRANSFORM(TransformIndexName);
 }
 
+void PEGTransformerFactory::RegisterCreateFunction() {
+	// create_function.gram is registered through RegisterGenerated().
+}
+
 void PEGTransformerFactory::RegisterCreateMacro() {
 	// create_macro.gram
 	REGISTER_TRANSFORM(TransformCreateMacroStmt);
@@ -907,6 +911,7 @@ PEGTransformerFactory::PEGTransformerFactory() {
 	RegisterComment();
 	RegisterCommon();
 	RegisterCopy();
+	RegisterCreateFunction();
 	RegisterCreateIndex();
 	RegisterCreateMacro();
 	RegisterCreateSequence();

@@ -1,0 +1,71 @@
+# name: test/sql/peg_parser/parser/create_function.test
+# description: Test create function syntax in peg parser
+# group: [parser]
+
+require autocomplete
+
+# Compatibility fallback for legacy CREATE FUNCTION macro syntax
+statement ok
+CALL check_peg_parser($TEST_PEG_PARSER$create function my_range(x) as table from range(x);$TEST_PEG_PARSER$);
+
+statement ok
+CALL check_peg_parser($TEST_PEG_PARSER$create function m(s varchar) as s || 'c'$TEST_PEG_PARSER$);
+
+# DuckPL with explicit BEGIN/END wrapper
+statement ok
+CALL check_peg_parser($TEST_PEG_PARSER$CREATE FUNCTION foo() RETURNS VARCHAR AS BEGIN RETURN 'x'; END LANGUAGE duckpl;$TEST_PEG_PARSER$);
+
+# DuckPL with brace wrapper
+statement ok
+CALL check_peg_parser($TEST_PEG_PARSER$CREATE FUNCTION foo() RETURNS VARCHAR AS { RETURN 'x'; } LANGUAGE duckpl;$TEST_PEG_PARSER$);
+
+# DuckPL with PL/pgSQL language alias
+statement ok
+CALL check_peg_parser($TEST_PEG_PARSER$CREATE FUNCTION foo() RETURNS INTEGER AS BEGIN RETURN 42; END LANGUAGE plpgsql;$TEST_PEG_PARSER$);
+
+# DuckPL declaration + assignment statement
+statement ok
+CALL check_peg_parser($TEST_PEG_PARSER$CREATE FUNCTION foo(x INTEGER) RETURNS INTEGER AS BEGIN y INTEGER := 42; y := y + x; RETURN y; END LANGUAGE 'duckpl';$TEST_PEG_PARSER$);
+
+# DuckPL declaration after another statement
+statement ok
+CALL check_peg_parser($TEST_PEG_PARSER$CREATE FUNCTION foo() RETURNS INTEGER AS BEGIN x INTEGER := 0; x := x + 1; y INTEGER := x; RETURN y; END LANGUAGE duckpl;$TEST_PEG_PARSER$);
+
+# DuckPL WHILE statement
+statement ok
+CALL check_peg_parser($TEST_PEG_PARSER$CREATE FUNCTION foo() RETURNS INTEGER AS BEGIN i INTEGER := 0; WHILE i < 10 LOOP i := i + 1; END LOOP; RETURN i; END LANGUAGE duckpl;$TEST_PEG_PARSER$);
+
+# DuckPL brace blocks
+statement ok
+CALL check_peg_parser($TEST_PEG_PARSER$CREATE FUNCTION foo(x INTEGER) RETURNS INTEGER AS { IF x > 0 { RETURN x; } ELSE { RETURN 0; } } LANGUAGE duckpl;$TEST_PEG_PARSER$);
+
+# DuckPL nested declaration inside brace block
+statement ok
+CALL check_peg_parser($TEST_PEG_PARSER$CREATE FUNCTION foo(x INTEGER) RETURNS INTEGER AS { IF x > 0 { y INTEGER := x; RETURN y; } ELSE { RETURN 0; } } LANGUAGE duckpl;$TEST_PEG_PARSER$);
+
+statement ok
+CALL check_peg_parser($TEST_PEG_PARSER$CREATE FUNCTION foo() RETURNS int AS { if true { x := (select 42); } else { x := (select 0); } } LANGUAGE duckpl;$TEST_PEG_PARSER$);
+
+statement ok
+CALL check_peg_parser($TEST_PEG_PARSER$CREATE FUNCTION foo() RETURNS int AS { if true { return (select 42); } else { return (select 0); } return 0; } LANGUAGE duckpl;$TEST_PEG_PARSER$);
+
+statement ok
+CALL check_peg_parser($TEST_PEG_PARSER$CREATE FUNCTION foo() RETURNS int AS { if true { return (select 42); } else { return (select 0); }; return 0; } LANGUAGE duckpl;$TEST_PEG_PARSER$);
+
+statement ok
+CALL check_peg_parser($TEST_PEG_PARSER$CREATE FUNCTION foo() RETURNS text AS BEGIN return 'x'; END language duckpl;$TEST_PEG_PARSER$);
+
+statement ok
+CALL check_peg_parser($TEST_PEG_PARSER$CREATE FUNCTION foo() RETURNS text AS BEGIN x INT := (SELECT 0); RETURN (SELECT * FROM lineitem); END LANGUAGE duckpl;$TEST_PEG_PARSER$);
+
+statement ok
+CALL check_peg_parser($TEST_PEG_PARSER$CREATE FUNCTION foo() RETURNS text AS { return 'x'; } language duckpl;$TEST_PEG_PARSER$);
+
+statement ok
+CALL check_peg_parser($TEST_PEG_PARSER$CREATE FUNCTION foo() RETURNS int AS { if true { x := (select 42); } else { x := (select 0); } } LANGUAGE duckpl;$TEST_PEG_PARSER$);
+
+statement ok
+CALL check_peg_parser($TEST_PEG_PARSER$CREATE FUNCTION foo() RETURNS int AS { if true { return (select 42); } else { return (select 0); } return 0; } LANGUAGE duckpl;$TEST_PEG_PARSER$);
+
+statement ok
+CALL check_peg_parser($TEST_PEG_PARSER$CREATE FUNCTION foo() RETURNS int AS { if true { return (select 42); } else { return (select 0); }; return 0; } LANGUAGE duckpl;$TEST_PEG_PARSER$);
