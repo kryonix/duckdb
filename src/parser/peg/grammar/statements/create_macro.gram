@@ -1,6 +1,4 @@
-CreateMacroStmt <- MacroOrFunction IfNotExists? QualifiedName List(MacroDefinition)
-
-MacroOrFunction <- 'MACRO' / 'FUNCTION'
+CreateMacroStmt <- 'MACRO' IfNotExists? QualifiedName List(MacroDefinition)
 
 MacroDefinition <- Parens(MacroParameters?) 'AS' (TableMacroDefinition / ScalarMacroDefinition)
 

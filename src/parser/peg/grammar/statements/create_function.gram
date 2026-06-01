@@ -1,0 +1,87 @@
+CreateFunctionStmt <- 'FUNCTION' IfNotExists? QualifiedName FunctionCreateDefinition
+
+FunctionCreateDefinition <- DuckPLFunctionDefinitions / LegacyMacroFunctionDefinitions
+DuckPLFunctionDefinitions <- DuckPLFunctionDefinition
+DuckPLFunctionDefinition <- DuckPLFunctionParameters DuckPLReturns? 'AS' DuckPLWrappedDefinition
+LegacyMacroFunctionDefinitions <- List(LegacyMacroFunctionDefinition)
+LegacyMacroFunctionDefinition <- LegacyTableMacroFunctionDefinition / LegacyScalarMacroFunctionDefinition
+LegacyTableMacroFunctionDefinition <- DuckPLFunctionParameters 'AS' TableMacroDefinition
+LegacyScalarMacroFunctionDefinition <- DuckPLFunctionParameters 'AS' ScalarMacroDefinition
+
+DuckPLFunctionParameters <- DuckPLNonEmptyFunctionParameters / EmptyDuckPLFunctionParameters
+DuckPLNonEmptyFunctionParameters <- Parens(MacroParameters)
+EmptyDuckPLFunctionParameters <- '(' ')'
+
+DuckPLWrappedDefinition <- DuckPLWrappedBody DuckPLLanguageSpec
+DuckPLWrappedBody <- DuckPLBeginEndBlock / DuckPLBraceBlock
+
+DuckPLDeclaration <- Identifier Type DuckPLDeclarationDefault?
+DuckPLDeclarationDefault <- NamedParameterAssignment Expression
+
+DuckPLStatements <- DuckPLCompoundRecursive /
+                    DuckPLSimpleRecursive /
+                    DuckPLCompoundTerminal /
+                    DuckPLSimpleTerminal
+DuckPLCompoundRecursive <- DuckPLCompoundStatement ';'? DuckPLStatements
+DuckPLSimpleRecursive <- DuckPLSimpleStatement ';' DuckPLStatements
+DuckPLCompoundTerminal <- DuckPLCompoundStatement ';'?
+DuckPLSimpleTerminal <- DuckPLSimpleStatement ';'?
+DuckPLCompoundStatement <- DuckPLIf /
+                           DuckPLWhile /
+                           DuckPLFor /
+                           DuckPLForeach /
+                           DuckPLLoop
+DuckPLSimpleStatement <- DuckPLReturn /
+                         DuckPLAssignment /
+                         DuckPLContinue /
+                         DuckPLExit /
+                         DuckPLDeclaration
+
+DuckPLAssignment <- Identifier ':=' Expression
+
+DuckPLReturn <- DuckPLReturnNext /
+                DuckPLReturnQuery /
+                DuckPLReturnExpr
+DuckPLReturnNext <- 'RETURN' 'NEXT' Expression
+DuckPLReturnQuery <- 'RETURN' 'QUERY' SelectStatementInternal
+DuckPLReturnExpr <- 'RETURN' Expression
+
+DuckPLIf <- DuckPLIfClassic / DuckPLIfBrace
+DuckPLIfClassic <- 'IF' Expression 'THEN' DuckPLStatements DuckPLClassicElseIfClause* DuckPLClassicElseClause? 'END' 'IF'
+DuckPLClassicElseIfClause <- 'ELSIF' Expression 'THEN' DuckPLStatements
+DuckPLClassicElseClause <- 'ELSE' DuckPLStatements
+DuckPLIfBrace <- 'IF' Expression DuckPLBraceBlock DuckPLBraceElseIfClause* DuckPLBraceElseClause?
+DuckPLBraceElseIfClause <- 'ELSIF' Expression DuckPLBraceBlock
+DuckPLBraceElseClause <- 'ELSE' DuckPLBraceBlock
+
+DuckPLLoop <- DuckPLLoopClassic / DuckPLLoopBrace
+DuckPLLoopClassic <- 'LOOP' DuckPLStatements 'END' 'LOOP'
+DuckPLLoopBrace <- 'LOOP' DuckPLBraceBlock
+
+DuckPLWhile <- DuckPLWhileClassic / DuckPLWhileBrace
+DuckPLWhileClassic <- 'WHILE' Expression 'LOOP' DuckPLStatements 'END' 'LOOP'
+DuckPLWhileBrace <- 'WHILE' Expression DuckPLBraceBlock
+
+DuckPLFor <- DuckPLForClassic / DuckPLForBrace
+DuckPLForClassic <- 'FOR' Identifier 'IN' DuckPLReverse? Expression '..' Expression DuckPLForStepClause? 'LOOP' DuckPLStatements 'END' 'LOOP'
+DuckPLForBrace <- 'FOR' Identifier 'IN' DuckPLReverse? Expression '..' Expression DuckPLForStepClause? DuckPLBraceBlock
+DuckPLReverse <- 'REVERSE'
+DuckPLForStepClause <- 'BY' Expression
+
+DuckPLForeach <- DuckPLForeachClassic / DuckPLForeachBrace
+DuckPLForeachClassic <- 'FOREACH' Identifier 'IN' 'ARRAY' Expression 'LOOP' DuckPLStatements 'END' 'LOOP'
+DuckPLForeachBrace <- 'FOREACH' Identifier 'IN' 'ARRAY' Expression DuckPLBraceBlock
+
+DuckPLContinue <- 'CONTINUE' Identifier? DuckPLWhenClause?
+DuckPLExit <- 'EXIT' Identifier? DuckPLWhenClause?
+DuckPLWhenClause <- 'WHEN' Expression
+
+DuckPLBeginEndBlock <- 'BEGIN' DuckPLStatements 'END'
+DuckPLBraceBlock <- '{' DuckPLStatements '}'
+
+DuckPLScriptStatement <- DuckPLStatements
+DuckPLLanguageSpec <- 'LANGUAGE' DuckPLLanguage
+DuckPLLanguage <- DuckPLDuckLanguage / DuckPLPlpgsqlLanguage / StringLiteral
+DuckPLDuckLanguage <- 'DUCKPL'
+DuckPLPlpgsqlLanguage <- 'PLPGSQL'
+DuckPLReturns <- 'RETURNS' Type
