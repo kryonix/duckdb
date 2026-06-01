@@ -122,7 +122,7 @@ PEGTransformerFactory::TransformDuckPLFunctionDefinitions(PEGTransformer &transf
                                                           CreateRoutineDefinition duck_pl_function_definition) {
 	vector<CreateRoutineDefinition> result;
 	result.push_back(std::move(duck_pl_function_definition));
-	return std::move(result);
+	return result;
 }
 
 CreateRoutineDefinition PEGTransformerFactory::TransformDuckPLFunctionDefinition(
@@ -140,7 +140,7 @@ CreateRoutineDefinition PEGTransformerFactory::TransformDuckPLFunctionDefinition
 
 vector<CreateRoutineDefinition> PEGTransformerFactory::TransformLegacyMacroFunctionDefinitions(
     PEGTransformer &transformer, vector<CreateRoutineDefinition> legacy_macro_function_definition) {
-	return std::move(legacy_macro_function_definition);
+	return legacy_macro_function_definition;
 }
 
 CreateRoutineDefinition
@@ -172,7 +172,7 @@ PEGTransformerFactory::TransformLegacyScalarMacroFunctionDefinition(PEGTransform
 vector<MacroParameter>
 PEGTransformerFactory::TransformDuckPLNonEmptyFunctionParameters(PEGTransformer &transformer,
                                                                  vector<MacroParameter> macro_parameters) {
-	return std::move(macro_parameters);
+	return macro_parameters;
 }
 
 vector<MacroParameter> PEGTransformerFactory::TransformEmptyDuckPLFunctionParameters(PEGTransformer &transformer) {
