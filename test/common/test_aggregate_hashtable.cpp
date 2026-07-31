@@ -55,7 +55,7 @@ TEST_CASE("Grouped aggregate address lookup and update", "[aggregate_hashtable]"
 	aggregates.push_back(CreateCountAggregate(true));
 	aggregates.push_back(CreateCountAggregate(false));
 	GroupedAggregateHashTable hash_table(context, allocator, {LogicalType::INTEGER}, {LogicalType::INTEGER},
-	                                     std::move(aggregates), GroupedAggregateHashTable::InitialCapacity(), 0,
+	                                     std::move(aggregates), GroupedAggregateHashTable::InitialCapacity(), idx_t(0),
 	                                     TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 
 	DataChunk groups;
@@ -107,7 +107,7 @@ TEST_CASE("Grouped aggregate address lookup and update", "[aggregate_hashtable]"
 	other_aggregates.push_back(CreateCountAggregate(false));
 	GroupedAggregateHashTable other_hash_table(
 	    context, allocator, {LogicalType::INTEGER}, {LogicalType::INTEGER}, std::move(other_aggregates),
-	    GroupedAggregateHashTable::InitialCapacity(), 0, TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
+	    GroupedAggregateHashTable::InitialCapacity(), idx_t(0), TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 	REQUIRE_THROWS(other_hash_table.UpdateAggregatesAtAddresses(update_state, matched_addresses, matched_payload,
 	                                                            aggregate_filter));
 	hash_table.UpdateAggregatesAtAddresses(update_state, matched_addresses, matched_payload, aggregate_filter);

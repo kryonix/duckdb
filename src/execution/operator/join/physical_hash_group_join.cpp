@@ -26,7 +26,7 @@ public:
 	    : hash_table(make_uniq<GroupedAggregateHashTable>(
 	          context, BufferAllocator::Get(context), op.grouped_aggregate_data.group_types,
 	          op.grouped_aggregate_data.payload_types, op.grouped_aggregate_data.bindings,
-	          GroupedAggregateHashTable::InitialCapacity(), 0, TupleDataValidityType::CANNOT_HAVE_NULL_VALUES)) {
+	          GroupedAggregateHashTable::InitialCapacity(), idx_t(0), TupleDataValidityType::CANNOT_HAVE_NULL_VALUES)) {
 	}
 
 	unique_ptr<GroupedAggregateHashTable> hash_table;
