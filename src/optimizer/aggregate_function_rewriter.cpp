@@ -1,11 +1,13 @@
 #include "duckdb/optimizer/aggregate_function_rewriter.hpp"
 
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
+#include "duckdb/execution/group_join_strategy.hpp"
 #include "duckdb/function/aggregate/distributive_function_utils.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/optimizer/matcher/expression_matcher.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/optimizer/hash_group_join.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -14,7 +16,9 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/main/settings.hpp"
 
 namespace duckdb {
 
@@ -25,7 +29,7 @@ public:
 	virtual ~AggregateRewriteRule() = default;
 
 public:
-	virtual bool ShouldSkip(const LogicalAggregate &aggr) const = 0;
+	virtual bool ShouldSkip(LogicalAggregate &aggr) const = 0;
 	virtual unique_ptr<Expression> Rewrite(unique_ptr<Expression> &expr, vector<reference<Expression>> &bindings,
 	                                       vector<unique_ptr<Expression>> &additional_expressions) = 0;
 	virtual unique_ptr<Expression>
@@ -59,7 +63,7 @@ public:
 	}
 
 public:
-	bool ShouldSkip(const LogicalAggregate &aggr) const override {
+	bool ShouldSkip(LogicalAggregate &aggr) const override {
 		// AVG -> SUM/COUNT is correct under any grouping (both ignore NULLs
 		// identically), so ROLLUP/CUBE/GROUPING SETS are safe to rewrite.
 		// Decomposing here is also the prerequisite for partial-aggregate
@@ -123,7 +127,7 @@ public:
 	}
 
 public:
-	bool ShouldSkip(const LogicalAggregate &aggr) const override {
+	bool ShouldSkip(LogicalAggregate &aggr) const override {
 		// This can probably be relaxed to be the same check as AvgRewriteRule,
 		// but behaviour (for now) is the same as the old SumRewriterOptimizer
 		return !aggr.groups.empty();
@@ -230,8 +234,15 @@ public:
 		matcher = std::move(op);
 	}
 
-	bool ShouldSkip(const LogicalAggregate &aggr) const override {
-		return false;
+	bool ShouldSkip(LogicalAggregate &aggr) const override {
+		if (Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context) != GroupJoinStrategy::FORCE ||
+		    aggr.children.size() != 1 || aggr.children[0]->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+			return false;
+		}
+		auto &join = aggr.children[0]->Cast<LogicalComparisonJoin>();
+		return TryGetHashGroupJoinCandidate(aggr, join, optimizer.context,
+		                                    HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER)
+		    .has_value();
 	}
 
 	unique_ptr<Expression> Rewrite(unique_ptr<Expression> &expr, vector<reference<Expression>> &bindings,

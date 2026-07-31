@@ -8,6 +8,9 @@
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/function/scalar/generic_common.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/optimizer/hash_group_join.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/execution/group_join_strategy.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -944,6 +947,15 @@ bool PartialAggregatePushdown::FuseInterveningProjections(LogicalOperator &op) {
 void PartialAggregatePushdown::VisitOperator(unique_ptr<LogicalOperator> &op) {
 	LogicalOperatorVisitor::VisitOperator(op);
 	FuseInterveningProjections(*op);
+	if (Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context) == GroupJoinStrategy::FORCE &&
+	    op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && op->children.size() == 1 &&
+	    op->children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &aggregate = op->Cast<LogicalAggregate>();
+		auto &join = op->children[0]->Cast<LogicalComparisonJoin>();
+		if (TryGetHashGroupJoinCandidate(aggregate, join, optimizer.context)) {
+			return;
+		}
+	}
 	if (TryDoubleEagerPushdown(op) || TryPushdownAggregate(op)) {
 		// Revisit rewritten subtrees so nested aggregate-over-join shapes can be pushed too.
 		LogicalOperatorVisitor::VisitOperator(op);

@@ -90,6 +90,16 @@ void DebugCheckpointAbortSetting::OnSet(SettingCallbackInfo &info, Value &parame
 }
 
 //===----------------------------------------------------------------------===//
+// Debug Group Join Strategy
+//===----------------------------------------------------------------------===//
+void DebugGroupJoinStrategySetting::OnSet(SettingCallbackInfo &info, Value &parameter) {
+	if (parameter.IsNull()) {
+		throw InvalidInputException("debug_group_join_strategy setting cannot be NULL");
+	}
+	EnumUtil::FromString<GroupJoinStrategy>(StringValue::Get(parameter));
+}
+
+//===----------------------------------------------------------------------===//
 // Debug Order Verification
 //===----------------------------------------------------------------------===//
 void DebugOrderVerificationSetting::SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &input) {

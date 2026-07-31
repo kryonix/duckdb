@@ -86,7 +86,8 @@ unique_ptr<NodeStatistics> StatisticsPropagator::PropagateStatistics(LogicalOper
 		result = PropagateChildren(node, node_ptr);
 	}
 
-	if (!optimizer.OptimizerDisabled(OptimizerType::COMPRESSED_MATERIALIZATION)) {
+	if (!suppress_compressed_materialization &&
+	    !optimizer.OptimizerDisabled(OptimizerType::COMPRESSED_MATERIALIZATION)) {
 		// compress data based on statistics for materializing operators
 		CompressedMaterialization compressed_materialization(optimizer, *root, statistics_map);
 		compressed_materialization.Compress(node_ptr);

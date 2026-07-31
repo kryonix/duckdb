@@ -264,9 +264,13 @@ enum class GeometryType : uint8_t;
 
 enum class GroupByExpressionInfoType : uint8_t;
 
+enum class GroupJoinStrategy : uint8_t;
+
 enum class HLLStorageType : uint8_t;
 
 enum class HTTPStatusCode : uint16_t;
+
+enum class HashGroupJoinCandidateMode : uint8_t;
 
 enum class IndexAppendMode : uint8_t;
 
@@ -575,6 +579,8 @@ enum class TupleDataValidityType : uint8_t;
 enum class UndoFlags : uint32_t;
 
 enum class UnionInvalidReason : uint8_t;
+
+enum class UniqueKeyProof : uint8_t;
 
 enum class VacuumIndexStrategy : uint8_t;
 
@@ -956,10 +962,16 @@ template<>
 const char* EnumUtil::ToChars<GroupByExpressionInfoType>(GroupByExpressionInfoType value);
 
 template<>
+const char* EnumUtil::ToChars<GroupJoinStrategy>(GroupJoinStrategy value);
+
+template<>
 const char* EnumUtil::ToChars<HLLStorageType>(HLLStorageType value);
 
 template<>
 const char* EnumUtil::ToChars<HTTPStatusCode>(HTTPStatusCode value);
+
+template<>
+const char* EnumUtil::ToChars<HashGroupJoinCandidateMode>(HashGroupJoinCandidateMode value);
 
 template<>
 const char* EnumUtil::ToChars<IndexAppendMode>(IndexAppendMode value);
@@ -1424,6 +1436,9 @@ template<>
 const char* EnumUtil::ToChars<UnionInvalidReason>(UnionInvalidReason value);
 
 template<>
+const char* EnumUtil::ToChars<UniqueKeyProof>(UniqueKeyProof value);
+
+template<>
 const char* EnumUtil::ToChars<VacuumIndexStrategy>(VacuumIndexStrategy value);
 
 template<>
@@ -1818,10 +1833,16 @@ template<>
 GroupByExpressionInfoType EnumUtil::FromString<GroupByExpressionInfoType>(const char *value);
 
 template<>
+GroupJoinStrategy EnumUtil::FromString<GroupJoinStrategy>(const char *value);
+
+template<>
 HLLStorageType EnumUtil::FromString<HLLStorageType>(const char *value);
 
 template<>
 HTTPStatusCode EnumUtil::FromString<HTTPStatusCode>(const char *value);
+
+template<>
+HashGroupJoinCandidateMode EnumUtil::FromString<HashGroupJoinCandidateMode>(const char *value);
 
 template<>
 IndexAppendMode EnumUtil::FromString<IndexAppendMode>(const char *value);
@@ -2284,6 +2305,9 @@ UndoFlags EnumUtil::FromString<UndoFlags>(const char *value);
 
 template<>
 UnionInvalidReason EnumUtil::FromString<UnionInvalidReason>(const char *value);
+
+template<>
+UniqueKeyProof EnumUtil::FromString<UniqueKeyProof>(const char *value);
 
 template<>
 VacuumIndexStrategy EnumUtil::FromString<VacuumIndexStrategy>(const char *value);

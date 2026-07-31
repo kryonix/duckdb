@@ -118,6 +118,7 @@
 #include "duckdb/common/vector/map_vector.hpp"
 #include "duckdb/common/vector/union_vector.hpp"
 #include "duckdb/execution/adaptive_filter.hpp"
+#include "duckdb/execution/group_join_strategy.hpp"
 #include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/execution/index/art/art_scanner.hpp"
 #include "duckdb/execution/index/art/iterator.hpp"
@@ -163,6 +164,7 @@
 #include "duckdb/main/setting_info.hpp"
 #include "duckdb/optimizer/build_probe_side_optimizer.hpp"
 #include "duckdb/optimizer/compressed_materialization.hpp"
+#include "duckdb/optimizer/hash_group_join.hpp"
 #include "duckdb/optimizer/join_order/join_order_operator.hpp"
 #include "duckdb/optimizer/join_order/relation_statistics_helper.hpp"
 #include "duckdb/optimizer/remove_unused_columns.hpp"
@@ -2755,6 +2757,25 @@ GroupByExpressionInfoType EnumUtil::FromString<GroupByExpressionInfoType>(const 
 	return static_cast<GroupByExpressionInfoType>(StringUtil::StringToEnum(GetGroupByExpressionInfoTypeValues(), 5, "GroupByExpressionInfoType", value));
 }
 
+const StringUtil::EnumStringLiteral *GetGroupJoinStrategyValues() {
+	static constexpr StringUtil::EnumStringLiteral values[] {
+		{ static_cast<uint32_t>(GroupJoinStrategy::DISABLED), "DISABLED" },
+		{ static_cast<uint32_t>(GroupJoinStrategy::FORCE), "FORCE" },
+		{ static_cast<uint32_t>(GroupJoinStrategy::AUTO), "AUTO" }
+	};
+	return values;
+}
+
+template<>
+const char* EnumUtil::ToChars<GroupJoinStrategy>(GroupJoinStrategy value) {
+	return StringUtil::EnumToString(GetGroupJoinStrategyValues(), 3, "GroupJoinStrategy", static_cast<uint32_t>(value));
+}
+
+template<>
+GroupJoinStrategy EnumUtil::FromString<GroupJoinStrategy>(const char *value) {
+	return static_cast<GroupJoinStrategy>(StringUtil::StringToEnum(GetGroupJoinStrategyValues(), 3, "GroupJoinStrategy", value));
+}
+
 const StringUtil::EnumStringLiteral *GetHLLStorageTypeValues() {
 	static constexpr StringUtil::EnumStringLiteral values[] {
 		{ static_cast<uint32_t>(HLLStorageType::HLL_V1), "HLL_V1" },
@@ -2851,6 +2872,24 @@ const char* EnumUtil::ToChars<HTTPStatusCode>(HTTPStatusCode value) {
 template<>
 HTTPStatusCode EnumUtil::FromString<HTTPStatusCode>(const char *value) {
 	return static_cast<HTTPStatusCode>(StringUtil::StringToEnum(GetHTTPStatusCodeValues(), 64, "HTTPStatusCode", value));
+}
+
+const StringUtil::EnumStringLiteral *GetHashGroupJoinCandidateModeValues() {
+	static constexpr StringUtil::EnumStringLiteral values[] {
+		{ static_cast<uint32_t>(HashGroupJoinCandidateMode::STRICT), "STRICT" },
+		{ static_cast<uint32_t>(HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER), "ALLOW_AGGREGATE_ORDER" }
+	};
+	return values;
+}
+
+template<>
+const char* EnumUtil::ToChars<HashGroupJoinCandidateMode>(HashGroupJoinCandidateMode value) {
+	return StringUtil::EnumToString(GetHashGroupJoinCandidateModeValues(), 2, "HashGroupJoinCandidateMode", static_cast<uint32_t>(value));
+}
+
+template<>
+HashGroupJoinCandidateMode EnumUtil::FromString<HashGroupJoinCandidateMode>(const char *value) {
+	return static_cast<HashGroupJoinCandidateMode>(StringUtil::StringToEnum(GetHashGroupJoinCandidateModeValues(), 2, "HashGroupJoinCandidateMode", value));
 }
 
 const StringUtil::EnumStringLiteral *GetIndexAppendModeValues() {
@@ -6397,6 +6436,24 @@ const char* EnumUtil::ToChars<UnionInvalidReason>(UnionInvalidReason value) {
 template<>
 UnionInvalidReason EnumUtil::FromString<UnionInvalidReason>(const char *value) {
 	return static_cast<UnionInvalidReason>(StringUtil::StringToEnum(GetUnionInvalidReasonValues(), 6, "UnionInvalidReason", value));
+}
+
+const StringUtil::EnumStringLiteral *GetUniqueKeyProofValues() {
+	static constexpr StringUtil::EnumStringLiteral values[] {
+		{ static_cast<uint32_t>(UniqueKeyProof::PRIMARY_KEY), "PRIMARY_KEY" },
+		{ static_cast<uint32_t>(UniqueKeyProof::UNIQUE_NOT_NULL), "UNIQUE_NOT_NULL" }
+	};
+	return values;
+}
+
+template<>
+const char* EnumUtil::ToChars<UniqueKeyProof>(UniqueKeyProof value) {
+	return StringUtil::EnumToString(GetUniqueKeyProofValues(), 2, "UniqueKeyProof", static_cast<uint32_t>(value));
+}
+
+template<>
+UniqueKeyProof EnumUtil::FromString<UniqueKeyProof>(const char *value) {
+	return static_cast<UniqueKeyProof>(StringUtil::StringToEnum(GetUniqueKeyProofValues(), 2, "UniqueKeyProof", value));
 }
 
 const StringUtil::EnumStringLiteral *GetVacuumIndexStrategyValues() {

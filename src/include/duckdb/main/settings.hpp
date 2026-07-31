@@ -596,6 +596,17 @@ struct DebugForceNoCrossProductSetting {
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
 };
 
+struct DebugGroupJoinStrategySetting {
+	using RETURN_TYPE = GroupJoinStrategy;
+	static constexpr const char *Name = "debug_group_join_strategy";
+	static constexpr const char *Description = "DEBUG SETTING: choose the physical GroupJoin strategy";
+	static constexpr const char *InputType = "VARCHAR";
+	static constexpr const char *DefaultValue = "DISABLED";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+	static void OnSet(SettingCallbackInfo &info, Value &input);
+};
+
 struct DebugOrderVerificationSetting {
 	using RETURN_TYPE = DebugOrderVerification;
 	static constexpr const char *Name = "debug_order_verification";

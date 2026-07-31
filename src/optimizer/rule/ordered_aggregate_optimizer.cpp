@@ -1,11 +1,14 @@
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
+#include "duckdb/execution/group_join_strategy.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/optimizer/matcher/expression_matcher.hpp"
 #include "duckdb/optimizer/expression_rewriter.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/optimizer/rule/ordered_aggregate_optimizer.hpp"
 
 namespace duckdb {
@@ -99,13 +102,18 @@ unique_ptr<Expression> OrderedAggregateOptimizer::Apply(LogicalOperator &op, vec
 	if (op.type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 		return nullptr;
 	}
+	auto &logical_aggregate = op.Cast<LogicalAggregate>();
+	if (Settings::Get<DebugGroupJoinStrategySetting>(rewriter.context) == GroupJoinStrategy::FORCE &&
+	    aggr.GetOrderBys() && logical_aggregate.children.size() == 1 &&
+	    logical_aggregate.children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		return nullptr;
+	}
 	// don't rewrite state-export aggregates - the rewrite would lose the STATE_EXPORT mode
 	if (aggr.StateExportMode() == AggregateStateExportMode::STATE_EXPORT) {
 		return nullptr;
 	}
 
-	return Apply(rewriter.context, aggr, op.Cast<LogicalAggregate>().groups, op.Cast<LogicalAggregate>().grouping_sets,
-	             changes_made);
+	return Apply(rewriter.context, aggr, logical_aggregate.groups, logical_aggregate.grouping_sets, changes_made);
 }
 
 } // namespace duckdb

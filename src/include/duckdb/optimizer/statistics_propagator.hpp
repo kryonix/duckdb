@@ -133,6 +133,8 @@ private:
 	column_binding_map_t<unique_ptr<BaseStatistics>> statistics_map;
 	//! Node stats for the current node
 	unique_ptr<NodeStatistics> node_stats;
+	//! Forced GroupJoin keeps its join subtree in the original key representation until physical planning.
+	bool suppress_compressed_materialization = false;
 };
 
 } // namespace duckdb

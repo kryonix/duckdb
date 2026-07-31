@@ -1,12 +1,24 @@
 #include "duckdb/optimizer/compressed_materialization.hpp"
+#include "duckdb/optimizer/hash_group_join.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/execution/group_join_strategy.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 
 namespace duckdb {
 
 void CompressedMaterialization::CompressAggregate(unique_ptr<LogicalOperator> &op) {
 	auto &aggregate = op->Cast<LogicalAggregate>();
+	if (Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context) == GroupJoinStrategy::FORCE &&
+	    aggregate.children.size() == 1 && aggregate.children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = aggregate.children[0]->Cast<LogicalComparisonJoin>();
+		if (TryGetHashGroupJoinCandidate(aggregate, join, optimizer.context)) {
+			return;
+		}
+	}
 	auto &groups = aggregate.groups;
 	column_binding_set_t group_binding_set;
 	for (const auto &group : groups) {

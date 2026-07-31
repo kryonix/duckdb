@@ -29,6 +29,7 @@ add_library_unity(
   filter_pullup.cpp
   filter_pushdown.cpp
   grouping_sets_optimizer.cpp
+  hash_group_join.cpp
   in_clause_rewriter.cpp
   join_filter_pushdown_optimizer.cpp
   late_materialization.cpp

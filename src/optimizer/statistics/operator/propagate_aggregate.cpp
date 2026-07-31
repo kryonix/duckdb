@@ -10,6 +10,9 @@
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/function/partition_stats.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
+#include "duckdb/execution/group_join_strategy.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/optimizer/hash_group_join.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -18,6 +21,7 @@
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_dummy_scan.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -466,7 +470,16 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 unique_ptr<NodeStatistics> StatisticsPropagator::PropagateStatistics(LogicalAggregate &aggr,
                                                                      unique_ptr<LogicalOperator> &node_ptr) {
 	// first propagate statistics in the child node
+	const auto previous_suppression = suppress_compressed_materialization;
+	if (Settings::Get<DebugGroupJoinStrategySetting>(context) == GroupJoinStrategy::FORCE &&
+	    aggr.children.size() == 1 && aggr.children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = aggr.children[0]->Cast<LogicalComparisonJoin>();
+		if (TryGetHashGroupJoinCandidate(aggr, join, context)) {
+			suppress_compressed_materialization = true;
+		}
+	}
 	node_stats = PropagateStatistics(aggr.children[0]);
+	suppress_compressed_materialization = previous_suppression;
 
 	// handle the groups: simply propagate statistics and assign the stats to the group binding
 	aggr.group_stats.resize(aggr.groups.size());

@@ -356,6 +356,13 @@
         "default_value": "false"
     },
     {
+        "name": "debug_group_join_strategy",
+        "description": "DEBUG SETTING: choose the physical GroupJoin strategy",
+        "type": "ENUM<GroupJoinStrategy>",
+        "default_scope": "local",
+        "default_value": "DISABLED"
+    },
+    {
         "name": "debug_order_verification",
         "description": "DEBUG SETTING: verify ORDER BY results by rewriting the ordering (NONE, CREATE_SORT_KEY or VARIANT)",
         "type": "ENUM<DebugOrderVerification>",

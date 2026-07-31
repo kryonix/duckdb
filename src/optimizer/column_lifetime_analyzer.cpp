@@ -1,7 +1,9 @@
 #include "duckdb/optimizer/column_lifetime_analyzer.hpp"
 
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/execution/group_join_strategy.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
+#include "duckdb/optimizer/hash_group_join.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/topn_optimizer.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -67,6 +69,17 @@ void ColumnLifetimeAnalyzer::VisitOperator(LogicalOperator &op) {
 	}
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
+		auto &aggregate = op.Cast<LogicalAggregate>();
+		if (Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context) == GroupJoinStrategy::FORCE &&
+		    aggregate.children.size() == 1 &&
+		    aggregate.children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+			auto &join = aggregate.children[0]->Cast<LogicalComparisonJoin>();
+			if (TryGetHashGroupJoinCandidate(aggregate, join, optimizer.context)) {
+				ColumnLifetimeAnalyzer analyzer(optimizer, root, true);
+				analyzer.StandardVisitOperator(op);
+				return;
+			}
+		}
 		// FIXME: groups that are not referenced can be removed from projection
 		// recurse into the children of the aggregate
 		ColumnLifetimeAnalyzer analyzer(optimizer, root);
