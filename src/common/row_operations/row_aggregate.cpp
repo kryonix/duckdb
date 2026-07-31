@@ -151,6 +151,22 @@ void RowOperations::CombineStates(RowOperationsState &state, TupleDataLayout &la
 
 void RowOperations::FinalizeStates(RowOperationsState &state, TupleDataLayout &layout, Vector &addresses,
                                    DataChunk &result, idx_t aggr_idx) {
+	FinalizeStatesRange(state, layout, addresses, result, aggr_idx, 0, layout.GetAggregates().size());
+}
+
+void RowOperations::FinalizeStatesRange(RowOperationsState &state, TupleDataLayout &layout, Vector &addresses,
+                                        DataChunk &result, idx_t result_idx, idx_t aggregate_begin,
+                                        idx_t aggregate_count) {
+	auto &aggregates = layout.GetAggregates();
+	if (aggregate_begin > aggregates.size() || aggregate_count > aggregates.size() - aggregate_begin) {
+		throw InternalException("FinalizeStatesRange: aggregate range [%llu, %llu) exceeds aggregate count %llu",
+		                        aggregate_begin, aggregate_begin + aggregate_count, aggregates.size());
+	}
+	if (result_idx > result.ColumnCount() || aggregate_count > result.ColumnCount() - result_idx) {
+		throw InternalException("FinalizeStatesRange: result range [%llu, %llu) exceeds column count %llu", result_idx,
+		                        result_idx + aggregate_count, result.ColumnCount());
+	}
+
 	// Copy the addresses
 	if (!state.addresses) {
 		state.addresses = make_uniq<Vector>(LogicalType::POINTER);
@@ -159,10 +175,6 @@ void RowOperations::FinalizeStates(RowOperationsState &state, TupleDataLayout &l
 	VectorOperations::Copy(addresses, addresses_copy, result.size(), 0, 0);
 	FlatVector::SetSize(addresses_copy, count_t(result.size()));
 
-	//	Move to the first aggregate state
-	VectorOperations::AddInPlace(addresses_copy, UnsafeNumericCast<int64_t>(layout.GetAggrOffset()));
-
-	auto &aggregates = layout.GetAggregates();
 	// initialize the finalize local states once - they are re-used across all finalize calls of this state
 	if (state.local_states.size() < aggregates.size()) {
 		state.local_states.resize(aggregates.size());
@@ -175,8 +187,16 @@ void RowOperations::FinalizeStates(RowOperationsState &state, TupleDataLayout &l
 			}
 		}
 	}
-	for (idx_t i = 0; i < aggregates.size(); i++) {
-		auto &target = result.data[aggr_idx + i];
+
+	idx_t state_offset = layout.GetAggrOffset();
+	for (idx_t i = 0; i < aggregate_begin; i++) {
+		state_offset += aggregates[i].payload_size;
+	}
+	VectorOperations::AddInPlace(addresses_copy, UnsafeNumericCast<int64_t>(state_offset));
+
+	const auto aggregate_end = aggregate_begin + aggregate_count;
+	for (idx_t i = aggregate_begin; i < aggregate_end; i++) {
+		auto &target = result.data[result_idx + i - aggregate_begin];
 		auto &aggr = aggregates[i];
 		AggregateFinalizeInputData finalize_input_data(aggr, state.allocator, state.local_states[i].get());
 		aggr.function.GetStateFinalizeCallback()(addresses_copy, finalize_input_data, target, result.size(), 0);

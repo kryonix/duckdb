@@ -62,6 +62,9 @@ struct RowOperations {
 	//! finalize - unaligned addresses, updated
 	static void FinalizeStates(RowOperationsState &state, TupleDataLayout &layout, Vector &addresses, DataChunk &result,
 	                           idx_t aggr_idx);
+	//! finalize a contiguous range of aggregate states - unaligned addresses, updated
+	static void FinalizeStatesRange(RowOperationsState &state, TupleDataLayout &layout, Vector &addresses,
+	                                DataChunk &result, idx_t result_idx, idx_t aggregate_begin, idx_t aggregate_count);
 
 	//===--------------------------------------------------------------------===//
 	// Deprecated overloads (count parameter removed - use count-free versions)

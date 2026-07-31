@@ -48,6 +48,10 @@ AggregateHTProbeState::AggregateHTProbeState()
 AggregateHTLookupState::AggregateHTLookupState() : missing_vector(STANDARD_VECTOR_SIZE) {
 }
 
+AggregateHTUpdateState::AggregateHTUpdateState(GroupedAggregateHashTable &hash_table)
+    : owner(hash_table), aggregate_allocator(hash_table.GetAggregateAllocator()), row_state(*aggregate_allocator) {
+}
+
 GroupedAggregateHashTable::GroupedAggregateHashTable(ClientContext &context_p, Allocator &allocator,
                                                      vector<LogicalType> group_types_p,
                                                      vector<LogicalType> payload_types_p,
@@ -670,6 +674,13 @@ void GroupedAggregateHashTable::UpdateAggregates(DataChunk &payload, const unsaf
 		return;
 	}
 
+	UpdateAggregates(state.row_state, state.addresses, payload, filter);
+
+	Verify();
+}
+
+void GroupedAggregateHashTable::UpdateAggregates(RowOperationsState &row_state, Vector &addresses, DataChunk &payload,
+                                                 const unsafe_vector<idx_t> &filter) {
 	auto &aggregates = layout_ptr->GetAggregates();
 	idx_t filter_idx = 0;
 	idx_t payload_idx = 0;
@@ -678,25 +689,39 @@ void GroupedAggregateHashTable::UpdateAggregates(DataChunk &payload, const unsaf
 		if (filter_idx >= filter.size() || i < filter[filter_idx]) {
 			// Skip all the aggregates that are not in the filter
 			payload_idx += aggr.child_count;
-			VectorOperations::AddInPlace(state.addresses, NumericCast<int64_t>(aggr.payload_size));
+			VectorOperations::AddInPlace(addresses, NumericCast<int64_t>(aggr.payload_size));
 			continue;
 		}
 		D_ASSERT(i == filter[filter_idx]);
 
 		if (aggr.aggr_type != AggregateType::DISTINCT && aggr.filter) {
-			RowOperations::UpdateFilteredStates(state.row_state, filter_set.GetFilterData(i), aggr, state.addresses,
-			                                    payload, payload_idx);
+			RowOperations::UpdateFilteredStates(row_state, filter_set.GetFilterData(i), aggr, addresses, payload,
+			                                    payload_idx);
 		} else {
-			RowOperations::UpdateStates(state.row_state, aggr, state.addresses, payload, payload_idx);
+			RowOperations::UpdateStates(row_state, aggr, addresses, payload, payload_idx);
 		}
 
 		// Move to the next aggregate
 		payload_idx += aggr.child_count;
-		VectorOperations::AddInPlace(state.addresses, NumericCast<int64_t>(aggr.payload_size));
+		VectorOperations::AddInPlace(addresses, NumericCast<int64_t>(aggr.payload_size));
 		filter_idx++;
 	}
+}
 
-	Verify();
+void GroupedAggregateHashTable::UpdateAggregatesAtAddresses(AggregateHTUpdateState &state, Vector &addresses,
+                                                            DataChunk &payload, const unsafe_vector<idx_t> &filter) {
+	if (state.owner.get() != this) {
+		throw InternalException("Aggregate hash-table update state cannot be reused across hash tables");
+	}
+	if (addresses.size() != payload.size()) {
+		throw InternalException("UpdateAggregatesAtAddresses: address count (%llu) does not match payload count (%llu)",
+		                        addresses.size(), payload.size());
+	}
+	Vector aggregate_addresses(LogicalType::POINTER, addresses.size());
+	VectorOperations::Copy(addresses, aggregate_addresses, addresses.size(), 0, 0);
+	FlatVector::SetSize(aggregate_addresses, addresses.size());
+	VectorOperations::AddInPlace(aggregate_addresses, NumericCast<int64_t>(layout_ptr->GetAggrOffset()));
+	UpdateAggregates(state.row_state, aggregate_addresses, payload, filter);
 }
 
 idx_t GroupedAggregateHashTable::AddChunk(DataChunk &groups, Vector &group_hashes, DataChunk &payload,
@@ -1204,6 +1229,16 @@ bool GroupedAggregateHashTable::ScanGroups(AggregateHTScanState &scan_state, Dat
 			return true;
 		}
 	}
+}
+
+bool GroupedAggregateHashTable::ScanGroupsAndAddresses(AggregateHTScanState &scan_state, DataChunk &distinct_rows,
+                                                       Vector &addresses) {
+	if (!ScanGroups(scan_state, distinct_rows)) {
+		return false;
+	}
+	addresses.Reference(scan_state.scan_states.chunk_state.row_locations);
+	FlatVector::SetSize(addresses, distinct_rows.size());
+	return true;
 }
 
 bool GroupedAggregateHashTable::Scan(AggregateHTScanState &scan_state, DataChunk &distinct_rows,

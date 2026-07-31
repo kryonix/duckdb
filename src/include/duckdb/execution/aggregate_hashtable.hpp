@@ -68,6 +68,16 @@ public:
 	vector<TupleDataGatherFunction> gather_functions;
 };
 
+//! Task-local state for updating aggregate rows through stable addresses.
+struct AggregateHTUpdateState {
+public:
+	explicit AggregateHTUpdateState(GroupedAggregateHashTable &hash_table);
+
+	optional_ptr<const GroupedAggregateHashTable> owner;
+	shared_ptr<ArenaAllocator> aggregate_allocator;
+	RowOperationsState row_state;
+};
+
 class GroupedAggregateHashTable : public BaseAggregateHashTable {
 public:
 	GroupedAggregateHashTable(ClientContext &context, Allocator &allocator, vector<LogicalType> group_types,
@@ -120,6 +130,8 @@ public:
 	void InitializeScan(AggregateHTScanState &scan_state);
 	//! Scans group columns without reading or finalizing aggregate states.
 	bool ScanGroups(AggregateHTScanState &scan_state, DataChunk &distinct_rows);
+	//! Scans group columns and references their stable row-start addresses until the next scan call.
+	bool ScanGroupsAndAddresses(AggregateHTScanState &scan_state, DataChunk &distinct_rows, Vector &addresses);
 	bool Scan(AggregateHTScanState &scan_state, DataChunk &distinct_rows, DataChunk &payload_rows);
 
 	//! Finds or creates groups in the hashtable using the specified group keys. The addresses vector will be filled
@@ -132,6 +144,9 @@ public:
 	//! Finds existing groups without changing the hash table. Returns the number of matches and writes input-row
 	//! indexes to found_groups_out. Matching row addresses are stored at their input-row indexes in state.addresses.
 	idx_t LookupGroups(DataChunk &groups, AggregateHTLookupState &state, SelectionVector &found_groups_out) const;
+	//! Updates aggregate states at existing row-start addresses without changing the hash table.
+	void UpdateAggregatesAtAddresses(AggregateHTUpdateState &state, Vector &addresses, DataChunk &payload,
+	                                 const unsafe_vector<idx_t> &filter);
 	//! Gathers matched group values from state.addresses in the order specified by found_groups.
 	void GatherGroups(AggregateHTLookupState &state, const SelectionVector &found_groups, idx_t found_count,
 	                  DataChunk &result) const;
@@ -272,6 +287,8 @@ private:
 
 	void UpdateAggregates(DataChunk &payload, const unsafe_vector<idx_t> &filter, idx_t count,
 	                      bool ht_offsets_valid = true);
+	void UpdateAggregates(RowOperationsState &row_state, Vector &addresses, DataChunk &payload,
+	                      const unsafe_vector<idx_t> &filter);
 	bool UpdateAggregatesClustered(DataChunk &payload, const unsafe_vector<idx_t> &filter, idx_t count,
 	                               bool ht_offsets_valid);
 
