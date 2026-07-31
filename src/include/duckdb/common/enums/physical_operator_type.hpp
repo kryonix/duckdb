@@ -132,6 +132,8 @@ enum class PhysicalOperatorType : uint8_t {
 
 	// Physical-only recursive CTE specialization. Keep appended to preserve existing enum values.
 	RECURSIVE_KEY_JOIN,
+	// Physical-only aggregate-over-join specialization. Keep appended to preserve existing enum values.
+	HASH_GROUP_JOIN,
 };
 
 string PhysicalOperatorToString(PhysicalOperatorType type);

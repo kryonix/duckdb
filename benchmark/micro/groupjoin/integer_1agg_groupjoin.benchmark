@@ -1,0 +1,10 @@
+# name: benchmark/micro/groupjoin/integer_1agg_groupjoin.benchmark
+# group: [groupjoin]
+
+template benchmark/micro/groupjoin/groupjoin.benchmark.in
+LABEL=integer/1 aggregate/groupjoin
+STRATEGY=force
+DISABLED_OPTIMIZERS=top_n
+KEY_COLUMNS=int_key
+AGGREGATES=sum(value) AS total_value
+SUMMARY=count(*) AS group_count, sum(total_value) AS total_value

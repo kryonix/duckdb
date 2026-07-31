@@ -1,0 +1,68 @@
+# description: Parameterized serial Hash GroupJoin comparison
+# group: [groupjoin]
+
+name GroupJoin ${LABEL} (B=${owner_rows}, fanout=${fanout}, match=${match_rate}%, hot=${hot_percent}%)
+group micro
+subgroup groupjoin
+
+argument owner_rows 100000
+argument fanout 10
+argument match_rate 100
+argument hot_percent 0
+
+load
+SET threads TO 1;
+SET debug_group_join_strategy TO '${STRATEGY}';
+SET disabled_optimizers TO '${DISABLED_OPTIMIZERS}';
+CREATE TABLE groupjoin_owner(
+	int_key BIGINT PRIMARY KEY,
+	tail INTEGER NOT NULL,
+	string_key VARCHAR UNIQUE NOT NULL,
+	UNIQUE(int_key, tail)
+);
+INSERT INTO groupjoin_owner
+SELECT i, (i % 17)::INTEGER, 'key-' || i::VARCHAR
+FROM range(${owner_rows}) t(i);
+CREATE TABLE groupjoin_probe AS
+WITH generated AS (
+	SELECT i, i // ${fanout} AS owner_slot, i % ${fanout} AS repeat_index
+	FROM range(${owner_rows} * ${fanout}) t(i)
+), keys AS (
+	SELECT i,
+		CASE
+			WHEN owner_slot < (${owner_rows} * ${match_rate}) // 100 THEN
+				CASE WHEN (repeat_index * 100) // ${fanout} < ${hot_percent} THEN 0 ELSE owner_slot END
+			ELSE ${owner_rows} + i
+		END AS int_key
+	FROM generated
+)
+SELECT int_key, (int_key % 17)::INTEGER AS tail, 'key-' || int_key::VARCHAR AS string_key,
+	(i % 1000)::BIGINT AS value
+FROM keys;
+
+run
+SELECT ${SUMMARY}
+FROM (
+	SELECT ${KEY_COLUMNS}, ${AGGREGATES}
+	FROM groupjoin_owner o
+	JOIN groupjoin_probe p USING (${KEY_COLUMNS})
+	GROUP BY ${KEY_COLUMNS}
+) groups;
+
+result_query I
+WITH expected AS (
+	SELECT ${SUMMARY}
+	FROM (
+		SELECT ${KEY_COLUMNS}, ${AGGREGATES}
+		FROM groupjoin_probe
+		WHERE int_key < ${owner_rows}
+		GROUP BY ${KEY_COLUMNS}
+	) groups
+)
+SELECT count(*) FROM (
+	(SELECT * FROM __answer EXCEPT ALL SELECT * FROM expected)
+	UNION ALL
+	(SELECT * FROM expected EXCEPT ALL SELECT * FROM __answer)
+) differences
+----
+0

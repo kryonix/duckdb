@@ -1,0 +1,463 @@
+# name: test/sql/aggregate/group/test_hash_group_join.test
+# description: Serial physical Hash GroupJoin eligibility and execution
+# group: [group]
+
+statement ok
+CREATE TABLE gj_owner(id INTEGER PRIMARY KEY, payload INTEGER)
+
+statement ok
+INSERT INTO gj_owner VALUES (3, 30), (1, 10), (4, 40), (2, 20)
+
+statement ok
+CREATE TABLE gj_probe(owner_id INTEGER, value INTEGER, flag BOOLEAN)
+
+statement ok
+INSERT INTO gj_probe VALUES
+	(1, 10, true), (1, NULL, false), (1, 10, NULL),
+	(2, NULL, true), (2, 5, false), (2, 5, true),
+	(NULL, 99, true), (5, 100, true)
+
+# The strategy is inert by default.
+query II
+EXPLAIN SELECT o.id, count(*), sum(p.value)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+# Materialize a trustworthy result baseline without optimizer rewrites.
+statement ok
+PRAGMA disable_optimizer
+
+statement ok
+CREATE TEMP TABLE gj_baseline AS
+SELECT o.id, count(*) AS count_star, count(p.value) AS count_value, sum(p.value) AS sum_value,
+       avg(p.value) AS avg_value, min(p.value) AS min_value, max(p.value) AS max_value
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+
+statement ok
+PRAGMA enable_optimizer
+
+statement ok
+SET debug_group_join_strategy = 'force'
+
+# Force protects an eligible candidate from partial aggregate pushdown and selects the physical specialization.
+query II
+EXPLAIN SELECT o.id, count(*), sum(p.value)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+physical_plan	<REGEX>:.*Hash Group Join.*
+
+query IIIIRII rowsort
+SELECT o.id, count(*), count(p.value), sum(p.value), avg(p.value), min(p.value), max(p.value)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+1	3	2	20	10.000000	10	10
+2	3	2	10	5.000000	5	5
+
+# The physical operator normalizes either logical child orientation to probe then owner.
+query II
+EXPLAIN SELECT o.id, count(*)
+FROM gj_probe p JOIN gj_owner o ON p.owner_id = o.id
+GROUP BY o.id
+----
+physical_plan	<REGEX>:.*Hash Group Join.*
+
+query III rowsort
+SELECT o.id, count(*), sum(p.value)
+FROM gj_probe p JOIN gj_owner o ON p.owner_id = o.id
+GROUP BY o.id
+----
+1	3	20
+2	3	10
+
+# Compare the forced result bidirectionally with a result materialized under the disabled strategy.
+query I
+SELECT count(*) FROM (
+	(SELECT o.id, count(*), count(p.value), sum(p.value), avg(p.value), min(p.value), max(p.value)
+	 FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id GROUP BY o.id
+	 EXCEPT ALL SELECT * FROM gj_baseline)
+	UNION ALL
+	(SELECT * FROM gj_baseline EXCEPT ALL
+	 SELECT o.id, count(*), count(p.value), sum(p.value), avg(p.value), min(p.value), max(p.value)
+	 FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id GROUP BY o.id)
+) differences
+----
+0
+
+query III rowsort
+SELECT o.id, bool_or(p.flag), bool_and(p.flag)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+1	1	0
+2	1	0
+
+# Variable-sized aggregate state uses the same generic address-based update and destruction paths.
+query II rowsort
+SELECT o.id, array_length(list(p.value))
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+1	3
+2	3
+
+# A probe-side equality key is canonicalized to the owner key.
+query III rowsort
+SELECT p.owner_id, count(*), sum(p.value)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY p.owner_id
+----
+1	3	20
+2	3	10
+
+# Owner filters and direct projections preserve the catalog uniqueness proof.
+query II
+EXPLAIN SELECT owner_key, count(*), sum(p.value)
+FROM (SELECT id AS owner_key FROM gj_owner WHERE payload >= 20) o
+JOIN gj_probe p ON o.owner_key = p.owner_id
+GROUP BY owner_key
+----
+physical_plan	<REGEX>:.*Hash Group Join.*
+
+query III rowsort
+SELECT owner_key, count(*), sum(p.value)
+FROM (SELECT id AS owner_key FROM gj_owner WHERE payload >= 20) o
+JOIN gj_probe p ON o.owner_key = p.owner_id
+GROUP BY owner_key
+----
+2	3	10
+
+statement ok
+CREATE TABLE gj_composite_owner(a INTEGER, b INTEGER, PRIMARY KEY(a, b))
+
+statement ok
+INSERT INTO gj_composite_owner VALUES (1, 1), (1, 2), (2, 1), (3, 3)
+
+statement ok
+CREATE TABLE gj_composite_probe(a INTEGER, b INTEGER, value INTEGER)
+
+statement ok
+INSERT INTO gj_composite_probe VALUES
+	(1, 1, 5), (1, 1, 7), (1, 2, NULL), (2, 1, 9),
+	(NULL, 1, 100), (1, NULL, 100), (9, 9, 100)
+
+query IIII rowsort
+SELECT o.b, o.a, count(*), sum(p.value)
+FROM gj_composite_owner o
+JOIN gj_composite_probe p ON o.a = p.a AND o.b = p.b
+GROUP BY o.b, o.a
+----
+1	1	2	12
+1	2	1	9
+2	1	1	NULL
+
+statement ok
+CREATE TABLE gj_string_owner(k VARCHAR PRIMARY KEY)
+
+statement ok
+INSERT INTO gj_string_owner VALUES ('alpha'), ('beta'), ('unused')
+
+statement ok
+CREATE TABLE gj_string_probe(k VARCHAR, value DECIMAL(10,2))
+
+statement ok
+INSERT INTO gj_string_probe VALUES ('alpha', 1.25), ('alpha', 2.75), ('beta', NULL), (NULL, 9.00)
+
+query TII rowsort
+SELECT o.k, count(*), count(p.value)
+FROM gj_string_owner o JOIN gj_string_probe p USING (k)
+GROUP BY o.k
+----
+alpha	2	2
+beta	1	0
+
+query TR rowsort
+SELECT o.k, sum(p.value)
+FROM gj_string_owner o JOIN gj_string_probe p USING (k)
+GROUP BY o.k
+----
+alpha	4.000000
+beta	NULL
+
+# Exercise multiple chunks, vector boundaries, unmatched rows, and a high fan-out group.
+statement ok
+CREATE TABLE gj_large_owner(id INTEGER PRIMARY KEY)
+
+statement ok
+INSERT INTO gj_large_owner SELECT i FROM range(4097) t(i)
+
+statement ok
+CREATE TABLE gj_large_probe(id INTEGER, value INTEGER)
+
+statement ok
+INSERT INTO gj_large_probe SELECT i % 5000, i FROM range(10000) t(i)
+
+statement ok
+INSERT INTO gj_large_probe SELECT 0, i FROM range(5000) t(i)
+
+query II
+SELECT count(*), sum(c) FROM (
+	SELECT o.id, count(*) c
+	FROM gj_large_owner o JOIN gj_large_probe p USING (id)
+	GROUP BY o.id
+)
+----
+4097	13194
+
+# Empty/no-match inputs and one-match-per-group all retain INNER semantics.
+statement ok
+CREATE TABLE gj_empty_owner(id INTEGER PRIMARY KEY)
+
+statement ok
+CREATE TABLE gj_empty_probe(id INTEGER, value INTEGER)
+
+query I
+SELECT count(*) FROM (
+	SELECT o.id, count(*) FROM gj_empty_owner o JOIN gj_probe p ON o.id = p.owner_id GROUP BY o.id
+)
+----
+0
+
+query I
+SELECT count(*) FROM (
+	SELECT o.id, count(*) FROM gj_owner o JOIN gj_empty_probe p ON o.id = p.id GROUP BY o.id
+)
+----
+0
+
+query I
+SELECT count(*) FROM (
+	SELECT o.id, count(*) FROM gj_empty_owner o JOIN gj_empty_probe p ON o.id = p.id GROUP BY o.id
+)
+----
+0
+
+statement ok
+INSERT INTO gj_empty_probe VALUES (99, 1), (100, 2)
+
+query I
+SELECT count(*) FROM (
+	SELECT o.id, count(*) FROM gj_owner o JOIN gj_empty_probe p ON o.id = p.id GROUP BY o.id
+)
+----
+0
+
+statement ok
+CREATE TABLE gj_one_probe(id INTEGER)
+
+statement ok
+INSERT INTO gj_one_probe VALUES (1), (2), (3), (4)
+
+query II rowsort
+SELECT o.id, count(*) FROM gj_owner o JOIN gj_one_probe p ON o.id = p.id GROUP BY o.id
+----
+1	1
+2	1
+3	1
+4	1
+
+# UNIQUE is accepted only when every key column is NOT NULL.
+statement ok
+CREATE TABLE gj_unique_not_null(id INTEGER UNIQUE NOT NULL)
+
+statement ok
+INSERT INTO gj_unique_not_null VALUES (1), (2)
+
+query II
+EXPLAIN SELECT o.id, count(*) FROM gj_unique_not_null o JOIN gj_probe p ON o.id = p.owner_id GROUP BY o.id
+----
+physical_plan	<REGEX>:.*Hash Group Join.*
+
+# Rejection cases fall back to the existing plan.
+statement ok
+CREATE TABLE gj_nonunique(id INTEGER)
+
+statement ok
+INSERT INTO gj_nonunique VALUES (1), (1), (2)
+
+query II
+EXPLAIN SELECT o.id, count(*) FROM gj_nonunique o JOIN gj_probe p ON o.id = p.owner_id GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+statement ok
+CREATE TABLE gj_nullable_unique(id INTEGER UNIQUE)
+
+query II
+EXPLAIN SELECT o.id, count(*) FROM gj_nullable_unique o JOIN gj_probe p ON o.id = p.owner_id GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.id, count(*) FROM gj_owner o LEFT JOIN gj_probe p ON o.id = p.owner_id GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.id, count(*) FROM gj_owner o RIGHT JOIN gj_probe p ON o.id = p.owner_id GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.id, count(*) FROM gj_owner o FULL JOIN gj_probe p ON o.id = p.owner_id GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.id, count(*) FROM gj_owner o SEMI JOIN gj_probe p ON o.id = p.owner_id GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.id, count(*) FROM gj_owner o ANTI JOIN gj_probe p ON o.id = p.owner_id GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.id, count(*) FROM gj_owner o JOIN gj_probe p ON o.id < p.owner_id GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.id, count(*)
+FROM gj_owner o JOIN gj_probe p ON o.id IS NOT DISTINCT FROM p.owner_id
+GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.id, count(*)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id AND p.value > o.payload
+GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.payload, count(*)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.payload
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.owner_key, count(*)
+FROM (SELECT id * 2 AS owner_key FROM gj_owner) o JOIN gj_probe p ON o.owner_key = p.owner_id
+GROUP BY o.owner_key
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.a, count(*)
+FROM gj_composite_owner o JOIN gj_composite_probe p ON o.a = p.a
+GROUP BY o.a
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.id, first(p.value ORDER BY p.value)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II rowsort
+SELECT o.id, first(p.value ORDER BY p.value)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+1	10
+2	5
+
+query II
+EXPLAIN SELECT o.id, o.payload, count(*)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id, o.payload
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.id, count(DISTINCT p.value)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.id, count(*) FILTER (WHERE p.value > 0)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.id, list(p.value ORDER BY p.value)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.id, sum(o.payload)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.id, sum(p.value + o.payload)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.id, sum(p.value + random())
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.id, count(*)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY GROUPING SETS ((o.id), ())
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+# Force does not suppress the existing eager aggregate rewrite for an ineligible candidate.
+statement ok
+CREATE TABLE gj_eager_probe(id INTEGER, value INTEGER)
+
+statement ok
+INSERT INTO gj_eager_probe SELECT (i % 3) + 1, i FROM range(10000) t(i)
+
+query II
+EXPLAIN SELECT o.id, sum(p.value)
+FROM gj_nonunique o JOIN gj_eager_probe p ON o.id = p.id
+GROUP BY o.id
+----
+physical_plan	<REGEX>:.*EXPORT_STATE.*
+
+statement ok
+RESET debug_group_join_strategy
+
+# The default remains disabled after reset.
+query II
+EXPLAIN SELECT o.id, count(*) FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+statement ok
+SET debug_group_join_strategy = 'auto'
+
+query II
+EXPLAIN SELECT o.id, count(*) FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+statement ok
+RESET debug_group_join_strategy

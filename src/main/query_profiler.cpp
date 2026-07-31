@@ -197,6 +197,7 @@ bool QueryProfiler::OperatorRequiresProfiling(const PhysicalOperatorType op_type
 	case PhysicalOperatorType::RECURSIVE_CTE:
 	case PhysicalOperatorType::RECURSIVE_KEY_CTE:
 	case PhysicalOperatorType::RECURSIVE_KEY_JOIN:
+	case PhysicalOperatorType::HASH_GROUP_JOIN:
 	case PhysicalOperatorType::EMPTY_RESULT:
 	case PhysicalOperatorType::EXTENSION:
 		return true;

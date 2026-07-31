@@ -4,16 +4,41 @@
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
+#include "duckdb/execution/operator/join/physical_hash_group_join.hpp"
 #include "duckdb/execution/operator/aggregate/physical_partitioned_aggregate.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/function_binder.hpp"
+#include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/optimizer/hash_group_join.hpp"
+#include "duckdb/execution/group_join_strategy.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 
 namespace duckdb {
+
+static void RewriteGroupJoinProbeReferences(unique_ptr<Expression> &expression, idx_t probe_child,
+                                            idx_t left_column_count) {
+	if (expression->GetExpressionClass() == ExpressionClass::BOUND_REF) {
+		auto &reference = expression->Cast<BoundReferenceExpression>();
+		if (probe_child == 1) {
+			if (reference.Index() < left_column_count) {
+				throw InternalException("HASH_GROUP_JOIN aggregate unexpectedly referenced the owner child");
+			}
+			reference.IndexMutable() -= left_column_count;
+		} else if (reference.Index() >= left_column_count) {
+			throw InternalException("HASH_GROUP_JOIN aggregate unexpectedly referenced the owner child");
+		}
+		return;
+	}
+	ExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<Expression> &child) {
+		RewriteGroupJoinProbeReferences(child, probe_child, left_column_count);
+	});
+}
 
 static uint32_t RequiredBitsForValue(uint32_t n) {
 	idx_t required_bits = 0;
@@ -238,6 +263,60 @@ static bool CanUsePerfectHashAggregate(ClientContext &context, LogicalAggregate 
 
 PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalAggregate &op) {
 	D_ASSERT(op.children.size() == 1);
+	if (Settings::Get<DebugGroupJoinStrategySetting>(context) == GroupJoinStrategy::FORCE &&
+	    op.children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = op.children[0]->Cast<LogicalComparisonJoin>();
+		auto candidate = TryGetHashGroupJoinCandidate(op, join, context);
+		if (candidate) {
+			reference<PhysicalOperator> probe = CreatePlan(*join.children[candidate->probe_child]);
+			reference<PhysicalOperator> owner = CreatePlan(*join.children[candidate->owner_child]);
+
+			vector<unique_ptr<Expression>> owner_expressions;
+			vector<LogicalType> owner_types;
+			vector<unique_ptr<Expression>> probe_expressions;
+			vector<LogicalType> probe_types;
+			vector<unique_ptr<Expression>> groups;
+			for (idx_t group_idx = 0; group_idx < candidate->owner_key_indices.size(); group_idx++) {
+				auto owner_idx = candidate->owner_key_indices[group_idx];
+				auto probe_idx = candidate->probe_key_indices[group_idx];
+				auto type = owner.get().GetTypes()[owner_idx];
+				owner_types.push_back(type);
+				owner_expressions.push_back(make_uniq<BoundReferenceExpression>(type, owner_idx));
+				probe_types.push_back(type);
+				probe_expressions.push_back(make_uniq<BoundReferenceExpression>(type, probe_idx));
+				groups.push_back(make_uniq<BoundReferenceExpression>(type, group_idx));
+			}
+
+			vector<unique_ptr<Expression>> aggregates;
+			FunctionBinder function_binder(context);
+			aggregates.push_back(function_binder.BindAggregateFunction(CountStarFun::GetFunction(), {}, nullptr,
+			                                                           AggregateType::NON_DISTINCT));
+			const auto left_column_count = join.children[0]->GetColumnBindings().size();
+			for (auto &expression : op.expressions) {
+				auto &aggregate = expression->Cast<BoundAggregateExpression>();
+				for (auto &child : aggregate.GetChildrenMutable()) {
+					RewriteGroupJoinProbeReferences(child, candidate->probe_child, left_column_count);
+					auto type = child->GetReturnType();
+					auto projection_index = probe_expressions.size();
+					probe_types.push_back(type);
+					probe_expressions.push_back(std::move(child));
+					child = make_uniq<BoundReferenceExpression>(type, projection_index);
+				}
+				aggregates.push_back(std::move(expression));
+			}
+
+			auto &probe_projection = Make<PhysicalProjection>(std::move(probe_types), std::move(probe_expressions),
+			                                                  probe.get().estimated_cardinality);
+			probe_projection.children.push_back(probe);
+			auto &owner_projection = Make<PhysicalProjection>(std::move(owner_types), std::move(owner_expressions),
+			                                                  owner.get().estimated_cardinality);
+			owner_projection.children.push_back(owner);
+			auto &group_join =
+			    Make<PhysicalHashGroupJoin>(op, probe_projection, owner_projection, std::move(aggregates),
+			                                std::move(groups), op.estimated_cardinality);
+			return group_join;
+		}
+	}
 
 	reference<PhysicalOperator> plan = CreatePlan(*op.children[0]);
 	plan = ExtractAggregateExpressions(plan, op.expressions, op.groups, op.grouping_sets);

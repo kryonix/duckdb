@@ -1,0 +1,10 @@
+# name: benchmark/micro/groupjoin/integer_4agg_eager.benchmark
+# group: [groupjoin]
+
+template benchmark/micro/groupjoin/groupjoin.benchmark.in
+LABEL=integer/4 aggregates/eager
+STRATEGY=disabled
+DISABLED_OPTIMIZERS=top_n
+KEY_COLUMNS=int_key
+AGGREGATES=count(*) AS row_count, sum(value) AS total_value, min(value) AS min_value, max(value) AS max_value
+SUMMARY=count(*) AS group_count, sum(row_count) AS match_count, sum(total_value) AS total_value, sum(min_value) AS min_sum, sum(max_value) AS max_sum
