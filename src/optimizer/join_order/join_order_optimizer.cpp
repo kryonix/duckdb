@@ -61,6 +61,10 @@ unique_ptr<LogicalOperator> JoinOrderOptimizer::Optimize(unique_ptr<LogicalOpera
 			                                  group_join_context->state_width,
 			                                  group_join_context->routed,
 			                                  group_join_context->direct_inner,
+			                                  group_join_context->fixed_size_keys,
+			                                  group_join_context->physical_eager_supported,
+			                                  group_join_context->perfect_supported,
+			                                  group_join_context->perfect_range,
 			                                  group_join_context->strategy};
 			bool valid = true;
 			auto map_relations = [&](const unordered_set<TableIndex> &tables, unordered_set<RelationIndex> &relations) {

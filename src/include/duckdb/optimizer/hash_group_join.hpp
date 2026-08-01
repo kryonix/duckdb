@@ -50,11 +50,16 @@ struct HashGroupJoinCostEstimate {
 	idx_t state_width = 0;
 	double separate_cost = 0;
 	double eager_cost = 0;
+	double physical_eager_cost = 0;
+	double perfect_cost = 0;
 	double memoizing_cost = 0;
 	double index_cost = 0;
 	GroupJoinExecutionMode execution_mode = GroupJoinExecutionMode::AUTO;
 	bool index_available = false;
 	bool index_selected = false;
+	bool physical_eager_selected = false;
+	bool perfect_available = false;
+	bool perfect_selected = false;
 	bool hash_selected = false;
 };
 
@@ -65,6 +70,10 @@ struct HashGroupJoinOrderContext {
 	idx_t state_width = 0;
 	bool routed = false;
 	bool direct_inner = false;
+	bool fixed_size_keys = true;
+	bool physical_eager_supported = false;
+	bool perfect_supported = false;
+	idx_t perfect_range = 0;
 	GroupJoinStrategy strategy = GroupJoinStrategy::AUTO;
 };
 
@@ -82,7 +91,9 @@ HashGroupJoinCostEstimate EstimateHashGroupJoinCost(LogicalAggregate &aggregate,
 
 HashGroupJoinCostEstimate EstimateHashGroupJoinAlternatives(idx_t owner_rows, idx_t probe_rows, idx_t match_rows,
                                                             idx_t matched_groups, idx_t key_width, idx_t state_width,
-                                                            bool routed, bool direct_inner, ClientContext &context);
+                                                            bool routed, bool direct_inner, bool fixed_size_keys,
+                                                            bool physical_eager_supported, bool perfect_supported,
+                                                            idx_t perfect_range, ClientContext &context);
 
 optional<HashGroupJoinOrderContext> GetHashGroupJoinOrderContext(LogicalAggregate &aggregate, ClientContext &context);
 

@@ -72,6 +72,13 @@ struct ClusteredAggr {
 		}
 	}
 
+	void InitializeStatesFromAddresses(const data_ptr_t *addresses, idx_t offset) {
+		for (idx_t r = 0; r < n_group_runs; r++) {
+			const auto input_idx = group_runs[r].sel ? group_runs[r].sel[0] : sel_t(0);
+			group_runs[r].state = addresses[input_idx] + offset;
+		}
+	}
+
 	//! Returns a composed dict sel for simple dictionary input, or nullptr.
 	const sel_t *ClusterIter(const Vector &input, idx_t count) const;
 

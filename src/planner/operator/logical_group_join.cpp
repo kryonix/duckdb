@@ -18,14 +18,15 @@ InsertionOrderPreservingMap<string> LogicalGroupJoin::ParamsToString() const {
 	                                                                                  : "OWNER OUTER";
 	result["Owner Key"] = unique_owner ? "UNIQUE" : "GENERAL";
 	result["Routing"] = routed ? "ROUTED" : "DIRECT";
-	result["Implementation"] = use_index ? "INDEX" : "HASH";
+	result["Implementation"] = EnumUtil::ToString(implementation);
 	result["Strategy"] = EnumUtil::ToString(execution_mode);
 	if (estimated_owner_rows != 0 || estimated_probe_rows != 0 || estimated_match_rows != 0) {
 		result["Strategy Cardinalities"] = StringUtil::Format(
 		    "owner=%llu, probe=%llu, matches=%llu, groups=%llu, probe keys=%llu", estimated_owner_rows,
 		    estimated_probe_rows, estimated_match_rows, estimated_matched_groups, estimated_distinct_probe_keys);
-		result["Strategy Costs"] = StringUtil::Format("separate=%.2f, eager=%.2f, memoizing=%.2f, index=%.2f",
-		                                              separate_cost, eager_cost, memoizing_cost, index_cost);
+		result["Strategy Costs"] = StringUtil::Format(
+		    "separate=%.2f, eager=%.2f, physical eager=%.2f, perfect=%.2f, memoizing=%.2f, index=%.2f", separate_cost,
+		    eager_cost, physical_eager_cost, perfect_cost, memoizing_cost, index_cost);
 	}
 	return result;
 }

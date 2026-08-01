@@ -57,6 +57,12 @@ struct RowOperations {
 	                                  AggregateFilterDataSet *filter_set, const unsafe_vector<idx_t> *filter,
 	                                  Vector &addresses, DataChunk &payload, ClusteredAggr &clustered,
 	                                  bool skip_addresses);
+	//! clustered update loop for a contiguous range of aggregate states
+	static void UpdateStatesClusteredRange(RowOperationsState &state, vector<AggregateObject> &aggregates,
+	                                       idx_t aggregate_begin, idx_t aggregate_count,
+	                                       AggregateFilterDataSet *filter_set, const unsafe_vector<idx_t> *filter,
+	                                       Vector &addresses, DataChunk &payload, ClusteredAggr &clustered,
+	                                       bool skip_addresses);
 	//! combine - unaligned addresses, updated
 	static void CombineStates(RowOperationsState &state, TupleDataLayout &layout, Vector &sources, Vector &targets);
 	//! combine a contiguous range of compatible aggregate states from one layout into another

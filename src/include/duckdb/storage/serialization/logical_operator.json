@@ -133,6 +133,11 @@
     "class": "LogicalGroupJoin",
     "base": "LogicalOperator",
     "enum": "LOGICAL_GROUP_JOIN",
+    "finalize_deserialization": [
+      "if (use_index && result->implementation == GroupJoinImplementation::MEMOIZING_HASH) {",
+      "\tresult->implementation = GroupJoinImplementation::INDEX;",
+      "}"
+    ],
     "members": [
       {
         "id": 200,
@@ -242,6 +247,8 @@
         "id": 220,
         "name": "use_index",
         "type": "bool",
+        "serialize_property": "implementation == GroupJoinImplementation::INDEX",
+        "deserialize_skip_assign": true,
         "default": "false"
       },
       {
@@ -301,6 +308,42 @@
       {
         "id": 230,
         "name": "index_cost",
+        "type": "double",
+        "default": "0"
+      },
+      {
+        "id": 231,
+        "name": "perfect_min",
+        "type": "Value",
+        "default": "Value()"
+      },
+      {
+        "id": 232,
+        "name": "perfect_max",
+        "type": "Value",
+        "default": "Value()"
+      },
+      {
+        "id": 233,
+        "name": "perfect_range",
+        "type": "idx_t",
+        "default": "0"
+      },
+      {
+        "id": 234,
+        "name": "physical_eager_cost",
+        "type": "double",
+        "default": "0"
+      },
+      {
+        "id": 235,
+        "name": "implementation",
+        "type": "GroupJoinImplementation",
+        "default": "GroupJoinImplementation::MEMOIZING_HASH"
+      },
+      {
+        "id": 236,
+        "name": "perfect_cost",
         "type": "double",
         "default": "0"
       }

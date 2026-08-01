@@ -1,0 +1,10 @@
+# name: benchmark/micro/groupjoin/integer_count_eager.benchmark
+# group: [groupjoin]
+
+template benchmark/micro/groupjoin/groupjoin.benchmark.in
+LABEL=integer/count/eager
+STRATEGY=eager
+DISABLED_OPTIMIZERS=top_n
+KEY_COLUMNS=int_key
+AGGREGATES=count(*) AS row_count
+SUMMARY=count(*) AS group_count, sum(row_count) AS match_count

@@ -16,6 +16,9 @@
 
 namespace duckdb {
 class BoundFunctionExpression;
+class ArenaAllocator;
+class Vector;
+struct AggregateObject;
 
 struct ConstantOrNull {
 	static unique_ptr<FunctionData> Bind(Value value);
@@ -32,6 +35,9 @@ struct ExportAggregateFunctionBindData : public FunctionData {
 struct ExportAggregateFunction {
 	static unique_ptr<BoundAggregateExpression> Bind(unique_ptr<BoundAggregateExpression> child_aggregate);
 	static void SetStateExport(BoundAggregateExpression &aggregate, LogicalType state_layout);
+	//! Imports serialized states and combines them into initialized target state addresses.
+	static void CombineStates(const AggregateObject &aggregate, Vector &serialized_states, Vector &target_states,
+	                          ArenaAllocator &allocator);
 };
 
 } // namespace duckdb

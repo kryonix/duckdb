@@ -20,6 +20,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
+#include "duckdb/execution/operator/aggregate/aggregate_object.hpp"
 
 namespace duckdb {
 
@@ -60,7 +61,7 @@ struct ExportAggregateBindData : public FunctionData {
 };
 
 template <class OP, class... ARGS>
-void TemplateDispatch(PhysicalType type, ARGS &&... args) {
+void TemplateDispatch(PhysicalType type, ARGS &&...args) {
 	switch (type) {
 	case PhysicalType::BOOL:
 		OP::template Operation<bool>(std::forward<ARGS>(args)...);
@@ -1103,6 +1104,41 @@ ExportAggregateFunction::Bind(unique_ptr<BoundAggregateExpression> child_aggrega
 	}
 	SetStateExport(*child_aggregate, CreateAggregateStateType(bound_function, child_aggregate->BindInfo().get()));
 	return child_aggregate;
+}
+
+void ExportAggregateFunction::CombineStates(const AggregateObject &aggregate, Vector &serialized_states,
+                                            Vector &target_states, ArenaAllocator &allocator) {
+	const auto count = target_states.size();
+	if (serialized_states.size() != count) {
+		throw InternalException("Exported aggregate state count (%llu) does not match target count (%llu)",
+		                        serialized_states.size(), count);
+	}
+	if (count == 0) {
+		return;
+	}
+	auto &function = aggregate.function;
+	if (!function.HasStateCombineCallback()) {
+		throw InternalException("Aggregate function %s does not support state combination", function.GetName());
+	}
+	auto layout = GetLayout(function, aggregate.GetFunctionData());
+	auto state_buffer = make_unsafe_uniq_array<data_t>(count * layout.total_state_size);
+	Vector source_states(LogicalType::POINTER);
+	auto source_data = FlatVector::Writer<data_ptr_t>(source_states, count);
+	AggregateStateInput state_input(function, aggregate.GetFunctionData());
+	for (idx_t row_idx = 0; row_idx < count; row_idx++) {
+		auto state_ptr = state_buffer.get() + row_idx * layout.total_state_size;
+		function.GetStateInitCallback()(state_input, &state_ptr, 1);
+		source_data.WriteValue(state_ptr);
+	}
+	try {
+		DeserializeState(function, layout, serialized_states, count, state_buffer.get(), allocator);
+		AggregateInputData combine_input(aggregate, allocator, AggregateCombineType::ALLOW_DESTRUCTIVE);
+		function.GetStateCombineCallback()(source_states, target_states, combine_input, count);
+	} catch (...) {
+		DestroyExportStates(function, aggregate.GetFunctionData(), source_states, count, allocator);
+		throw;
+	}
+	DestroyExportStates(function, aggregate.GetFunctionData(), source_states, count, allocator);
 }
 
 ExportAggregateFunctionBindData::ExportAggregateFunctionBindData(unique_ptr<Expression> aggregate_p) {

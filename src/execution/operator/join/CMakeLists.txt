@@ -14,6 +14,7 @@ add_library_unity(
   physical_index_group_join.cpp
   physical_join.cpp
   physical_nested_loop_join.cpp
+  perfect_group_join_executor.cpp
   perfect_hash_join_executor.cpp
   physical_piecewise_merge_join.cpp
   physical_positional_join.cpp

@@ -268,6 +268,8 @@ enum class GroupByExpressionInfoType : uint8_t;
 
 enum class GroupJoinExecutionMode : uint8_t;
 
+enum class GroupJoinImplementation : uint8_t;
+
 enum class GroupJoinStrategy : uint8_t;
 
 enum class HLLStorageType : uint8_t;
@@ -976,6 +978,9 @@ const char* EnumUtil::ToChars<GroupByExpressionInfoType>(GroupByExpressionInfoTy
 
 template<>
 const char* EnumUtil::ToChars<GroupJoinExecutionMode>(GroupJoinExecutionMode value);
+
+template<>
+const char* EnumUtil::ToChars<GroupJoinImplementation>(GroupJoinImplementation value);
 
 template<>
 const char* EnumUtil::ToChars<GroupJoinStrategy>(GroupJoinStrategy value);
@@ -1862,6 +1867,9 @@ GroupByExpressionInfoType EnumUtil::FromString<GroupByExpressionInfoType>(const 
 
 template<>
 GroupJoinExecutionMode EnumUtil::FromString<GroupJoinExecutionMode>(const char *value);
+
+template<>
+GroupJoinImplementation EnumUtil::FromString<GroupJoinImplementation>(const char *value);
 
 template<>
 GroupJoinStrategy EnumUtil::FromString<GroupJoinStrategy>(const char *value);

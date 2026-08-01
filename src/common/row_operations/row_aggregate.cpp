@@ -80,11 +80,21 @@ void RowOperations::UpdateStatesClustered(RowOperationsState &state, vector<Aggr
                                           AggregateFilterDataSet *filter_set, const unsafe_vector<idx_t> *filter,
                                           Vector &addresses, DataChunk &payload, ClusteredAggr &clustered,
                                           bool skip_addresses) {
+	UpdateStatesClusteredRange(state, aggregates, 0, aggregates.size(), filter_set, filter, addresses, payload,
+	                           clustered, skip_addresses);
+}
+
+void RowOperations::UpdateStatesClusteredRange(RowOperationsState &state, vector<AggregateObject> &aggregates,
+                                               idx_t aggregate_begin, idx_t aggregate_count,
+                                               AggregateFilterDataSet *filter_set, const unsafe_vector<idx_t> *filter,
+                                               Vector &addresses, DataChunk &payload, ClusteredAggr &clustered,
+                                               bool skip_addresses) {
 	idx_t filter_idx = 0;
 	idx_t payload_idx = 0;
-	for (idx_t aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
+	for (idx_t range_idx = 0; range_idx < aggregate_count; range_idx++) {
+		const auto aggr_idx = aggregate_begin + range_idx;
 		auto &aggr = aggregates[aggr_idx];
-		if (filter && (filter_idx >= filter->size() || aggr_idx < (*filter)[filter_idx])) {
+		if (filter && (filter_idx >= filter->size() || range_idx < (*filter)[filter_idx])) {
 			// Skip all the aggregates that are not in the filter
 			payload_idx += aggr.child_count;
 			if (!skip_addresses) {
@@ -94,7 +104,7 @@ void RowOperations::UpdateStatesClustered(RowOperationsState &state, vector<Aggr
 			continue;
 		}
 		if (filter) {
-			D_ASSERT(aggr_idx == (*filter)[filter_idx]);
+			D_ASSERT(range_idx == (*filter)[filter_idx]);
 		}
 
 		if (aggr.aggr_type != AggregateType::DISTINCT && aggr.filter) {

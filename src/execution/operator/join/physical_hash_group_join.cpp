@@ -11,6 +11,7 @@
 #include "duckdb/execution/group_join_strategy.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/execution/operator/join/perfect_group_join_executor.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/base_pipeline_event.hpp"
 #include "duckdb/parallel/executor_task.hpp"
@@ -20,6 +21,7 @@
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 
 namespace duckdb {
 
@@ -118,32 +120,40 @@ static void StoreGroupJoinId(const TupleDataLayout &layout, data_ptr_t row, idx_
 	state.value = NumericCast<uint64_t>(group_id) + 1;
 }
 
-PhysicalHashGroupJoin::PhysicalHashGroupJoin(PhysicalPlan &physical_plan, LogicalAggregate &op, PhysicalOperator &probe,
-                                             PhysicalOperator &owner, vector<unique_ptr<Expression>> aggregates,
-                                             vector<unique_ptr<Expression>> owner_payload_aggregates,
-                                             vector<unique_ptr<Expression>> groups,
-                                             vector<HashGroupJoinOutputColumn> output_groups_p,
-                                             HashGroupJoinUnmatchedPolicy unmatched_policy_p, bool routed_p,
-                                             bool unique_owner_p, bool single_match_p,
-                                             unique_ptr<JoinFilterPushdownInfo> filter_pushdown_p,
-                                             GroupJoinExecutionMode execution_mode_p, idx_t estimated_cardinality)
+PhysicalHashGroupJoin::PhysicalHashGroupJoin(
+    PhysicalPlan &physical_plan, LogicalAggregate &op, PhysicalOperator &probe, PhysicalOperator &owner,
+    vector<unique_ptr<Expression>> aggregates, vector<unique_ptr<Expression>> owner_payload_aggregates,
+    vector<unique_ptr<Expression>> groups, vector<HashGroupJoinOutputColumn> output_groups_p,
+    HashGroupJoinUnmatchedPolicy unmatched_policy_p, bool routed_p, bool unique_owner_p, bool single_match_p,
+    unique_ptr<JoinFilterPushdownInfo> filter_pushdown_p, GroupJoinImplementation implementation_p,
+    GroupJoinExecutionMode execution_mode_p, Value perfect_min_p, Value perfect_max_p, idx_t perfect_range_p,
+    vector<LogicalType> eager_payload_types_p, vector<LogicalType> unmatched_probe_types_p,
+    vector<unique_ptr<Expression>> unmatched_payload_expressions_p, idx_t estimated_cardinality)
     : PhysicalJoin(physical_plan, op, PhysicalOperatorType::HASH_GROUP_JOIN, JoinType::INNER, estimated_cardinality),
-      output_groups(std::move(output_groups_p)), unmatched_policy(unmatched_policy_p), routed(routed_p),
-      unique_owner(unique_owner_p), single_match(single_match_p), null_equal(false), static_mode(false),
+      output_groups(std::move(output_groups_p)), unmatched_policy(unmatched_policy_p),
+      eager_payload_types(std::move(eager_payload_types_p)), routed(routed_p), unique_owner(unique_owner_p),
+      single_match(single_match_p), null_equal(false), static_mode(false),
       parallel_owner_build(unique_owner_p && !routed_p &&
                            owner.estimated_cardinality >= GROUP_JOIN_PARALLEL_BUILD_THRESHOLD),
-      planned_execution_mode(execution_mode_p), filter_pushdown(std::move(filter_pushdown_p)) {
+      implementation(implementation_p), planned_execution_mode(execution_mode_p), perfect_min(std::move(perfect_min_p)),
+      perfect_max(std::move(perfect_max_p)), perfect_range(perfect_range_p),
+      filter_pushdown(std::move(filter_pushdown_p)) {
 	for (auto &group : op.groups) {
 		output_group_types.push_back(group->GetReturnType());
 	}
 	grouped_aggregate_data.InitializeGroupby(std::move(groups), std::move(aggregates), {});
 	owner_payload_data.InitializeGroupby({}, std::move(owner_payload_aggregates), {});
-	auto &probe_projection = probe.Cast<PhysicalProjection>();
-	D_ASSERT(probe_projection.children.size() == 1);
-	unmatched_probe_types = probe_projection.children[0].get().GetTypes();
-	for (idx_t payload_idx = grouped_aggregate_data.group_types.size();
-	     payload_idx < probe_projection.select_list.size(); payload_idx++) {
-		unmatched_payload_expressions.push_back(probe_projection.select_list[payload_idx]->Copy());
+	if (!unmatched_probe_types_p.empty()) {
+		unmatched_probe_types = std::move(unmatched_probe_types_p);
+		unmatched_payload_expressions = std::move(unmatched_payload_expressions_p);
+	} else {
+		auto &probe_projection = probe.Cast<PhysicalProjection>();
+		D_ASSERT(probe_projection.children.size() == 1);
+		unmatched_probe_types = probe_projection.children[0].get().GetTypes();
+		for (idx_t payload_idx = grouped_aggregate_data.group_types.size();
+		     payload_idx < probe_projection.select_list.size(); payload_idx++) {
+			unmatched_payload_expressions.push_back(probe_projection.select_list[payload_idx]->Copy());
+		}
 	}
 	for (auto &group : op.groups) {
 		output_group_names.push_back(group->GetName().GetIdentifierName());
@@ -151,7 +161,9 @@ PhysicalHashGroupJoin::PhysicalHashGroupJoin(PhysicalPlan &physical_plan, Logica
 	idx_t payload_index = 0;
 	for (idx_t aggregate_idx = 0; aggregate_idx < grouped_aggregate_data.aggregates.size(); aggregate_idx++) {
 		auto &aggregate = grouped_aggregate_data.aggregates[aggregate_idx]->Cast<BoundAggregateExpression>();
-		if (aggregate.IsDistinct()) {
+		if (implementation == GroupJoinImplementation::EAGER_HASH) {
+			non_distinct_filter.push_back(aggregate_idx);
+		} else if (aggregate.IsDistinct()) {
 			vector<LogicalType> argument_types;
 			for (auto &child : aggregate.GetChildren()) {
 				argument_types.push_back(child->GetReturnType());
@@ -178,7 +190,8 @@ PhysicalHashGroupJoin::PhysicalHashGroupJoin(PhysicalPlan &physical_plan, Logica
     : PhysicalJoin(physical_plan, op, PhysicalOperatorType::HASH_GROUP_JOIN, JoinType::INNER, estimated_cardinality),
       output_columns(std::move(output_columns_p)), unmatched_policy(HashGroupJoinUnmatchedPolicy::EMPTY_AGGREGATE),
       routed(false), unique_owner(false), single_match(false), null_equal(true), static_mode(true),
-      parallel_owner_build(false), planned_execution_mode(GroupJoinExecutionMode::AUTO) {
+      parallel_owner_build(false), implementation(GroupJoinImplementation::MEMOIZING_HASH),
+      planned_execution_mode(GroupJoinExecutionMode::AUTO), perfect_range(0) {
 	for (auto &group : groups) {
 		output_group_types.push_back(group->GetReturnType());
 		output_group_names.push_back(group->GetName().GetIdentifierName());
@@ -261,10 +274,24 @@ public:
 			    op.null_equal ? TupleDataValidityType::CAN_HAVE_NULL_VALUES
 			                  : TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 		}
+		if (!op.routed && op.unique_owner && !op.null_equal && !parallel_build) {
+			hash_table->SkipLookups();
+			skipped_unique_build = true;
+			if ((op.implementation == GroupJoinImplementation::PERFECT_HASH ||
+			     op.implementation == GroupJoinImplementation::EAGER_HASH) &&
+			    op.grouped_aggregate_data.group_types.size() == 1 && !op.perfect_min.IsNull() &&
+			    !op.perfect_max.IsNull() &&
+			    PerfectGroupJoinDirectoryFits(op.perfect_range,
+			                                  BufferManager::GetBufferManager(context).GetMaxMemory())) {
+				perfect_executor = make_uniq<PerfectGroupJoinExecutor>(
+				    op.grouped_aggregate_data.group_types[0], op.perfect_min, op.perfect_max, op.perfect_range);
+			}
+		}
 	}
 
 	unique_ptr<GroupedAggregateHashTable> hash_table;
 	unique_ptr<GroupedAggregateHashTable> final_hash_table;
+	unique_ptr<PerfectGroupJoinExecutor> perfect_executor;
 	vector<data_ptr_t> group_addresses;
 	vector<vector<idx_t>> route_build_groups;
 	vector<idx_t> route_offsets;
@@ -278,6 +305,7 @@ public:
 	unique_ptr<ColumnDataCollection> filter_keys;
 	bool external;
 	bool parallel_build;
+	bool skipped_unique_build = false;
 	mutex lock;
 	vector<unique_ptr<GroupedAggregateHashTable>> local_hash_tables;
 	unique_ptr<RadixPartitionedColumnData> owner_partitions;
@@ -304,7 +332,7 @@ class HashGroupJoinLocalSinkState : public LocalSinkState {
 public:
 	HashGroupJoinLocalSinkState(ExecutionContext &context, const PhysicalHashGroupJoin &op)
 	    : addresses(LogicalType::POINTER), new_groups(STANDARD_VECTOR_SIZE), final_addresses(LogicalType::POINTER),
-	      final_new_groups(STANDARD_VECTOR_SIZE), hashes(LogicalType::HASH) {
+	      final_new_groups(STANDARD_VECTOR_SIZE), hashes(LogicalType::HASH), perfect_group_ids(LogicalType::UBIGINT) {
 		auto &sink = op.sink_state->Cast<HashGroupJoinGlobalSinkState>();
 		owner_keys.InitializeEmpty(op.grouped_aggregate_data.group_types);
 		owner_payload.InitializeEmpty(op.owner_payload_data.payload_types);
@@ -352,6 +380,7 @@ public:
 	unique_ptr<JoinFilterLocalState> local_filter_state;
 	unique_ptr<ColumnDataCollection> filter_keys;
 	Vector hashes;
+	Vector perfect_group_ids;
 	DataChunk partition_chunk;
 	unique_ptr<PartitionedColumnData> owner_partitions;
 	PartitionedColumnDataAppendState owner_partition_append;
@@ -405,6 +434,11 @@ SinkResultType PhysicalHashGroupJoin::Sink(ExecutionContext &context, DataChunk 
 	}
 	auto addresses = FlatVector::GetData<data_ptr_t>(local_state.addresses);
 	auto &layout = build_table.GetLayout();
+	uint64_t *perfect_group_ids = nullptr;
+	if (global_state.perfect_executor) {
+		local_state.perfect_group_ids.SetVectorType(VectorType::FLAT_VECTOR);
+		perfect_group_ids = FlatVector::GetDataMutable<uint64_t>(local_state.perfect_group_ids);
+	}
 	const auto group_id_begin = global_state.parallel_build
 	                                ? global_state.next_group_id.fetch_add(new_group_count, std::memory_order_relaxed)
 	                                : idx_t(0);
@@ -414,10 +448,20 @@ SinkResultType PhysicalHashGroupJoin::Sink(ExecutionContext &context, DataChunk 
 		                      : routed                    ? global_state.route_build_groups.size()
 		                                                  : global_state.group_addresses.size();
 		StoreGroupJoinId(layout, addresses[row_idx], group_id);
+		if (perfect_group_ids) {
+			perfect_group_ids[row_idx] = group_id;
+		}
 		if (routed) {
 			global_state.route_build_groups.emplace_back();
 		} else if (!global_state.parallel_build) {
 			global_state.group_addresses.push_back(addresses[row_idx]);
+		}
+	}
+	if (global_state.perfect_executor) {
+		FlatVector::SetSize(local_state.perfect_group_ids, chunk.size());
+		if (!global_state.perfect_executor->Sink(local_state.owner_keys.data[0], local_state.addresses,
+		                                         local_state.perfect_group_ids)) {
+			global_state.perfect_executor.reset();
 		}
 	}
 	if (static_mode) {
@@ -651,6 +695,15 @@ SinkFinalizeType PhysicalHashGroupJoin::Finalize(Pipeline &pipeline, Event &even
 		state.local_hash_tables.clear();
 		state.hash_table->PrepareUniqueFinalize(group_count);
 		state.group_addresses.resize(group_count, nullptr);
+	} else if (state.skipped_unique_build && !state.perfect_executor) {
+		state.hash_table->PrepareUniqueFinalize(state.owner_rows);
+		vector<data_ptr_t> finalized_addresses;
+		for (idx_t partition_idx = 0; partition_idx < state.hash_table->GetPartitionedData().PartitionCount();
+		     partition_idx++) {
+			state.hash_table->FinalizeUniquePartition(partition_idx, finalized_addresses, false);
+			finalized_addresses.clear();
+		}
+		state.hash_table->VerifyUniqueFinalize();
 	}
 	if (filter_pushdown) {
 		D_ASSERT(state.global_filter_state);
@@ -734,7 +787,8 @@ static GroupJoinExecutionMode ResolveGroupJoinExecutionMode(ClientContext &conte
 class HashGroupJoinGlobalOperatorState : public GlobalOperatorState {
 public:
 	HashGroupJoinGlobalOperatorState(ClientContext &context, const PhysicalHashGroupJoin &op)
-	    : execution_mode(ResolveGroupJoinExecutionMode(context, op)) {
+	    : execution_mode(ResolveGroupJoinExecutionMode(context, op)),
+	      eager_direct(op.implementation == GroupJoinImplementation::EAGER_HASH && !op.routed) {
 		if (execution_mode == GroupJoinExecutionMode::EXTERNAL) {
 			auto probe_types = op.children[0].get().GetTypes();
 			probe_types.push_back(LogicalType::HASH);
@@ -745,10 +799,11 @@ public:
 	}
 
 	idx_t MaxThreads(idx_t source_max_threads) override {
-		return execution_mode == GroupJoinExecutionMode::SERIAL ? 1 : source_max_threads;
+		return execution_mode == GroupJoinExecutionMode::SERIAL && !eager_direct ? 1 : source_max_threads;
 	}
 
 	GroupJoinExecutionMode execution_mode;
+	bool eager_direct;
 	atomic<idx_t> next_token {1};
 	mutex lock;
 	vector<shared_ptr<GroupedAggregateHashTable>> local_tables;
@@ -773,6 +828,7 @@ public:
 		auto &global_state = op.op_state->Cast<HashGroupJoinGlobalOperatorState>();
 		auto &sink = op.sink_state->Cast<HashGroupJoinGlobalSinkState>();
 		execution_mode = global_state.execution_mode;
+		eager_direct = global_state.eager_direct;
 		probe_keys.InitializeEmpty(op.grouped_aggregate_data.group_types);
 		if (execution_mode == GroupJoinExecutionMode::EXTERNAL) {
 			auto partition_types = op.children[0].get().GetTypes();
@@ -789,9 +845,12 @@ public:
 		}
 		auto &target = GetHashGroupJoinTarget(sink);
 		lookup_keys.InitializeEmpty(op.grouped_aggregate_data.group_types);
-		payload.InitializeEmpty(op.grouped_aggregate_data.payload_types);
-		routed_payload.InitializeEmpty(op.grouped_aggregate_data.payload_types);
-		selected_payload.InitializeEmpty(op.grouped_aggregate_data.payload_types);
+		auto &payload_types = op.implementation == GroupJoinImplementation::EAGER_HASH
+		                          ? op.eager_payload_types
+		                          : op.grouped_aggregate_data.payload_types;
+		payload.InitializeEmpty(payload_types);
+		routed_payload.InitializeEmpty(payload_types);
+		selected_payload.InitializeEmpty(payload_types);
 		group_ids.Initialize(Allocator::Get(context.client), {LogicalType::UBIGINT});
 		selected_group_ids.InitializeEmpty({LogicalType::UBIGINT});
 		auto aggregate_objects = CreateLocalGroupJoinAggregates(op);
@@ -810,12 +869,16 @@ public:
 
 		if (execution_mode == GroupJoinExecutionMode::SERIAL) {
 			update_state = make_uniq<AggregateHTUpdateState>(target);
+		} else if (eager_direct) {
+			update_allocator = make_shared_ptr<ArenaAllocator>(Allocator::Get(context.client));
+			update_state = make_uniq<AggregateHTUpdateState>(target, update_allocator);
 		} else {
 			local_hash_table = make_shared_ptr<GroupedAggregateHashTable>(
 			    context.client, BufferAllocator::Get(context.client), vector<LogicalType> {LogicalType::UBIGINT},
 			    op.grouped_aggregate_data.payload_types, std::move(aggregate_objects),
 			    GroupedAggregateHashTable::InitialCapacity(), GROUP_JOIN_LOCAL_RADIX_BITS,
 			    TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
+			local_update_state = make_uniq<AggregateHTUpdateState>(*local_hash_table);
 			if (execution_mode == GroupJoinExecutionMode::OWNERSHIP) {
 				token = global_state.next_token.fetch_add(1, std::memory_order_relaxed);
 				if (token == 0) {
@@ -850,15 +913,25 @@ public:
 	SelectionVector route_input_sel;
 	SelectionVector owner_sel;
 	SelectionVector local_sel;
+	vector<uint64_t> acquired_groups;
 	Vector matched_addresses;
+	Vector lookup_group_ids {LogicalType::UBIGINT};
+	Vector matched_group_ids {LogicalType::UBIGINT};
+	Vector lookup_hashes {LogicalType::HASH};
+	Vector matched_hashes {LogicalType::HASH};
+	Vector selected_hashes {LogicalType::HASH};
 	Vector routed_addresses;
 	Vector owner_addresses;
+	Vector local_addresses {LogicalType::POINTER};
+	SelectionVector local_new_groups {STANDARD_VECTOR_SIZE};
 	AggregateHTLookupState lookup_state;
 	vector<UnifiedVectorFormat> key_formats;
 	GroupJoinExecutionMode execution_mode = GroupJoinExecutionMode::SERIAL;
+	bool eager_direct = false;
 	idx_t token = 0;
 	shared_ptr<ArenaAllocator> update_allocator;
 	unique_ptr<AggregateHTUpdateState> update_state;
+	unique_ptr<AggregateHTUpdateState> local_update_state;
 	shared_ptr<GroupedAggregateHashTable> local_hash_table;
 	AggregateFilterDataSet distinct_filter_set;
 	vector<shared_ptr<GroupedAggregateHashTable>> distinct_tables;
@@ -905,50 +978,111 @@ static void SinkHashGroupJoinDistinct(const PhysicalHashGroupJoin &op, HashGroup
 	}
 }
 
+static void CombineEagerGroupJoinStates(GroupedAggregateHashTable &target, AggregateHTUpdateState &update_state,
+                                        Vector &addresses, DataChunk &payload, idx_t aggregate_offset) {
+	DataChunk count_payload;
+	count_payload.SetChildCardinality(addresses.size());
+	target.UpdateAggregatesAtAddressesRange(update_state, addresses, count_payload, aggregate_offset, 1);
+	target.CombineExportedStatesAtAddressesRange(update_state, addresses, payload, aggregate_offset + 1,
+	                                             payload.ColumnCount());
+}
+
 static void SinkHashGroupJoinMatches(const PhysicalHashGroupJoin &op, HashGroupJoinGlobalSinkState &sink,
                                      HashGroupJoinOperatorState &state, GroupedAggregateHashTable &target,
-                                     Vector &matched_addresses, DataChunk &payload, idx_t match_count) {
-	state.group_ids.Reset();
-	state.group_ids.SetChildCardinality(match_count);
-	state.group_ids.data[0].SetVectorType(VectorType::FLAT_VECTOR);
-	auto ids = FlatVector::GetDataMutable<uint64_t>(state.group_ids.data[0]);
-	auto addresses = FlatVector::GetData<data_ptr_t>(matched_addresses);
-	auto &global_layout = target.GetLayout();
-	for (idx_t match_idx = 0; match_idx < match_count; match_idx++) {
-		ids[match_idx] = LoadGroupJoinId(global_layout, addresses[match_idx]);
+                                     Vector &matched_addresses, optional_ptr<Vector> matched_group_ids,
+                                     optional_ptr<Vector> matched_hashes, DataChunk &payload, idx_t match_count) {
+	const auto direct_updates = state.execution_mode == GroupJoinExecutionMode::SERIAL || state.eager_direct;
+	const auto need_group_ids =
+	    !op.distinct_aggregates.empty() || !direct_updates || state.update_state->clustered_state.arena;
+	const uint64_t *ids = nullptr;
+	if (need_group_ids) {
+		state.group_ids.Reset();
+		state.group_ids.SetChildCardinality(match_count);
+		if (matched_group_ids) {
+			state.group_ids.data[0].Reference(*matched_group_ids);
+		} else {
+			state.group_ids.data[0].SetVectorType(VectorType::FLAT_VECTOR);
+			auto mutable_ids = FlatVector::GetDataMutable<uint64_t>(state.group_ids.data[0]);
+			auto addresses = FlatVector::GetData<data_ptr_t>(matched_addresses);
+			auto &global_layout = target.GetLayout();
+			data_ptr_t previous_address = nullptr;
+			uint64_t previous_id = 0;
+			for (idx_t match_idx = 0; match_idx < match_count; match_idx++) {
+				if (addresses[match_idx] != previous_address) {
+					previous_address = addresses[match_idx];
+					previous_id = LoadGroupJoinId(global_layout, previous_address);
+				}
+				mutable_ids[match_idx] = previous_id;
+			}
+			FlatVector::SetSize(state.group_ids.data[0], match_count);
+		}
+		state.group_ids.data[0].Flatten();
+		ids = FlatVector::GetData<uint64_t>(state.group_ids.data[0]);
 	}
-	FlatVector::SetSize(state.group_ids.data[0], match_count);
 	if (!op.distinct_aggregates.empty()) {
 		SinkHashGroupJoinDistinct(op, state, payload, state.group_ids);
 	}
 
-	if (state.execution_mode == GroupJoinExecutionMode::SERIAL) {
-		target.UpdateAggregatesAtAddressesRange(*state.update_state, matched_addresses, payload,
-		                                        GetHashGroupJoinAggregateOffset(op),
-		                                        op.grouped_aggregate_data.aggregates.size(), op.non_distinct_filter);
+	if (direct_updates) {
+		if (op.implementation == GroupJoinImplementation::EAGER_HASH) {
+			CombineEagerGroupJoinStates(target, *state.update_state, matched_addresses, payload,
+			                            GetHashGroupJoinAggregateOffset(op));
+		} else if (need_group_ids) {
+			target.UpdateAggregatesAtAddressesRange(*state.update_state, matched_addresses, state.group_ids.data[0],
+			                                        payload, GetHashGroupJoinAggregateOffset(op),
+			                                        op.grouped_aggregate_data.aggregates.size(),
+			                                        op.non_distinct_filter);
+		} else {
+			target.UpdateAggregatesAtAddressesRange(
+			    *state.update_state, matched_addresses, payload, GetHashGroupJoinAggregateOffset(op),
+			    op.grouped_aggregate_data.aggregates.size(), op.non_distinct_filter);
+		}
 		sink.matched_rows.fetch_add(match_count, std::memory_order_relaxed);
 		return;
 	}
 
 	if (state.execution_mode == GroupJoinExecutionMode::LOCAL) {
-		state.local_hash_table->AddChunk(state.group_ids, payload, op.non_distinct_filter);
+		if (op.implementation == GroupJoinImplementation::EAGER_HASH) {
+			if (matched_hashes) {
+				matched_hashes->Flatten();
+				state.local_hash_table->FindOrCreateGroups(state.group_ids, *matched_hashes, state.local_addresses,
+				                                           state.local_new_groups);
+			} else {
+				state.local_hash_table->FindOrCreateGroups(state.group_ids, state.local_addresses,
+				                                           state.local_new_groups);
+			}
+			CombineEagerGroupJoinStates(*state.local_hash_table, *state.local_update_state, state.local_addresses,
+			                            payload, 0);
+		} else if (matched_hashes) {
+			matched_hashes->Flatten();
+			state.local_hash_table->AddChunk(state.group_ids, *matched_hashes, payload, op.non_distinct_filter);
+		} else {
+			state.local_hash_table->AddChunk(state.group_ids, payload, op.non_distinct_filter);
+		}
 		sink.matched_rows.fetch_add(match_count, std::memory_order_relaxed);
 		return;
 	}
 
 	D_ASSERT(state.execution_mode == GroupJoinExecutionMode::OWNERSHIP);
+	state.acquired_groups.clear();
 	idx_t owner_count = 0;
 	idx_t local_count = 0;
+	uint64_t previous_id = NumericLimits<uint64_t>::Maximum();
+	idx_t current_owner = 0;
 	for (idx_t match_idx = 0; match_idx < match_count; match_idx++) {
-		auto &owner = sink.owners[NumericCast<idx_t>(ids[match_idx])];
-		auto current_owner = owner.load(std::memory_order_relaxed);
-		if (current_owner == 0) {
-			auto expected = idx_t(0);
-			if (owner.compare_exchange_strong(expected, state.token, std::memory_order_relaxed,
-			                                  std::memory_order_relaxed)) {
-				current_owner = state.token;
-			} else {
-				current_owner = expected;
+		if (ids[match_idx] != previous_id) {
+			previous_id = ids[match_idx];
+			auto &owner = sink.owners[NumericCast<idx_t>(previous_id)];
+			current_owner = owner.load(std::memory_order_relaxed);
+			if (current_owner == 0) {
+				auto expected = idx_t(0);
+				if (owner.compare_exchange_strong(expected, state.token, std::memory_order_acquire,
+				                                  std::memory_order_relaxed)) {
+					current_owner = state.token;
+					state.acquired_groups.push_back(previous_id);
+				} else {
+					current_owner = expected;
+				}
 			}
 		}
 		if (current_owner == state.token) {
@@ -957,23 +1091,69 @@ static void SinkHashGroupJoinMatches(const PhysicalHashGroupJoin &op, HashGroupJ
 			state.local_sel.set_index(local_count++, match_idx);
 		}
 	}
+	auto release_groups = [&]() {
+		for (auto group_id : state.acquired_groups) {
+			sink.owners[NumericCast<idx_t>(group_id)].store(0, std::memory_order_release);
+		}
+	};
+	if (owner_count == match_count) {
+		if (op.implementation == GroupJoinImplementation::EAGER_HASH) {
+			CombineEagerGroupJoinStates(target, *state.update_state, matched_addresses, payload,
+			                            GetHashGroupJoinAggregateOffset(op));
+		} else {
+			target.UpdateAggregatesAtAddressesRange(*state.update_state, matched_addresses, state.group_ids.data[0],
+			                                        payload, GetHashGroupJoinAggregateOffset(op),
+			                                        op.grouped_aggregate_data.aggregates.size(),
+			                                        op.non_distinct_filter);
+		}
+		release_groups();
+		sink.matched_rows.fetch_add(match_count, std::memory_order_relaxed);
+		return;
+	}
 
 	if (owner_count != 0) {
 		state.owner_addresses.Slice(matched_addresses, state.owner_sel, owner_count);
 		state.owner_addresses.Flatten();
+		state.selected_group_ids.Reset();
+		state.selected_group_ids.Slice(state.group_ids, state.owner_sel, owner_count);
 		state.selected_payload.Reset();
 		state.selected_payload.Slice(payload, state.owner_sel, owner_count);
-		target.UpdateAggregatesAtAddressesRange(*state.update_state, state.owner_addresses, state.selected_payload,
-		                                        GetHashGroupJoinAggregateOffset(op),
-		                                        op.grouped_aggregate_data.aggregates.size(), op.non_distinct_filter);
+		if (op.implementation == GroupJoinImplementation::EAGER_HASH) {
+			CombineEagerGroupJoinStates(target, *state.update_state, state.owner_addresses, state.selected_payload,
+			                            GetHashGroupJoinAggregateOffset(op));
+		} else {
+			target.UpdateAggregatesAtAddressesRange(
+			    *state.update_state, state.owner_addresses, state.selected_group_ids.data[0], state.selected_payload,
+			    GetHashGroupJoinAggregateOffset(op), op.grouped_aggregate_data.aggregates.size(),
+			    op.non_distinct_filter);
+		}
 	}
 	if (local_count != 0) {
 		state.selected_group_ids.Reset();
 		state.selected_group_ids.Slice(state.group_ids, state.local_sel, local_count);
 		state.selected_payload.Reset();
 		state.selected_payload.Slice(payload, state.local_sel, local_count);
-		state.local_hash_table->AddChunk(state.selected_group_ids, state.selected_payload, op.non_distinct_filter);
+		if (op.implementation == GroupJoinImplementation::EAGER_HASH) {
+			if (matched_hashes) {
+				state.selected_hashes.Slice(*matched_hashes, state.local_sel, local_count);
+				state.local_hash_table->FindOrCreateGroups(state.selected_group_ids, state.selected_hashes,
+				                                           state.local_addresses, state.local_new_groups);
+			} else {
+				state.local_hash_table->FindOrCreateGroups(state.selected_group_ids, state.local_addresses,
+				                                           state.local_new_groups);
+			}
+			CombineEagerGroupJoinStates(*state.local_hash_table, *state.local_update_state, state.local_addresses,
+			                            state.selected_payload, 0);
+		} else if (matched_hashes) {
+			state.selected_hashes.Slice(*matched_hashes, state.local_sel, local_count);
+			state.selected_hashes.Flatten();
+			state.local_hash_table->AddChunk(state.selected_group_ids, state.selected_hashes, state.selected_payload,
+			                                 op.non_distinct_filter);
+		} else {
+			state.local_hash_table->AddChunk(state.selected_group_ids, state.selected_payload, op.non_distinct_filter);
+		}
 	}
+	release_groups();
 	sink.matched_rows.fetch_add(match_count, std::memory_order_relaxed);
 }
 
@@ -986,6 +1166,9 @@ OperatorResultType PhysicalHashGroupJoin::ExecuteInternal(ExecutionContext &cont
 	sink.probe_rows.fetch_add(input.size(), std::memory_order_relaxed);
 
 	const auto group_count = grouped_aggregate_data.group_types.size();
+	const auto payload_count = implementation == GroupJoinImplementation::EAGER_HASH
+	                               ? eager_payload_types.size()
+	                               : grouped_aggregate_data.payload_types.size();
 	state.probe_keys.Reset();
 	for (idx_t group_idx = 0; group_idx < group_count; group_idx++) {
 		state.probe_keys.data[group_idx].Reference(input.data[group_idx]);
@@ -1025,7 +1208,15 @@ OperatorResultType PhysicalHashGroupJoin::ExecuteInternal(ExecutionContext &cont
 	} else {
 		state.lookup_keys.Slice(state.probe_keys, state.non_null_sel, non_null_count);
 	}
-	const auto match_count = sink.hash_table->LookupGroups(state.lookup_keys, state.lookup_state, state.found_sel);
+	idx_t match_count;
+	if (sink.perfect_executor) {
+		match_count = sink.perfect_executor->Lookup(state.lookup_keys.data[0], state.lookup_state.addresses,
+		                                            state.lookup_group_ids, state.found_sel);
+	} else {
+		state.lookup_keys.Hash(state.lookup_hashes);
+		match_count =
+		    sink.hash_table->LookupGroups(state.lookup_keys, state.lookup_hashes, state.lookup_state, state.found_sel);
+	}
 	if (match_count == 0) {
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
@@ -1035,7 +1226,12 @@ OperatorResultType PhysicalHashGroupJoin::ExecuteInternal(ExecutionContext &cont
 	state.payload.Reset();
 	if (all_input_rows_match) {
 		state.matched_addresses.Reference(state.lookup_state.addresses);
-		for (idx_t payload_idx = 0; payload_idx < grouped_aggregate_data.payload_types.size(); payload_idx++) {
+		if (sink.perfect_executor) {
+			state.matched_group_ids.Reference(state.lookup_group_ids);
+		} else {
+			state.matched_hashes.Reference(state.lookup_hashes);
+		}
+		for (idx_t payload_idx = 0; payload_idx < payload_count; payload_idx++) {
 			state.payload.data[payload_idx].Reference(input.data[group_count + payload_idx]);
 		}
 		if (state.payload.ColumnCount() == 0) {
@@ -1054,7 +1250,12 @@ OperatorResultType PhysicalHashGroupJoin::ExecuteInternal(ExecutionContext &cont
 			matched_addresses[match_idx] = lookup_addresses[lookup_idx];
 		}
 		FlatVector::SetSize(state.matched_addresses, match_count);
-		for (idx_t payload_idx = 0; payload_idx < grouped_aggregate_data.payload_types.size(); payload_idx++) {
+		if (sink.perfect_executor) {
+			state.matched_group_ids.Slice(state.lookup_group_ids, state.found_sel, match_count);
+		} else {
+			state.matched_hashes.Slice(state.lookup_hashes, state.found_sel, match_count);
+		}
+		for (idx_t payload_idx = 0; payload_idx < payload_count; payload_idx++) {
 			state.payload.data[payload_idx].Slice(input.data[group_count + payload_idx], state.matched_input_sel,
 			                                      match_count);
 		}
@@ -1081,8 +1282,8 @@ OperatorResultType PhysicalHashGroupJoin::ExecuteInternal(ExecutionContext &cont
 			if (state.routed_payload.ColumnCount() == 0) {
 				state.routed_payload.SetChildCardinality(routed_count);
 			}
-			SinkHashGroupJoinMatches(*this, sink, state, target, state.routed_addresses, state.routed_payload,
-			                         routed_count);
+			SinkHashGroupJoinMatches(*this, sink, state, target, state.routed_addresses, nullptr, nullptr,
+			                         state.routed_payload, routed_count);
 			routed_count = 0;
 		};
 		for (idx_t match_idx = 0; match_idx < match_count; match_idx++) {
@@ -1106,7 +1307,10 @@ OperatorResultType PhysicalHashGroupJoin::ExecuteInternal(ExecutionContext &cont
 		flush_routes();
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
-	SinkHashGroupJoinMatches(*this, sink, state, target, state.matched_addresses, state.payload, match_count);
+	SinkHashGroupJoinMatches(*this, sink, state, target, state.matched_addresses,
+	                         sink.perfect_executor ? optional_ptr<Vector>(state.matched_group_ids) : nullptr,
+	                         sink.perfect_executor ? nullptr : optional_ptr<Vector>(state.matched_hashes),
+	                         state.payload, match_count);
 	return OperatorResultType::NEED_MORE_INPUT;
 }
 
@@ -1136,8 +1340,8 @@ static void MergeHashGroupJoinLocalStates(const PhysicalHashGroupJoin &op, Clien
 	for (auto &local_table : global_state.local_tables) {
 		has_local_groups = has_local_groups || local_table->Count() != 0;
 	}
-	if (global_state.execution_mode == GroupJoinExecutionMode::LOCAL && !has_local_groups &&
-	    sink.matched_rows.load(std::memory_order_relaxed) != 0) {
+	if (global_state.execution_mode == GroupJoinExecutionMode::LOCAL && !global_state.eager_direct &&
+	    !has_local_groups && sink.matched_rows.load(std::memory_order_relaxed) != 0) {
 		throw InternalException("HASH_GROUP_JOIN local states were not registered before the merge barrier");
 	}
 	AggregateHTUpdateState merge_state(target);
@@ -2522,6 +2726,7 @@ InsertionOrderPreservingMap<string> PhysicalHashGroupJoin::ParamsToString() cons
 	}
 	result["Build Side"] = "OWNER";
 	result["Owner Build"] = parallel_owner_build ? "PARALLEL" : "SERIAL";
+	result["Implementation"] = EnumUtil::ToString(implementation);
 	string groups;
 	for (idx_t group_idx = 0; group_idx < output_group_names.size(); group_idx++) {
 		if (group_idx > 0) {

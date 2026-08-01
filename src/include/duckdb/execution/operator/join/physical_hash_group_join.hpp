@@ -34,7 +34,10 @@ public:
 	                      vector<unique_ptr<Expression>> groups, vector<HashGroupJoinOutputColumn> output_groups,
 	                      HashGroupJoinUnmatchedPolicy unmatched_policy, bool routed, bool unique_owner,
 	                      bool single_match, unique_ptr<JoinFilterPushdownInfo> filter_pushdown,
-	                      GroupJoinExecutionMode execution_mode, idx_t estimated_cardinality);
+	                      GroupJoinImplementation implementation, GroupJoinExecutionMode execution_mode,
+	                      Value perfect_min, Value perfect_max, idx_t perfect_range,
+	                      vector<LogicalType> eager_payload_types, vector<LogicalType> unmatched_probe_types,
+	                      vector<unique_ptr<Expression>> unmatched_payload_expressions, idx_t estimated_cardinality);
 	PhysicalHashGroupJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op, PhysicalOperator &probe,
 	                      PhysicalOperator &owner, vector<unique_ptr<Expression>> aggregates,
 	                      vector<unique_ptr<Expression>> owner_payload_aggregates,
@@ -51,13 +54,18 @@ public:
 	HashGroupJoinUnmatchedPolicy unmatched_policy;
 	vector<LogicalType> unmatched_probe_types;
 	vector<unique_ptr<Expression>> unmatched_payload_expressions;
+	vector<LogicalType> eager_payload_types;
 	bool routed;
 	bool unique_owner;
 	bool single_match;
 	bool null_equal;
 	bool static_mode;
 	bool parallel_owner_build;
+	GroupJoinImplementation implementation;
 	GroupJoinExecutionMode planned_execution_mode;
+	Value perfect_min;
+	Value perfect_max;
+	idx_t perfect_range;
 	vector<LogicalType> output_group_types;
 	unique_ptr<JoinFilterPushdownInfo> filter_pushdown;
 

@@ -31,8 +31,11 @@ public:
 	bool routed = false;
 	bool unique_owner = false;
 	bool single_match = false;
-	bool use_index = false;
+	GroupJoinImplementation implementation = GroupJoinImplementation::MEMOIZING_HASH;
 	GroupJoinExecutionMode execution_mode = GroupJoinExecutionMode::AUTO;
+	Value perfect_min;
+	Value perfect_max;
+	idx_t perfect_range = 0;
 	idx_t estimated_owner_rows = 0;
 	idx_t estimated_probe_rows = 0;
 	idx_t estimated_match_rows = 0;
@@ -40,6 +43,8 @@ public:
 	idx_t estimated_distinct_probe_keys = 0;
 	double separate_cost = 0;
 	double eager_cost = 0;
+	double physical_eager_cost = 0;
+	double perfect_cost = 0;
 	double memoizing_cost = 0;
 	double index_cost = 0;
 	//! Runtime filters generated for the probe subtree when the owner is the original join build side

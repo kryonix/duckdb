@@ -22,6 +22,10 @@ struct GroupJoinOrderCostContext {
 	idx_t state_width;
 	bool routed;
 	bool direct_inner;
+	bool fixed_size_keys;
+	bool physical_eager_supported;
+	bool perfect_supported;
+	idx_t perfect_range;
 	GroupJoinStrategy strategy;
 };
 

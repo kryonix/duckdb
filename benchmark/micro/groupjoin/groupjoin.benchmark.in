@@ -20,11 +20,13 @@ SET disabled_optimizers TO '${DISABLED_OPTIMIZERS}';
 CREATE TABLE groupjoin_owner(
 	int_key BIGINT PRIMARY KEY,
 	tail INTEGER NOT NULL,
+	tail_big BIGINT NOT NULL,
 	string_key VARCHAR UNIQUE NOT NULL,
-	UNIQUE(int_key, tail)
+	UNIQUE(int_key, tail),
+	UNIQUE(int_key, tail_big)
 );
 INSERT INTO groupjoin_owner
-SELECT i, (i % 17)::INTEGER, 'key-' || i::VARCHAR
+SELECT i, (i % 17)::INTEGER, (i % 17)::BIGINT, 'key-' || i::VARCHAR
 FROM range(${owner_rows}) t(i);
 CREATE TABLE groupjoin_probe AS
 WITH generated AS (
@@ -39,7 +41,8 @@ WITH generated AS (
 		END AS int_key
 	FROM generated
 )
-SELECT int_key, (int_key % 17)::INTEGER AS tail, 'key-' || int_key::VARCHAR AS string_key,
+SELECT int_key, (int_key % 17)::INTEGER AS tail, (int_key % 17)::BIGINT AS tail_big,
+	'key-' || int_key::VARCHAR AS string_key,
 	(i % 1000)::BIGINT AS value
 FROM keys;
 

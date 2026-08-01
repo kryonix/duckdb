@@ -2799,6 +2799,26 @@ GroupJoinExecutionMode EnumUtil::FromString<GroupJoinExecutionMode>(const char *
 	return static_cast<GroupJoinExecutionMode>(StringUtil::StringToEnum(GetGroupJoinExecutionModeValues(), 6, "GroupJoinExecutionMode", value));
 }
 
+const StringUtil::EnumStringLiteral *GetGroupJoinImplementationValues() {
+	static constexpr StringUtil::EnumStringLiteral values[] {
+		{ static_cast<uint32_t>(GroupJoinImplementation::MEMOIZING_HASH), "MEMOIZING_HASH" },
+		{ static_cast<uint32_t>(GroupJoinImplementation::PERFECT_HASH), "PERFECT_HASH" },
+		{ static_cast<uint32_t>(GroupJoinImplementation::EAGER_HASH), "EAGER_HASH" },
+		{ static_cast<uint32_t>(GroupJoinImplementation::INDEX), "INDEX" }
+	};
+	return values;
+}
+
+template<>
+const char* EnumUtil::ToChars<GroupJoinImplementation>(GroupJoinImplementation value) {
+	return StringUtil::EnumToString(GetGroupJoinImplementationValues(), 4, "GroupJoinImplementation", static_cast<uint32_t>(value));
+}
+
+template<>
+GroupJoinImplementation EnumUtil::FromString<GroupJoinImplementation>(const char *value) {
+	return static_cast<GroupJoinImplementation>(StringUtil::StringToEnum(GetGroupJoinImplementationValues(), 4, "GroupJoinImplementation", value));
+}
+
 const StringUtil::EnumStringLiteral *GetGroupJoinStrategyValues() {
 	static constexpr StringUtil::EnumStringLiteral values[] {
 		{ static_cast<uint32_t>(GroupJoinStrategy::DISABLED), "DISABLED" },
@@ -2807,6 +2827,7 @@ const StringUtil::EnumStringLiteral *GetGroupJoinStrategyValues() {
 		{ static_cast<uint32_t>(GroupJoinStrategy::SEPARATE), "SEPARATE" },
 		{ static_cast<uint32_t>(GroupJoinStrategy::EAGER), "EAGER" },
 		{ static_cast<uint32_t>(GroupJoinStrategy::HASH), "HASH" },
+		{ static_cast<uint32_t>(GroupJoinStrategy::PERFECT), "PERFECT" },
 		{ static_cast<uint32_t>(GroupJoinStrategy::INDEX), "INDEX" }
 	};
 	return values;
@@ -2814,12 +2835,12 @@ const StringUtil::EnumStringLiteral *GetGroupJoinStrategyValues() {
 
 template<>
 const char* EnumUtil::ToChars<GroupJoinStrategy>(GroupJoinStrategy value) {
-	return StringUtil::EnumToString(GetGroupJoinStrategyValues(), 7, "GroupJoinStrategy", static_cast<uint32_t>(value));
+	return StringUtil::EnumToString(GetGroupJoinStrategyValues(), 8, "GroupJoinStrategy", static_cast<uint32_t>(value));
 }
 
 template<>
 GroupJoinStrategy EnumUtil::FromString<GroupJoinStrategy>(const char *value) {
-	return static_cast<GroupJoinStrategy>(StringUtil::StringToEnum(GetGroupJoinStrategyValues(), 7, "GroupJoinStrategy", value));
+	return static_cast<GroupJoinStrategy>(StringUtil::StringToEnum(GetGroupJoinStrategyValues(), 8, "GroupJoinStrategy", value));
 }
 
 const StringUtil::EnumStringLiteral *GetHLLStorageTypeValues() {

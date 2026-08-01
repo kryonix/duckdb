@@ -673,7 +673,8 @@ void LogicalGroupJoin::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<bool>(217, "routed", routed, false);
 	serializer.WritePropertyWithDefault<bool>(218, "unique_owner", unique_owner, false);
 	serializer.WritePropertyWithDefault<bool>(219, "single_match", single_match, false);
-	serializer.WritePropertyWithDefault<bool>(220, "use_index", use_index, false);
+	serializer.WritePropertyWithDefault<bool>(220, "use_index", implementation == GroupJoinImplementation::INDEX,
+	                                          false);
 	serializer.WritePropertyWithDefault<GroupJoinExecutionMode>(221, "execution_mode", execution_mode,
 	                                                            GroupJoinExecutionMode::AUTO);
 	serializer.WritePropertyWithDefault<idx_t>(222, "estimated_owner_rows", estimated_owner_rows, 0);
@@ -685,6 +686,13 @@ void LogicalGroupJoin::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<double>(228, "eager_cost", eager_cost, 0);
 	serializer.WritePropertyWithDefault<double>(229, "memoizing_cost", memoizing_cost, 0);
 	serializer.WritePropertyWithDefault<double>(230, "index_cost", index_cost, 0);
+	serializer.WritePropertyWithDefault<Value>(231, "perfect_min", perfect_min, Value());
+	serializer.WritePropertyWithDefault<Value>(232, "perfect_max", perfect_max, Value());
+	serializer.WritePropertyWithDefault<idx_t>(233, "perfect_range", perfect_range, 0);
+	serializer.WritePropertyWithDefault<double>(234, "physical_eager_cost", physical_eager_cost, 0);
+	serializer.WritePropertyWithDefault<GroupJoinImplementation>(235, "implementation", implementation,
+	                                                             GroupJoinImplementation::MEMOIZING_HASH);
+	serializer.WritePropertyWithDefault<double>(236, "perfect_cost", perfect_cost, 0);
 }
 
 unique_ptr<LogicalOperator> LogicalGroupJoin::Deserialize(Deserializer &deserializer) {
@@ -713,7 +721,7 @@ unique_ptr<LogicalOperator> LogicalGroupJoin::Deserialize(Deserializer &deserial
 	deserializer.ReadPropertyWithExplicitDefault<bool>(217, "routed", result->routed, false);
 	deserializer.ReadPropertyWithExplicitDefault<bool>(218, "unique_owner", result->unique_owner, false);
 	deserializer.ReadPropertyWithExplicitDefault<bool>(219, "single_match", result->single_match, false);
-	deserializer.ReadPropertyWithExplicitDefault<bool>(220, "use_index", result->use_index, false);
+	auto use_index = deserializer.ReadPropertyWithExplicitDefault<bool>(220, "use_index", false);
 	deserializer.ReadPropertyWithExplicitDefault<GroupJoinExecutionMode>(221, "execution_mode", result->execution_mode,
 	                                                                     GroupJoinExecutionMode::AUTO);
 	deserializer.ReadPropertyWithExplicitDefault<idx_t>(222, "estimated_owner_rows", result->estimated_owner_rows, 0);
@@ -727,6 +735,16 @@ unique_ptr<LogicalOperator> LogicalGroupJoin::Deserialize(Deserializer &deserial
 	deserializer.ReadPropertyWithExplicitDefault<double>(228, "eager_cost", result->eager_cost, 0);
 	deserializer.ReadPropertyWithExplicitDefault<double>(229, "memoizing_cost", result->memoizing_cost, 0);
 	deserializer.ReadPropertyWithExplicitDefault<double>(230, "index_cost", result->index_cost, 0);
+	deserializer.ReadPropertyWithExplicitDefault<Value>(231, "perfect_min", result->perfect_min, Value());
+	deserializer.ReadPropertyWithExplicitDefault<Value>(232, "perfect_max", result->perfect_max, Value());
+	deserializer.ReadPropertyWithExplicitDefault<idx_t>(233, "perfect_range", result->perfect_range, 0);
+	deserializer.ReadPropertyWithExplicitDefault<double>(234, "physical_eager_cost", result->physical_eager_cost, 0);
+	deserializer.ReadPropertyWithExplicitDefault<GroupJoinImplementation>(235, "implementation", result->implementation,
+	                                                                      GroupJoinImplementation::MEMOIZING_HASH);
+	deserializer.ReadPropertyWithExplicitDefault<double>(236, "perfect_cost", result->perfect_cost, 0);
+	if (use_index && result->implementation == GroupJoinImplementation::MEMOIZING_HASH) {
+		result->implementation = GroupJoinImplementation::INDEX;
+	}
 	return std::move(result);
 }
 

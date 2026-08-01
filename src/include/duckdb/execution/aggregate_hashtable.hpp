@@ -65,6 +65,7 @@ public:
 	AggregateHTLookupState();
 
 	SelectionVector missing_vector;
+	unsafe_unique_array<bool> found_groups;
 	TupleDataChunkState chunk_state;
 	RowMatcher row_matcher;
 	vector<TupleDataGatherFunction> gather_functions;
@@ -79,6 +80,8 @@ public:
 	optional_ptr<const GroupedAggregateHashTable> owner;
 	shared_ptr<ArenaAllocator> aggregate_allocator;
 	RowOperationsState row_state;
+	Vector addresses;
+	ClusteredAggrState clustered_state;
 };
 
 class GroupedAggregateHashTable : public BaseAggregateHashTable {
@@ -149,6 +152,9 @@ public:
 	//! Finds existing groups without changing the hash table. Returns the number of matches and writes input-row
 	//! indexes to found_groups_out. Matching row addresses are stored at their input-row indexes in state.addresses.
 	idx_t LookupGroups(DataChunk &groups, AggregateHTLookupState &state, SelectionVector &found_groups_out) const;
+	//! Finds existing groups using hashes already computed for the input groups.
+	idx_t LookupGroups(DataChunk &groups, Vector &group_hashes, AggregateHTLookupState &state,
+	                   SelectionVector &found_groups_out) const;
 	//! Updates aggregate states at existing row-start addresses without changing the hash table.
 	void UpdateAggregatesAtAddresses(AggregateHTUpdateState &state, Vector &addresses, DataChunk &payload,
 	                                 const unsafe_vector<idx_t> &filter);
@@ -159,6 +165,14 @@ public:
 	void UpdateAggregatesAtAddressesRange(AggregateHTUpdateState &state, Vector &addresses, DataChunk &payload,
 	                                      idx_t aggregate_begin, idx_t aggregate_count,
 	                                      const unsafe_vector<idx_t> &filter);
+	//! Uses dense group identifiers to cluster updates that repeatedly target the same aggregate states.
+	void UpdateAggregatesAtAddressesRange(AggregateHTUpdateState &state, Vector &addresses, Vector &group_ids,
+	                                      DataChunk &payload, idx_t aggregate_begin, idx_t aggregate_count,
+	                                      const unsafe_vector<idx_t> &filter);
+	//! Imports one exported state per aggregate and combines it into the addressed rows.
+	void CombineExportedStatesAtAddressesRange(AggregateHTUpdateState &state, Vector &addresses,
+	                                           DataChunk &serialized_states, idx_t aggregate_begin,
+	                                           idx_t aggregate_count);
 	//! Gathers matched group values from state.addresses in the order specified by found_groups.
 	void GatherGroups(AggregateHTLookupState &state, const SelectionVector &found_groups, idx_t found_count,
 	                  DataChunk &result) const;
@@ -180,9 +194,9 @@ public:
 	void MoveUniqueGroups(GroupedAggregateHashTable &other);
 	//! Allocates an empty pointer directory for rows moved with MoveUniqueGroups.
 	void PrepareUniqueFinalize(idx_t group_count);
-	//! Atomically publishes one radix partition and returns its stable row addresses.
+	//! Publishes one radix partition and returns its stable row addresses.
 	//! Duplicate groups are rejected even when different partitions are finalized concurrently.
-	void FinalizeUniquePartition(idx_t partition_idx, vector<data_ptr_t> &row_addresses);
+	void FinalizeUniquePartition(idx_t partition_idx, vector<data_ptr_t> &row_addresses, bool concurrent = true);
 	//! Verifies the completed unique pointer directory.
 	void VerifyUniqueFinalize();
 

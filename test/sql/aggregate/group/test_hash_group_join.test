@@ -462,6 +462,15 @@ GROUP BY o.id
 physical_plan	<REGEX>:(?s).*Hash Group Join.*Strategy: LOCAL.*
 
 statement ok
+CREATE TABLE gj_external_eager_owner(a BIGINT, b BIGINT, PRIMARY KEY(a, b))
+
+statement ok
+INSERT INTO gj_external_eager_owner SELECT i, i % 17 FROM range(100000) t(i)
+
+statement ok
+ANALYZE gj_external_eager_owner
+
+statement ok
 SET memory_limit = '30MB'
 
 query II
@@ -471,8 +480,28 @@ GROUP BY o.id
 ----
 physical_plan	<REGEX>:(?s).*Hash Group Join.*Strategy: EXTERNAL.*
 
+# AUTO must not select physical eager when the estimated state table requires external execution. The physical layer
+# cannot execute that combination and explicit EAGER falls back to bounded memoization instead.
+statement ok
+SET debug_group_join_strategy = 'auto'
+
+query II
+EXPLAIN SELECT o.a, o.b, count(*), sum(p.value), min(p.value), max(p.value)
+FROM gj_external_eager_owner o
+JOIN (SELECT (i // 100)::BIGINT AS a, ((i // 100) % 17)::BIGINT AS b, i::BIGINT AS value
+      FROM range(10000000) t(i)) p USING (a, b)
+GROUP BY o.a, o.b
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+statement ok
+SET debug_group_join_strategy = 'force'
+
 statement ok
 RESET memory_limit
+
+statement ok
+DROP TABLE gj_external_eager_owner
 
 # Large proven-unique owners use task-local row construction and atomically publish one shared lookup directory.
 statement ok
@@ -1285,6 +1314,9 @@ GROUP BY o.id, o.payload
 ----
 physical_plan	<REGEX>:.*Index Group Join.*gj_index_probe_owner.*Strategy: INDEX.*
 
+statement ok
+SET debug_verify_serializer = true
+
 query IIIIIIIT rowsort
 SELECT o.id, o.payload, count(*), count(p.value), sum(p.value), count(DISTINCT p.tag),
        sum(p.value) FILTER (WHERE p.flag), list(DISTINCT p.value ORDER BY p.value NULLS FIRST)
@@ -1293,6 +1325,9 @@ GROUP BY o.id, o.payload
 ----
 1	10	3	2	30	2	10	[NULL, 10, 20]
 2	20	2	2	10	1	5	[5]
+
+statement ok
+SET debug_verify_serializer = false
 
 # Pushed-down probe filters are evaluated after the ART fetch. This protects original WHERE semantics while allowing
 # optimizer-derived range filters on the indexed key.
@@ -1516,7 +1551,14 @@ EXPLAIN SELECT o.a, o.b, count(*), sum(p.value)
 FROM gj_auto_owner o JOIN gj_auto_probe p USING (a, b)
 GROUP BY o.a, o.b
 ----
-physical_plan	<REGEX>:.*EXPORT_STATE.*
+physical_plan	<REGEX>:(?s).*Hash Group Join.*EAGER_HASH.*EXPORT_STATE.*
+
+query II
+EXPLAIN SELECT o.a, o.b, count(*), sum(p.value)
+FROM gj_auto_owner o JOIN gj_auto_probe p USING (a, b)
+GROUP BY o.a, o.b
+----
+physical_plan	<!REGEX>:.*combine_aggr.*
 
 statement ok
 SET debug_group_join_strategy = 'hash'
@@ -1612,6 +1654,124 @@ GROUP BY o.a, o.b
 ----
 physical_plan	<!REGEX>:.*Hash Group Join.*
 
+# A normalized matched-group estimate cannot exceed the unique owner domain. Four aggregate states over a fixed-width
+# 16-byte key have the calibrated prepared-execution margin for parallel memoization.
+statement ok
+CREATE TABLE gj_auto_memo_owner(a BIGINT, b BIGINT, PRIMARY KEY(a, b))
+
+statement ok
+INSERT INTO gj_auto_memo_owner SELECT i, (i % 17)::BIGINT FROM range(100000) t(i)
+
+statement ok
+CREATE TABLE gj_auto_memo_probe AS
+SELECT (i // 12)::BIGINT AS a, ((i // 12) % 17)::BIGINT AS b, i::BIGINT AS value
+FROM range(1200000) t(i)
+
+query II
+EXPLAIN SELECT o.a, o.b, count(*), sum(p.value), min(p.value), max(p.value)
+FROM gj_auto_memo_owner o JOIN gj_auto_memo_probe p USING (a, b)
+GROUP BY o.a, o.b
+----
+physical_plan	<REGEX>:(?s).*Hash Group Join.*MEMOIZING_HASH.*OWNERSHIP.*
+
+query III
+SELECT count(*), sum(n), sum(s) FROM (
+	SELECT o.a, o.b, count(*) n, sum(p.value) s, min(p.value), max(p.value)
+	FROM gj_auto_memo_owner o JOIN gj_auto_memo_probe p USING (a, b)
+	GROUP BY o.a, o.b
+)
+----
+100000	1200000	719999400000
+
+# A routed candidate that cannot enter AUTO must not suppress the mature partial aggregate rewrite. Its boundary-level
+# GroupJoin cost does not model the benefit of reducing a nested or multiplicity-increasing probe subtree.
+statement ok
+CREATE TABLE gj_auto_routed_owner AS SELECT (i % 100000)::INTEGER AS k FROM range(110000) t(i)
+
+statement ok
+CREATE TABLE gj_auto_routed_probe AS SELECT i::INTEGER AS k, i::BIGINT AS value FROM range(100000) t(i)
+
+statement ok
+ANALYZE gj_auto_routed_owner
+
+statement ok
+ANALYZE gj_auto_routed_probe
+
+query II
+EXPLAIN SELECT o.k, count(*), sum(p.value)
+FROM gj_auto_routed_owner o JOIN gj_auto_routed_probe p USING (k)
+GROUP BY o.k
+----
+physical_plan	<REGEX>:(?s).*combine_aggr.*EXPORT_STATE.*
+
+query III
+SELECT count(*), sum(n), sum(s) FROM (
+	SELECT o.k, count(*) n, sum(p.value) s
+	FROM gj_auto_routed_owner o JOIN gj_auto_routed_probe p USING (k)
+	GROUP BY o.k
+)
+----
+100000	110000	5049945000
+
+# Transient ownership lets shuffled workers update an uncontended final state directly and keeps only genuinely
+# contended groups in their local fallback tables.
+statement ok
+CREATE TEMP TABLE gj_auto_memo_shuffled_probe AS
+SELECT * FROM gj_auto_memo_probe ORDER BY hash(a, b, value)
+
+statement ok
+PRAGMA verify_parallelism
+
+query III
+SELECT count(*), sum(n), sum(s) FROM (
+	SELECT o.a, o.b, count(*) n, sum(p.value) s, min(p.value), max(p.value)
+	FROM gj_auto_memo_owner o JOIN gj_auto_memo_shuffled_probe p USING (a, b)
+	GROUP BY o.a, o.b
+)
+----
+100000	1200000	719999400000
+
+statement ok
+PRAGMA disable_verify_parallelism
+
+statement ok
+DROP TABLE gj_auto_memo_shuffled_probe
+
+# Physical eager GroupJoin replaces the compensating upper aggregate only for the calibrated high-fan-out region.
+statement ok
+CREATE TABLE gj_auto_physical_eager_owner(a BIGINT, b BIGINT, PRIMARY KEY(a, b))
+
+statement ok
+INSERT INTO gj_auto_physical_eager_owner SELECT i, (i % 17)::BIGINT FROM range(20000) t(i)
+
+statement ok
+CREATE TABLE gj_auto_physical_eager_probe AS
+SELECT (i // 100)::BIGINT AS a, ((i // 100) % 17)::BIGINT AS b, i::BIGINT AS value
+FROM range(2000000) t(i)
+
+query II
+EXPLAIN SELECT o.a, o.b, count(*), sum(p.value), min(p.value), max(p.value)
+FROM gj_auto_physical_eager_owner o JOIN gj_auto_physical_eager_probe p USING (a, b)
+GROUP BY o.a, o.b
+----
+physical_plan	<REGEX>:(?s).*Hash Group Join.*EAGER_HASH.*EXPORT_STATE.*
+
+query II
+EXPLAIN SELECT o.a, o.b, count(*), sum(p.value), min(p.value), max(p.value)
+FROM gj_auto_physical_eager_owner o JOIN gj_auto_physical_eager_probe p USING (a, b)
+GROUP BY o.a, o.b
+----
+physical_plan	<!REGEX>:.*combine_aggr.*
+
+query III
+SELECT count(*), sum(n), sum(s) FROM (
+	SELECT o.a, o.b, count(*) n, sum(p.value) s, min(p.value), max(p.value)
+	FROM gj_auto_physical_eager_owner o JOIN gj_auto_physical_eager_probe p USING (a, b)
+	GROUP BY o.a, o.b
+)
+----
+20000	2000000	1999999000000
+
 statement ok
 SET threads = 1
 
@@ -1681,6 +1841,453 @@ SELECT count(*), sum(n), sum(s) FROM (
 
 statement ok
 RESET debug_group_join_strategy
+
+# AUTO uses the dense direct-slot implementation only in measured count-state regions with a clear margin. Lower
+# reuse and wider aggregate states retain the mature plan.
+statement ok
+SET threads = 4
+
+statement ok
+CREATE TABLE gj_auto_perfect_owner(k INTEGER PRIMARY KEY)
+
+statement ok
+INSERT INTO gj_auto_perfect_owner SELECT i FROM range(20000) t(i)
+
+statement ok
+CREATE TABLE gj_auto_perfect_probe AS
+SELECT (i // 8)::INTEGER AS k, i::BIGINT AS v FROM range(160000) t(i)
+
+statement ok
+CREATE TABLE gj_auto_perfect_low_reuse_probe AS
+SELECT (i // 5)::INTEGER AS k FROM range(100000) t(i)
+
+statement ok
+ANALYZE gj_auto_perfect_owner
+
+statement ok
+ANALYZE gj_auto_perfect_probe
+
+statement ok
+ANALYZE gj_auto_perfect_low_reuse_probe
+
+statement ok
+SET debug_group_join_strategy = 'auto'
+
+query II
+EXPLAIN SELECT o.k, count(*)
+FROM gj_auto_perfect_owner o JOIN gj_auto_perfect_probe p USING (k)
+GROUP BY o.k
+----
+physical_plan	<REGEX>:(?s).*Hash Group Join.*PERFECT_HASH.*
+
+query III
+SELECT count(*), sum(n), sum(k) FROM (
+	SELECT o.k, count(*) n
+	FROM gj_auto_perfect_owner o JOIN gj_auto_perfect_probe p USING (k)
+	GROUP BY o.k
+)
+----
+20000	160000	199990000
+
+query II
+EXPLAIN SELECT o.k, count(*), sum(p.v)
+FROM gj_auto_perfect_owner o JOIN gj_auto_perfect_probe p USING (k)
+GROUP BY o.k
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.k, count(*)
+FROM gj_auto_perfect_owner o JOIN gj_auto_perfect_low_reuse_probe p USING (k)
+GROUP BY o.k
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+# Exact perfect hashing supports every integral key width, preserves sparse/missing/NULL probe semantics, and uses
+# signed lower bounds without remapping through an unsigned domain.
+statement ok
+SET threads = 1
+
+statement ok
+SET debug_group_join_strategy = 'perfect'
+
+foreach type TINYINT SMALLINT INTEGER BIGINT UTINYINT USMALLINT UINTEGER UBIGINT
+
+statement ok
+CREATE TABLE gj_perfect_{type}(k {type} PRIMARY KEY)
+
+statement ok
+INSERT INTO gj_perfect_{type} VALUES (0), (2), (5)
+
+statement ok
+ANALYZE gj_perfect_{type}
+
+statement ok
+CREATE TABLE gj_perfect_probe_{type}(k {type}, v INTEGER)
+
+statement ok
+INSERT INTO gj_perfect_probe_{type} VALUES (0, 1), (0, 2), (2, 3), (4, 99), (5, 4), (NULL, 100)
+
+query III
+SELECT count(*), sum(n), sum(s) FROM (
+	SELECT o.k, count(*) n, sum(p.v) s
+	FROM gj_perfect_{type} o JOIN gj_perfect_probe_{type} p USING (k)
+	GROUP BY o.k
+)
+----
+3	4	10
+
+endloop
+
+query II
+EXPLAIN SELECT o.k, count(*), sum(p.v)
+FROM gj_perfect_INTEGER o JOIN gj_perfect_probe_INTEGER p USING (k)
+GROUP BY o.k
+----
+physical_plan	<REGEX>:(?s).*Hash Group Join.*PERFECT_HASH.*
+
+statement ok
+SET debug_verify_serializer = true
+
+query III
+SELECT count(*), sum(n), sum(s) FROM (
+	SELECT o.k, count(*) n, sum(p.v) s
+	FROM gj_perfect_INTEGER o JOIN gj_perfect_probe_INTEGER p USING (k)
+	GROUP BY o.k
+)
+----
+3	4	10
+
+statement ok
+SET debug_verify_serializer = false
+
+statement ok
+CREATE TABLE gj_perfect_signed(k INTEGER PRIMARY KEY)
+
+statement ok
+INSERT INTO gj_perfect_signed VALUES (-7), (-2), (4)
+
+statement ok
+ANALYZE gj_perfect_signed
+
+statement ok
+CREATE TABLE gj_perfect_signed_probe(k INTEGER, v INTEGER)
+
+statement ok
+INSERT INTO gj_perfect_signed_probe VALUES (-7, 1), (-7, 2), (-2, 3), (0, 99), (4, 4)
+
+query III
+SELECT count(*), sum(n), sum(s) FROM (
+	SELECT o.k, count(*) n, sum(p.v) s
+	FROM gj_perfect_signed o JOIN gj_perfect_signed_probe p USING (k)
+	GROUP BY o.k
+)
+----
+3	4	10
+
+# Perfect lookup preserves owner-outer semantics and emits one synthetic NULL probe row for every miss.
+statement ok
+CREATE TABLE gj_perfect_outer_owner(k INTEGER PRIMARY KEY)
+
+statement ok
+INSERT INTO gj_perfect_outer_owner VALUES (0), (1), (2), (3)
+
+statement ok
+ANALYZE gj_perfect_outer_owner
+
+statement ok
+CREATE TABLE gj_perfect_outer_probe(k INTEGER, v INTEGER)
+
+statement ok
+INSERT INTO gj_perfect_outer_probe VALUES (0, 7), (9, 99), (NULL, 100)
+
+query II
+EXPLAIN SELECT o.k, count(*), sum(p.v)
+FROM gj_perfect_outer_owner o LEFT JOIN gj_perfect_outer_probe p USING (k)
+GROUP BY o.k
+----
+physical_plan	<REGEX>:(?s).*Hash Group Join.*PERFECT_HASH.*
+
+query III rowsort
+SELECT o.k, count(*), sum(p.v)
+FROM gj_perfect_outer_owner o LEFT JOIN gj_perfect_outer_probe p USING (k)
+GROUP BY o.k
+----
+0	1	7
+1	1	NULL
+2	1	NULL
+3	1	NULL
+
+# A prepared perfect plan falls back to a final-sized generic directory if execution observes a newly appended owner
+# key outside the statistics range used at planning time.
+statement ok
+CREATE TABLE gj_perfect_fallback_owner(k INTEGER PRIMARY KEY)
+
+statement ok
+INSERT INTO gj_perfect_fallback_owner VALUES (0), (1)
+
+statement ok
+ANALYZE gj_perfect_fallback_owner
+
+statement ok
+CREATE TABLE gj_perfect_fallback_probe(k INTEGER, v INTEGER)
+
+statement ok
+INSERT INTO gj_perfect_fallback_probe VALUES (0, 1), (1, 2)
+
+statement ok
+PREPARE gj_perfect_fallback AS
+SELECT count(*), sum(n), sum(s) FROM (
+	SELECT o.k, count(*) n, sum(p.v) s
+	FROM gj_perfect_fallback_owner o JOIN gj_perfect_fallback_probe p USING (k)
+	GROUP BY o.k
+)
+
+statement ok
+INSERT INTO gj_perfect_fallback_owner VALUES (100000)
+
+statement ok
+INSERT INTO gj_perfect_fallback_probe VALUES (100000, 3)
+
+query III
+EXECUTE gj_perfect_fallback
+----
+3	3	6
+
+statement ok
+CREATE TABLE gj_perfect_oversized(k INTEGER PRIMARY KEY)
+
+statement ok
+INSERT INTO gj_perfect_oversized VALUES (0), (2000000)
+
+statement ok
+ANALYZE gj_perfect_oversized
+
+statement ok
+CREATE TABLE gj_perfect_oversized_probe AS SELECT * FROM gj_perfect_oversized
+
+query II
+EXPLAIN SELECT o.k, count(*) FROM gj_perfect_oversized o JOIN gj_perfect_oversized_probe p USING (k) GROUP BY o.k
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+# Physical eager aggregation imports one probe state per key into GroupJoin. It handles outer NULL rows, variable and
+# ordered states, DISTINCT on direct owners, routed multiplicity for non-DISTINCT states, and SEMI semantics.
+statement ok
+SET debug_group_join_strategy = 'eager'
+
+statement ok
+CREATE TABLE gj_eager_owner(k INTEGER PRIMARY KEY, label VARCHAR)
+
+statement ok
+INSERT INTO gj_eager_owner VALUES (0, 'zero'), (1, 'one'), (2, 'two'), (3, 'three')
+
+statement ok
+CREATE TABLE gj_physical_eager_probe(k INTEGER, v INTEGER, s VARCHAR)
+
+statement ok
+INSERT INTO gj_physical_eager_probe VALUES (0, 3, 'c'), (0, 1, 'a'), (0, 1, 'b'), (1, 5, 'x'), (9, 99, 'miss')
+
+query II
+EXPLAIN SELECT o.k, count(*), sum(p.v)
+FROM gj_eager_owner o JOIN gj_physical_eager_probe p USING (k) GROUP BY o.k
+----
+physical_plan	<REGEX>:(?s).*Hash Group Join.*EAGER_HASH.*EXPORT_STATE.*
+
+statement ok
+SET debug_verify_serializer = true
+
+query III
+SELECT count(*), sum(n), sum(s) FROM (
+	SELECT o.k, count(*) n, sum(p.v) s
+	FROM gj_eager_owner o JOIN gj_physical_eager_probe p USING (k)
+	GROUP BY o.k
+)
+----
+2	4	10
+
+statement ok
+SET debug_verify_serializer = false
+
+query IIIIIITT
+SELECT o.k, count(*), count(p.v), sum(p.v), count(DISTINCT p.v), sum(p.v) FILTER (WHERE p.v > 1),
+	string_agg(p.s, ',' ORDER BY p.v, p.s), list(p.v ORDER BY p.v, p.s)
+FROM gj_eager_owner o LEFT JOIN gj_physical_eager_probe p USING (k)
+GROUP BY o.k ORDER BY o.k
+----
+0	3	3	5	2	3	a,b,c	[1, 1, 3]
+1	1	1	5	1	5	x	[5]
+2	1	0	NULL	0	NULL	NULL	[NULL]
+3	1	0	NULL	0	NULL	NULL	[NULL]
+
+# RIGHT JOIN normalization reaches the same physical eager path and preserves unmatched-owner results.
+query III rowsort
+SELECT o.k, count(*), sum(p.v)
+FROM gj_physical_eager_probe p RIGHT JOIN gj_eager_owner o USING (k)
+GROUP BY o.k
+----
+0	3	5
+1	1	5
+2	1	NULL
+3	1	NULL
+
+# A unique key retained by a nested owner subtree is still a direct physical eager candidate.
+query II
+EXPLAIN SELECT o.id, count(*), sum(p.value)
+FROM (gj_order_owner o JOIN gj_order_dimension d USING (dimension_id)) JOIN gj_order_probe p USING (id)
+GROUP BY o.id
+----
+physical_plan	<REGEX>:(?s).*Hash Group Join.*EAGER_HASH.*EXPORT_STATE.*
+
+query III
+SELECT count(*), sum(n), sum(s) FROM (
+	SELECT o.id, count(*) n, sum(p.value) s
+	FROM (gj_order_owner o JOIN gj_order_dimension d USING (dimension_id)) JOIN gj_order_probe p USING (id)
+	GROUP BY o.id
+)
+----
+10	10	45
+
+statement ok
+CREATE TABLE gj_eager_routed_owner(k INTEGER, payload INTEGER)
+
+statement ok
+INSERT INTO gj_eager_routed_owner VALUES (0, 1), (0, 2), (1, 3)
+
+query III
+SELECT o.k, count(*), sum(p.v)
+FROM gj_eager_routed_owner o JOIN gj_physical_eager_probe p USING (k)
+GROUP BY o.k ORDER BY o.k
+----
+0	6	10
+1	1	5
+
+foreach execution local ownership
+
+statement ok
+SET debug_group_join_execution = '{execution}'
+
+query III rowsort
+SELECT o.k, count(*), sum(p.v)
+FROM gj_eager_routed_owner o JOIN gj_physical_eager_probe p USING (k)
+GROUP BY o.k
+----
+0	6	10
+1	1	5
+
+endloop
+
+statement ok
+RESET debug_group_join_execution
+
+# DISTINCT plus collapsing routed owners is retained as a separate plan because repeating a finalized distinct state
+# would not preserve cross-owner deduplication.
+query II
+EXPLAIN SELECT o.k, count(DISTINCT p.v)
+FROM gj_eager_routed_owner o JOIN gj_physical_eager_probe p USING (k)
+GROUP BY o.k
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query III
+SELECT p.k, count(*), sum(p.v)
+FROM gj_physical_eager_probe p SEMI JOIN gj_eager_owner o USING (k)
+GROUP BY p.k ORDER BY p.k
+----
+0	3	5
+1	1	5
+
+# Exported variable-size states retain their arenas through parallel import and finalization.
+statement ok
+CREATE TABLE gj_eager_variable_owner(k INTEGER PRIMARY KEY)
+
+statement ok
+INSERT INTO gj_eager_variable_owner SELECT i FROM range(64) t(i)
+
+statement ok
+CREATE TABLE gj_eager_variable_probe AS
+SELECT (i % 64)::INTEGER AS k, i::INTEGER AS v, repeat('long-state-', 4) || i::VARCHAR AS s
+FROM range(32768) t(i)
+
+statement ok
+SET debug_group_join_strategy = 'disabled'
+
+statement ok
+CREATE TEMP TABLE gj_eager_variable_baseline AS
+SELECT o.k, count(*) AS n, sum(p.v) FILTER (WHERE p.v % 3 = 0) AS filtered_sum,
+	string_agg(p.s, ',' ORDER BY p.v) AS strings, list(p.s ORDER BY p.v) AS values
+FROM gj_eager_variable_owner o JOIN gj_eager_variable_probe p USING (k)
+GROUP BY o.k
+
+statement ok
+SET debug_group_join_strategy = 'eager'
+
+query II
+EXPLAIN SELECT o.k, count(*), sum(p.v) FILTER (WHERE p.v % 3 = 0),
+	string_agg(p.s, ',' ORDER BY p.v), list(p.s ORDER BY p.v)
+FROM gj_eager_variable_owner o JOIN gj_eager_variable_probe p USING (k)
+GROUP BY o.k
+----
+physical_plan	<REGEX>:(?s).*Hash Group Join.*EAGER_HASH.*EXPORT_STATE.*
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM gj_eager_variable_baseline EXCEPT ALL
+	 SELECT o.k, count(*), sum(p.v) FILTER (WHERE p.v % 3 = 0),
+		string_agg(p.s, ',' ORDER BY p.v), list(p.s ORDER BY p.v)
+	 FROM gj_eager_variable_owner o JOIN gj_eager_variable_probe p USING (k) GROUP BY o.k)
+	UNION ALL
+	(SELECT o.k, count(*), sum(p.v) FILTER (WHERE p.v % 3 = 0),
+		string_agg(p.s, ',' ORDER BY p.v), list(p.s ORDER BY p.v)
+	 FROM gj_eager_variable_owner o JOIN gj_eager_variable_probe p USING (k) GROUP BY o.k
+	 EXCEPT ALL SELECT * FROM gj_eager_variable_baseline)
+) differences
+----
+0
+
+foreach execution serial local ownership
+
+statement ok
+SET debug_group_join_execution = '{execution}'
+
+query III
+SELECT count(*), sum(n), sum(s) FROM (
+	SELECT o.k, count(*) n, sum(p.v) s
+	FROM gj_eager_owner o JOIN gj_physical_eager_probe p USING (k)
+	GROUP BY o.k
+)
+----
+2	4	10
+
+endloop
+
+# An explicitly external eager request falls back to the bounded memoizing implementation before physical planning.
+statement ok
+SET debug_group_join_execution = 'external'
+
+query II
+EXPLAIN SELECT o.k, count(*), sum(p.v)
+FROM gj_eager_owner o JOIN gj_physical_eager_probe p USING (k) GROUP BY o.k
+----
+physical_plan	<REGEX>:(?s).*Hash Group Join.*MEMOIZING_HASH.*
+
+query III
+SELECT count(*), sum(n), sum(s) FROM (
+	SELECT o.k, count(*) n, sum(p.v) s
+	FROM gj_eager_owner o JOIN gj_physical_eager_probe p USING (k)
+	GROUP BY o.k
+)
+----
+2	4	10
+
+statement ok
+RESET debug_group_join_execution
+
+statement ok
+RESET debug_group_join_strategy
+
+statement ok
+RESET threads
 
 statement ok
 RESET threads

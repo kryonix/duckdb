@@ -957,7 +957,6 @@ void PartialAggregatePushdown::VisitOperator(unique_ptr<LogicalOperator> &op) {
 	}
 	LogicalOperatorVisitor::VisitOperator(op);
 	FuseInterveningProjections(*op);
-	bool force_eager = false;
 	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && op->children.size() == 1 &&
 	    op->children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto &aggregate = op->Cast<LogicalAggregate>();
@@ -971,11 +970,14 @@ void PartialAggregatePushdown::VisitOperator(unique_ptr<LogicalOperator> &op) {
 		if (candidate) {
 			auto strategy = Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context);
 			if (strategy == GroupJoinStrategy::SEPARATE || strategy == GroupJoinStrategy::HASH ||
+			    strategy == GroupJoinStrategy::PERFECT || strategy == GroupJoinStrategy::EAGER ||
 			    strategy == GroupJoinStrategy::INDEX) {
 				return;
 			}
-			force_eager = strategy == GroupJoinStrategy::EAGER;
-			if (strategy == GroupJoinStrategy::AUTO) {
+			const auto direct_inner = join.join_type == JoinType::INNER && !candidate->routed &&
+			                          candidate->unique_owner &&
+			                          candidate->unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD;
+			if (strategy == GroupJoinStrategy::AUTO && direct_inner) {
 				auto cost = EstimateHashGroupJoinCost(aggregate, join, *candidate, optimizer.context);
 				if (cost.separate_cost != 0 && cost.eager_cost > cost.separate_cost) {
 					return;
@@ -983,8 +985,7 @@ void PartialAggregatePushdown::VisitOperator(unique_ptr<LogicalOperator> &op) {
 			}
 		}
 	}
-	const auto rewritten = force_eager ? TryPushdownAggregate(op, true) || TryDoubleEagerPushdown(op, true)
-	                                   : TryDoubleEagerPushdown(op, false) || TryPushdownAggregate(op, false);
+	const auto rewritten = TryDoubleEagerPushdown(op, false) || TryPushdownAggregate(op, false);
 	if (rewritten) {
 		// Revisit rewritten subtrees so nested aggregate-over-join shapes can be pushed too.
 		LogicalOperatorVisitor::VisitOperator(op);
