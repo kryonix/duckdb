@@ -12,6 +12,7 @@
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
@@ -113,16 +114,19 @@ static void StoreGroupJoinId(const TupleDataLayout &layout, data_ptr_t row, idx_
 	state.value = NumericCast<uint64_t>(group_id) + 1;
 }
 
-PhysicalHashGroupJoin::PhysicalHashGroupJoin(
-    PhysicalPlan &physical_plan, LogicalAggregate &op, PhysicalOperator &probe, PhysicalOperator &owner,
-    vector<unique_ptr<Expression>> aggregates, vector<unique_ptr<Expression>> owner_payload_aggregates,
-    vector<unique_ptr<Expression>> groups, vector<HashGroupJoinOutputColumn> output_groups_p,
-    HashGroupJoinUnmatchedPolicy unmatched_policy_p, bool routed_p, bool unique_owner_p, bool single_match_p,
-    unique_ptr<JoinFilterPushdownInfo> filter_pushdown_p, idx_t estimated_cardinality)
+PhysicalHashGroupJoin::PhysicalHashGroupJoin(PhysicalPlan &physical_plan, LogicalAggregate &op, PhysicalOperator &probe,
+                                             PhysicalOperator &owner, vector<unique_ptr<Expression>> aggregates,
+                                             vector<unique_ptr<Expression>> owner_payload_aggregates,
+                                             vector<unique_ptr<Expression>> groups,
+                                             vector<HashGroupJoinOutputColumn> output_groups_p,
+                                             HashGroupJoinUnmatchedPolicy unmatched_policy_p, bool routed_p,
+                                             bool unique_owner_p, bool single_match_p,
+                                             unique_ptr<JoinFilterPushdownInfo> filter_pushdown_p,
+                                             GroupJoinExecutionMode execution_mode_p, idx_t estimated_cardinality)
     : PhysicalJoin(physical_plan, op, PhysicalOperatorType::HASH_GROUP_JOIN, JoinType::INNER, estimated_cardinality),
       output_groups(std::move(output_groups_p)), unmatched_policy(unmatched_policy_p), routed(routed_p),
       unique_owner(unique_owner_p), single_match(single_match_p), null_equal(false), static_mode(false),
-      filter_pushdown(std::move(filter_pushdown_p)) {
+      planned_execution_mode(execution_mode_p), filter_pushdown(std::move(filter_pushdown_p)) {
 	for (auto &group : op.groups) {
 		output_group_types.push_back(group->GetReturnType());
 	}
@@ -167,7 +171,8 @@ PhysicalHashGroupJoin::PhysicalHashGroupJoin(PhysicalPlan &physical_plan, Logica
                                              idx_t estimated_cardinality)
     : PhysicalJoin(physical_plan, op, PhysicalOperatorType::HASH_GROUP_JOIN, JoinType::INNER, estimated_cardinality),
       output_columns(std::move(output_columns_p)), unmatched_policy(HashGroupJoinUnmatchedPolicy::EMPTY_AGGREGATE),
-      routed(false), unique_owner(false), single_match(false), null_equal(true), static_mode(true) {
+      routed(false), unique_owner(false), single_match(false), null_equal(true), static_mode(true),
+      planned_execution_mode(GroupJoinExecutionMode::AUTO) {
 	for (auto &group : groups) {
 		output_group_types.push_back(group->GetReturnType());
 		output_group_names.push_back(group->GetName().GetIdentifierName());
@@ -195,8 +200,14 @@ PhysicalHashGroupJoin::PhysicalHashGroupJoin(PhysicalPlan &physical_plan, Logica
 }
 
 static bool UseExternalHashGroupJoin(const PhysicalHashGroupJoin &op, ClientContext &context) {
-	return Settings::Get<DebugForceExternalSetting>(context) ||
-	       Settings::Get<DebugGroupJoinExecutionSetting>(context) == GroupJoinExecutionMode::EXTERNAL;
+	if (Settings::Get<DebugForceExternalSetting>(context)) {
+		return true;
+	}
+	auto mode = Settings::Get<DebugGroupJoinExecutionSetting>(context);
+	if (mode != GroupJoinExecutionMode::AUTO && mode != GroupJoinExecutionMode::INDEX) {
+		return mode == GroupJoinExecutionMode::EXTERNAL;
+	}
+	return op.planned_execution_mode == GroupJoinExecutionMode::EXTERNAL;
 }
 
 class HashGroupJoinGlobalSinkState : public GlobalSinkState {
@@ -577,9 +588,15 @@ static GroupJoinExecutionMode ResolveGroupJoinExecutionMode(ClientContext &conte
 		return GroupJoinExecutionMode::EXTERNAL;
 	}
 	auto mode = Settings::Get<DebugGroupJoinExecutionSetting>(context);
-	return mode == GroupJoinExecutionMode::AUTO || mode == GroupJoinExecutionMode::INDEX
-	           ? GroupJoinExecutionMode::OWNERSHIP
-	           : mode;
+	if (mode != GroupJoinExecutionMode::AUTO && mode != GroupJoinExecutionMode::INDEX) {
+		return mode;
+	}
+	if (op.planned_execution_mode != GroupJoinExecutionMode::AUTO &&
+	    op.planned_execution_mode != GroupJoinExecutionMode::INDEX) {
+		return op.planned_execution_mode;
+	}
+	return TaskScheduler::GetScheduler(context).NumberOfThreads() == 1 ? GroupJoinExecutionMode::SERIAL
+	                                                                   : GroupJoinExecutionMode::OWNERSHIP;
 }
 
 class HashGroupJoinGlobalOperatorState : public GlobalOperatorState {
@@ -2365,7 +2382,7 @@ InsertionOrderPreservingMap<string> PhysicalHashGroupJoin::ParamsToString() cons
 	if (op_state) {
 		result["Strategy"] = EnumUtil::ToString(op_state->Cast<HashGroupJoinGlobalOperatorState>().execution_mode);
 	} else {
-		result["Strategy"] = "AUTO";
+		result["Strategy"] = EnumUtil::ToString(planned_execution_mode);
 	}
 	SetEstimatedCardinality(result, estimated_cardinality);
 	return result;

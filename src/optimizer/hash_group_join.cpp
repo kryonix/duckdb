@@ -17,6 +17,9 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
+
+#include <cmath>
 
 namespace duckdb {
 
@@ -298,21 +301,22 @@ optional<HashGroupJoinCandidate> TryGetHashGroupJoinCandidate(LogicalAggregate &
 
 static bool AutoHashGroupJoinAggregatesSupported(const LogicalAggregate &aggregate, idx_t &state_size) {
 	state_size = sizeof(idx_t);
+	bool supported = true;
 	for (auto &expression : aggregate.expressions) {
 		auto &aggr = expression->Cast<BoundAggregateExpression>();
 		auto &callbacks = aggr.Function().GetCallbacks();
+		state_size += aggr.Function().GetStateSize(aggr.BindInfo().get());
 		if (aggr.IsDistinct() || aggr.GetFilter() || aggr.GetOrderBys() || callbacks.HasStateDestructorCallback() ||
 		    aggr.Function().GetName() == "combine_aggr") {
-			return false;
+			supported = false;
 		}
 		for (auto &child : aggr.GetChildren()) {
 			if (child->GetReturnType().IsAggregateState()) {
-				return false;
+				supported = false;
 			}
 		}
-		state_size += aggr.Function().GetStateSize(aggr.BindInfo().get());
 	}
-	return state_size <= 128;
+	return supported && state_size <= 128;
 }
 
 struct AutoHashGroupJoinCostModel {
@@ -416,82 +420,91 @@ static bool HasAutoHashGroupJoinART(LogicalComparisonJoin &join, const HashGroup
 	return false;
 }
 
-static bool PassesAutoIndexGroupJoinCostModel(LogicalAggregate &aggregate, LogicalComparisonJoin &join,
-                                              const HashGroupJoinCandidate &candidate, ClientContext &context) {
-	if (join.join_type != JoinType::INNER || candidate.routed || !candidate.unique_owner ||
-	    candidate.unmatched_policy != HashGroupJoinUnmatchedPolicy::DISCARD || !join.has_estimated_cardinality ||
-	    !join.children[candidate.owner_child]->has_estimated_cardinality ||
+HashGroupJoinCostEstimate EstimateHashGroupJoinCost(LogicalAggregate &aggregate, LogicalComparisonJoin &join,
+                                                    const HashGroupJoinCandidate &candidate, ClientContext &context) {
+	HashGroupJoinCostEstimate result;
+	if (!join.has_estimated_cardinality || !join.children[candidate.owner_child]->has_estimated_cardinality ||
 	    !join.children[candidate.probe_child]->has_estimated_cardinality) {
-		return false;
+		return result;
 	}
-	idx_t state_size;
-	if (!AutoHashGroupJoinAggregatesSupported(aggregate, state_size)) {
-		return false;
+	result.owner_rows = join.children[candidate.owner_child]->estimated_cardinality;
+	result.probe_rows = join.children[candidate.probe_child]->estimated_cardinality;
+	result.match_rows = join.estimated_cardinality;
+	result.matched_groups = aggregate.has_estimated_cardinality
+	                            ? MinValue(aggregate.estimated_cardinality, result.owner_rows)
+	                            : MinValue(result.owner_rows, result.match_rows);
+	if (result.match_rows != 0) {
+		auto distinct_keys = static_cast<double>(result.owner_rows) * static_cast<double>(result.probe_rows) /
+		                     static_cast<double>(result.match_rows);
+		result.distinct_probe_keys = MinValue(
+		    result.probe_rows, MaxValue<idx_t>(LossyNumericCast<idx_t>(MaxValue<double>(distinct_keys, 1)), 1));
 	}
-	const auto owner_rows = join.children[candidate.owner_child]->estimated_cardinality;
-	const auto probe_rows = join.children[candidate.probe_child]->estimated_cardinality;
-	const auto match_rows = join.estimated_cardinality;
-	if (probe_rows == 0 ||
-	    static_cast<double>(owner_rows) >
-	        AutoHashGroupJoinCostModel::MAX_INDEX_OWNER_PROBE_RATIO * static_cast<double>(probe_rows) ||
-	    static_cast<double>(match_rows) >
-	        AutoHashGroupJoinCostModel::MAX_INDEX_RETENTION * static_cast<double>(probe_rows)) {
-		return false;
-	}
-	return HasAutoHashGroupJoinART(join, candidate, context);
-}
-
-static bool PassesAutoHashGroupJoinCostModel(LogicalAggregate &aggregate, LogicalComparisonJoin &join,
-                                             const HashGroupJoinCandidate &candidate, ClientContext &context) {
-	if (join.join_type != JoinType::INNER || candidate.routed || !candidate.unique_owner ||
-	    candidate.unmatched_policy != HashGroupJoinUnmatchedPolicy::DISCARD ||
-	    TaskScheduler::GetScheduler(context).NumberOfThreads() != 1 || !join.has_estimated_cardinality ||
-	    !join.children[candidate.owner_child]->has_estimated_cardinality ||
-	    !join.children[candidate.probe_child]->has_estimated_cardinality) {
-		return false;
-	}
-
-	idx_t state_size;
-	if (!AutoHashGroupJoinAggregatesSupported(aggregate, state_size)) {
-		return false;
-	}
-	idx_t key_width = 0;
 	for (auto &condition : join.conditions) {
 		auto &key = candidate.owner_child == 0 ? condition.GetLHS() : condition.GetRHS();
-		key_width += GetTypeIdSize(key.GetReturnType().InternalType());
+		result.key_width += GetTypeIdSize(key.GetReturnType().InternalType());
+	}
+	if (!AutoHashGroupJoinAggregatesSupported(aggregate, result.state_width)) {
+		return result;
 	}
 
-	const auto owner_rows = join.children[candidate.owner_child]->estimated_cardinality;
-	const auto probe_rows = join.children[candidate.probe_child]->estimated_cardinality;
-	const auto match_rows = join.estimated_cardinality;
-	if (key_width < AutoHashGroupJoinCostModel::MIN_KEY_WIDTH ||
-	    owner_rows < AutoHashGroupJoinCostModel::MIN_OWNER_ROWS || match_rows == 0 ||
-	    static_cast<double>(probe_rows) <
-	        AutoHashGroupJoinCostModel::MIN_PROBE_OWNER_RATIO * static_cast<double>(owner_rows)) {
-		return false;
+	const auto key_cost = static_cast<double>(result.key_width) / 8.0;
+	const auto state_cost = static_cast<double>(result.state_width) / 16.0;
+	result.separate_cost = static_cast<double>(result.owner_rows + result.probe_rows) * key_cost +
+	                       static_cast<double>(result.match_rows) * (key_cost + state_cost + 1.0);
+	result.eager_cost = static_cast<double>(result.probe_rows) * (key_cost + state_cost) +
+	                    static_cast<double>(result.distinct_probe_keys) * (key_cost + state_cost) +
+	                    static_cast<double>(result.owner_rows) * key_cost;
+	result.memoizing_cost = static_cast<double>(result.owner_rows) * (key_cost + state_cost) +
+	                        static_cast<double>(result.probe_rows) * key_cost +
+	                        static_cast<double>(result.match_rows) * state_cost;
+	result.index_cost = static_cast<double>(result.owner_rows) * std::log2(static_cast<double>(result.probe_rows) + 1) +
+	                    static_cast<double>(result.match_rows) * (state_cost + 1.0);
+
+	const auto threads = TaskScheduler::GetScheduler(context).NumberOfThreads();
+	const auto fanout =
+	    static_cast<double>(result.match_rows) / static_cast<double>(MaxValue<idx_t>(result.matched_groups, 1));
+	result.execution_mode = threads == 1                                      ? GroupJoinExecutionMode::SERIAL
+	                        : fanout > AutoHashGroupJoinCostModel::MAX_FANOUT ? GroupJoinExecutionMode::LOCAL
+	                                                                          : GroupJoinExecutionMode::OWNERSHIP;
+	const auto estimated_memory =
+	    static_cast<double>(result.owner_rows) *
+	    static_cast<double>(result.key_width + result.state_width + (candidate.routed ? 80 : 48));
+	if (estimated_memory > static_cast<double>(BufferManager::GetBufferManager(context).GetMaxMemory()) * 0.25) {
+		result.execution_mode = GroupJoinExecutionMode::EXTERNAL;
 	}
-	const auto retention = static_cast<double>(match_rows) / static_cast<double>(MaxValue<idx_t>(probe_rows, 1));
-	const auto matched_groups = MinValue(owner_rows, match_rows);
+
+	const auto direct_inner = join.join_type == JoinType::INNER && !candidate.routed && candidate.unique_owner &&
+	                          candidate.unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD;
+	result.index_available = direct_inner && HasAutoHashGroupJoinART(join, candidate, context);
+	if (direct_inner && result.probe_rows != 0 &&
+	    static_cast<double>(result.owner_rows) <=
+	        AutoHashGroupJoinCostModel::MAX_INDEX_OWNER_PROBE_RATIO * static_cast<double>(result.probe_rows) &&
+	    static_cast<double>(result.match_rows) <=
+	        AutoHashGroupJoinCostModel::MAX_INDEX_RETENTION * static_cast<double>(result.probe_rows) &&
+	    result.index_available &&
+	    result.index_cost <=
+	        MinValue(result.separate_cost, result.eager_cost) * AutoHashGroupJoinCostModel::MAX_COST_RATIO) {
+		result.index_selected = true;
+		result.execution_mode = GroupJoinExecutionMode::INDEX;
+	}
+	if (!direct_inner || result.key_width < AutoHashGroupJoinCostModel::MIN_KEY_WIDTH ||
+	    result.owner_rows < AutoHashGroupJoinCostModel::MIN_OWNER_ROWS || result.match_rows == 0 ||
+	    static_cast<double>(result.probe_rows) <
+	        AutoHashGroupJoinCostModel::MIN_PROBE_OWNER_RATIO * static_cast<double>(result.owner_rows)) {
+		return result;
+	}
+	const auto retention =
+	    static_cast<double>(result.match_rows) / static_cast<double>(MaxValue<idx_t>(result.probe_rows, 1));
 	const auto match_density =
-	    static_cast<double>(matched_groups) / static_cast<double>(MaxValue<idx_t>(owner_rows, 1));
-	const auto fanout = static_cast<double>(match_rows) / static_cast<double>(MaxValue<idx_t>(matched_groups, 1));
-	if (retention < AutoHashGroupJoinCostModel::MIN_RETENTION ||
-	    match_density < AutoHashGroupJoinCostModel::MIN_MATCH_DENSITY ||
-	    fanout < AutoHashGroupJoinCostModel::MIN_FANOUT || fanout > AutoHashGroupJoinCostModel::MAX_FANOUT) {
-		return false;
+	    static_cast<double>(result.matched_groups) / static_cast<double>(MaxValue<idx_t>(result.owner_rows, 1));
+	if (retention >= AutoHashGroupJoinCostModel::MIN_RETENTION &&
+	    match_density >= AutoHashGroupJoinCostModel::MIN_MATCH_DENSITY &&
+	    fanout >= AutoHashGroupJoinCostModel::MIN_FANOUT && fanout <= AutoHashGroupJoinCostModel::MAX_FANOUT &&
+	    result.memoizing_cost <=
+	        MinValue(result.separate_cost, result.eager_cost) * AutoHashGroupJoinCostModel::MAX_COST_RATIO) {
+		result.hash_selected = true;
 	}
-
-	const auto key_cost = static_cast<double>(key_width) / 8.0;
-	const auto state_cost = static_cast<double>(state_size) / 16.0;
-	const auto separate_cost = static_cast<double>(owner_rows + probe_rows) * key_cost +
-	                           static_cast<double>(match_rows) * (key_cost + state_cost + 1.0);
-	const auto eager_cost = static_cast<double>(probe_rows) * (key_cost + state_cost) +
-	                        static_cast<double>(matched_groups) * (key_cost + state_cost) +
-	                        static_cast<double>(owner_rows) * key_cost;
-	const auto group_join_cost = static_cast<double>(owner_rows) * (key_cost + state_cost) +
-	                             static_cast<double>(probe_rows) * key_cost +
-	                             static_cast<double>(match_rows) * state_cost;
-	return group_join_cost <= MinValue(separate_cost, eager_cost) * AutoHashGroupJoinCostModel::MAX_COST_RATIO;
+	return result;
 }
 
 optional<HashGroupJoinCandidate> TrySelectHashGroupJoinCandidate(LogicalAggregate &aggregate,
@@ -511,14 +524,15 @@ optional<HashGroupJoinCandidate> TrySelectHashGroupJoinCandidate(LogicalAggregat
 	if (strategy != GroupJoinStrategy::AUTO) {
 		return nullopt;
 	}
+	auto cost = EstimateHashGroupJoinCost(aggregate, join, *candidate, context);
 	auto execution = Settings::Get<DebugGroupJoinExecutionSetting>(context);
 	if ((execution == GroupJoinExecutionMode::AUTO || execution == GroupJoinExecutionMode::INDEX) &&
-	    PassesAutoIndexGroupJoinCostModel(aggregate, join, *candidate, context)) {
+	    cost.index_selected) {
 		aggregate.group_join_auto_selected = true;
 		aggregate.group_join_auto_index = true;
 		return candidate;
 	}
-	if (!PassesAutoHashGroupJoinCostModel(aggregate, join, *candidate, context)) {
+	if (!cost.hash_selected) {
 		return nullopt;
 	}
 	aggregate.group_join_auto_selected = true;
@@ -582,7 +596,25 @@ void PlanHashGroupJoins(unique_ptr<LogicalOperator> &root, ClientContext &contex
 	result->routed = candidate->routed;
 	result->unique_owner = candidate->unique_owner;
 	result->single_match = candidate->single_match;
-	result->use_index = aggregate.group_join_auto_index;
+	auto cost = EstimateHashGroupJoinCost(aggregate, join, *candidate, context);
+	auto configured_execution = Settings::Get<DebugGroupJoinExecutionSetting>(context);
+	result->use_index = aggregate.group_join_auto_index ||
+	                    (configured_execution == GroupJoinExecutionMode::INDEX && cost.index_available);
+	result->execution_mode = cost.execution_mode;
+	if (configured_execution != GroupJoinExecutionMode::AUTO && configured_execution != GroupJoinExecutionMode::INDEX) {
+		result->execution_mode = configured_execution;
+	} else if (result->use_index) {
+		result->execution_mode = GroupJoinExecutionMode::INDEX;
+	}
+	result->estimated_owner_rows = cost.owner_rows;
+	result->estimated_probe_rows = cost.probe_rows;
+	result->estimated_match_rows = cost.match_rows;
+	result->estimated_matched_groups = cost.matched_groups;
+	result->estimated_distinct_probe_keys = cost.distinct_probe_keys;
+	result->separate_cost = cost.separate_cost;
+	result->eager_cost = cost.eager_cost;
+	result->memoizing_cost = cost.memoizing_cost;
+	result->index_cost = cost.index_cost;
 	if (candidate->owner_child == 1) {
 		result->filter_pushdown = std::move(join.filter_pushdown);
 	}

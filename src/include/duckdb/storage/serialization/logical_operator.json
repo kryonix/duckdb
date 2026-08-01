@@ -243,6 +243,66 @@
         "name": "use_index",
         "type": "bool",
         "default": "false"
+      },
+      {
+        "id": 221,
+        "name": "execution_mode",
+        "type": "GroupJoinExecutionMode",
+        "default": "GroupJoinExecutionMode::AUTO"
+      },
+      {
+        "id": 222,
+        "name": "estimated_owner_rows",
+        "type": "idx_t",
+        "default": "0"
+      },
+      {
+        "id": 223,
+        "name": "estimated_probe_rows",
+        "type": "idx_t",
+        "default": "0"
+      },
+      {
+        "id": 224,
+        "name": "estimated_match_rows",
+        "type": "idx_t",
+        "default": "0"
+      },
+      {
+        "id": 225,
+        "name": "estimated_matched_groups",
+        "type": "idx_t",
+        "default": "0"
+      },
+      {
+        "id": 226,
+        "name": "estimated_distinct_probe_keys",
+        "type": "idx_t",
+        "default": "0"
+      },
+      {
+        "id": 227,
+        "name": "separate_cost",
+        "type": "double",
+        "default": "0"
+      },
+      {
+        "id": 228,
+        "name": "eager_cost",
+        "type": "double",
+        "default": "0"
+      },
+      {
+        "id": 229,
+        "name": "memoizing_cost",
+        "type": "double",
+        "default": "0"
+      },
+      {
+        "id": 230,
+        "name": "index_cost",
+        "type": "double",
+        "default": "0"
       }
     ],
     "constructor": [

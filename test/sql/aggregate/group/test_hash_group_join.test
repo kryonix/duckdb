@@ -40,6 +40,9 @@ statement ok
 PRAGMA enable_optimizer
 
 statement ok
+SET threads = 1
+
+statement ok
 SET debug_group_join_strategy = 'force'
 
 # Force protects an eligible candidate from partial aggregate pushdown and produces a first-class logical GroupJoin.
@@ -51,7 +54,29 @@ EXPLAIN SELECT o.id, count(*), sum(p.value)
 FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
 GROUP BY o.id
 ----
-logical_opt	<REGEX>:.*Group Join.*
+logical_opt	<REGEX>:(?s).*Group Join.*Strategy: SERIAL.*Strategy Costs:.*
+
+# The shared strategy estimate is independent of physical planning and chooses a parallel ownership path at moderate
+# fan-out. FILTER is deliberately force-only under AUTO, but still receives a complete strategy estimate.
+statement ok
+SET threads = 4
+
+query II
+EXPLAIN SELECT o.id, count(*), sum(p.value)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+logical_opt	<REGEX>:(?s).*Group Join.*Strategy: OWNERSHIP.*Strategy Costs:.*
+
+query II
+EXPLAIN SELECT o.id, sum(p.value) FILTER (WHERE p.flag)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+logical_opt	<REGEX>:(?s).*Group Join.*Strategy: OWNERSHIP.*Strategy Costs:.*
+
+statement ok
+SET threads = 1
 
 statement ok
 SET debug_verify_serializer = true
@@ -371,6 +396,28 @@ endloop
 
 statement ok
 RESET debug_group_join_execution
+
+# Planned AUTO execution chooses task-local memoization for high fan-out and bounded external execution when the
+# estimated owner state table exceeds the memory budget.
+query II
+EXPLAIN SELECT o.id, count(*), sum(p.value)
+FROM gj_parallel_owner o JOIN gj_parallel_probe p USING (id)
+GROUP BY o.id
+----
+physical_plan	<REGEX>:(?s).*Hash Group Join.*Strategy: LOCAL.*
+
+statement ok
+SET memory_limit = '30MB'
+
+query II
+EXPLAIN SELECT o.id, count(*)
+FROM range(100000) o(id) JOIN range(100000) p(id) USING (id)
+GROUP BY o.id
+----
+physical_plan	<REGEX>:(?s).*Hash Group Join.*Strategy: EXTERNAL.*
+
+statement ok
+RESET memory_limit
 
 statement ok
 PRAGMA disable_verify_parallelism

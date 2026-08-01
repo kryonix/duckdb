@@ -40,6 +40,24 @@ struct StaticHashGroupJoinCandidate {
 	vector<HashGroupJoinOutputColumn> output_columns;
 };
 
+struct HashGroupJoinCostEstimate {
+	idx_t owner_rows = 0;
+	idx_t probe_rows = 0;
+	idx_t match_rows = 0;
+	idx_t matched_groups = 0;
+	idx_t distinct_probe_keys = 0;
+	idx_t key_width = 0;
+	idx_t state_width = 0;
+	double separate_cost = 0;
+	double eager_cost = 0;
+	double memoizing_cost = 0;
+	double index_cost = 0;
+	GroupJoinExecutionMode execution_mode = GroupJoinExecutionMode::AUTO;
+	bool index_available = false;
+	bool index_selected = false;
+	bool hash_selected = false;
+};
+
 //! Returns whether GroupJoin planning is enabled by both the strategy setting and optimizer configuration.
 bool HashGroupJoinPlanningEnabled(ClientContext &context);
 //! Returns whether the complete forced GroupJoin planning path is enabled.
@@ -48,6 +66,9 @@ bool ForceHashGroupJoinPlanning(ClientContext &context);
 optional<HashGroupJoinCandidate>
 TryGetHashGroupJoinCandidate(LogicalAggregate &aggregate, LogicalComparisonJoin &join, ClientContext &context,
                              HashGroupJoinCandidateMode mode = HashGroupJoinCandidateMode::STRICT);
+
+HashGroupJoinCostEstimate EstimateHashGroupJoinCost(LogicalAggregate &aggregate, LogicalComparisonJoin &join,
+                                                    const HashGroupJoinCandidate &candidate, ClientContext &context);
 
 //! Selects a forced or cost-qualified automatic candidate and records an automatic selection on the aggregate.
 optional<HashGroupJoinCandidate>

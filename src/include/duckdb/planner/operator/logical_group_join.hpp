@@ -32,6 +32,16 @@ public:
 	bool unique_owner = false;
 	bool single_match = false;
 	bool use_index = false;
+	GroupJoinExecutionMode execution_mode = GroupJoinExecutionMode::AUTO;
+	idx_t estimated_owner_rows = 0;
+	idx_t estimated_probe_rows = 0;
+	idx_t estimated_match_rows = 0;
+	idx_t estimated_matched_groups = 0;
+	idx_t estimated_distinct_probe_keys = 0;
+	double separate_cost = 0;
+	double eager_cost = 0;
+	double memoizing_cost = 0;
+	double index_cost = 0;
 	//! Runtime filters generated for the probe subtree when the owner is the original join build side
 	unique_ptr<JoinFilterPushdownInfo> filter_pushdown;
 
