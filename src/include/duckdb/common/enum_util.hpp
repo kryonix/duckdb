@@ -264,6 +264,8 @@ enum class GeometryType : uint8_t;
 
 enum class GroupByExpressionInfoType : uint8_t;
 
+enum class GroupJoinExecutionMode : uint8_t;
+
 enum class GroupJoinStrategy : uint8_t;
 
 enum class HLLStorageType : uint8_t;
@@ -271,6 +273,10 @@ enum class HLLStorageType : uint8_t;
 enum class HTTPStatusCode : uint16_t;
 
 enum class HashGroupJoinCandidateMode : uint8_t;
+
+enum class HashGroupJoinOutputSource : uint8_t;
+
+enum class HashGroupJoinUnmatchedPolicy : uint8_t;
 
 enum class IndexAppendMode : uint8_t;
 
@@ -962,6 +968,9 @@ template<>
 const char* EnumUtil::ToChars<GroupByExpressionInfoType>(GroupByExpressionInfoType value);
 
 template<>
+const char* EnumUtil::ToChars<GroupJoinExecutionMode>(GroupJoinExecutionMode value);
+
+template<>
 const char* EnumUtil::ToChars<GroupJoinStrategy>(GroupJoinStrategy value);
 
 template<>
@@ -972,6 +981,12 @@ const char* EnumUtil::ToChars<HTTPStatusCode>(HTTPStatusCode value);
 
 template<>
 const char* EnumUtil::ToChars<HashGroupJoinCandidateMode>(HashGroupJoinCandidateMode value);
+
+template<>
+const char* EnumUtil::ToChars<HashGroupJoinOutputSource>(HashGroupJoinOutputSource value);
+
+template<>
+const char* EnumUtil::ToChars<HashGroupJoinUnmatchedPolicy>(HashGroupJoinUnmatchedPolicy value);
 
 template<>
 const char* EnumUtil::ToChars<IndexAppendMode>(IndexAppendMode value);
@@ -1833,6 +1848,9 @@ template<>
 GroupByExpressionInfoType EnumUtil::FromString<GroupByExpressionInfoType>(const char *value);
 
 template<>
+GroupJoinExecutionMode EnumUtil::FromString<GroupJoinExecutionMode>(const char *value);
+
+template<>
 GroupJoinStrategy EnumUtil::FromString<GroupJoinStrategy>(const char *value);
 
 template<>
@@ -1843,6 +1861,12 @@ HTTPStatusCode EnumUtil::FromString<HTTPStatusCode>(const char *value);
 
 template<>
 HashGroupJoinCandidateMode EnumUtil::FromString<HashGroupJoinCandidateMode>(const char *value);
+
+template<>
+HashGroupJoinOutputSource EnumUtil::FromString<HashGroupJoinOutputSource>(const char *value);
+
+template<>
+HashGroupJoinUnmatchedPolicy EnumUtil::FromString<HashGroupJoinUnmatchedPolicy>(const char *value);
 
 template<>
 IndexAppendMode EnumUtil::FromString<IndexAppendMode>(const char *value);

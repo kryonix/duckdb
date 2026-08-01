@@ -41,6 +41,10 @@ public:
 	vector<unique_ptr<BaseStatistics>> group_stats;
 	//! Whether the inputs to all expression are non-NULL
 	TupleDataValidityType distinct_validity;
+	//! Whether the optimizer selected this aggregate for automatic Hash GroupJoin planning
+	bool group_join_auto_selected = false;
+	//! Whether the automatic selection requires the transactional ART-backed implementation
+	bool group_join_auto_index = false;
 
 public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;

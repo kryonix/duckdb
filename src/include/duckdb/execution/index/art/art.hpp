@@ -79,6 +79,8 @@ public:
 	//! Perform a lookup on the ART, fetching up to max_count row IDs.
 	//! If all row IDs were fetched, it return true, else false.
 	bool Scan(IndexScanState &state, idx_t max_count, set<row_t> &row_ids);
+	//! Looks up one row of already evaluated index keys.
+	bool SearchEqual(DataChunk &keys, idx_t row_idx, idx_t max_count, set<row_t> &row_ids);
 
 	//! Simple merge: scan source ART and delete each (key, rowid) from this ART.
 	// FIXME: replace with structural tree delete merge.

@@ -1,4 +1,4 @@
-# description: Parameterized serial Hash GroupJoin comparison
+# description: Parameterized Hash GroupJoin comparison
 # group: [groupjoin]
 
 name GroupJoin ${LABEL} (B=${owner_rows}, fanout=${fanout}, match=${match_rate}%, hot=${hot_percent}%)
@@ -9,10 +9,13 @@ argument owner_rows 100000
 argument fanout 10
 argument match_rate 100
 argument hot_percent 0
+argument groupjoin_threads 1
+argument execution auto
 
 load
-SET threads TO 1;
+SET threads TO ${groupjoin_threads};
 SET debug_group_join_strategy TO '${STRATEGY}';
+SET debug_group_join_execution TO '${execution}';
 SET disabled_optimizers TO '${DISABLED_OPTIMIZERS}';
 CREATE TABLE groupjoin_owner(
 	int_key BIGINT PRIMARY KEY,

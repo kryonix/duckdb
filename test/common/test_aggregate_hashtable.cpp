@@ -143,3 +143,109 @@ TEST_CASE("Grouped aggregate address lookup and update", "[aggregate_hashtable]"
 	REQUIRE(counts[20] == make_pair<int64_t, int64_t>(1, 1));
 	REQUIRE(counts[30] == make_pair<int64_t, int64_t>(0, 0));
 }
+
+TEST_CASE("Combine compatible aggregate state ranges across layouts", "[aggregate_hashtable]") {
+	DuckDB database(nullptr);
+	Connection connection(database);
+	auto &context = *connection.context;
+	auto &allocator = Allocator::Get(context);
+
+	vector<AggregateObject> source_aggregates;
+	source_aggregates.push_back(CreateCountAggregate(true));
+	source_aggregates.push_back(CreateCountAggregate(false));
+	GroupedAggregateHashTable source_table(context, allocator, {LogicalType::UBIGINT}, {LogicalType::INTEGER},
+	                                       std::move(source_aggregates), GroupedAggregateHashTable::InitialCapacity(),
+	                                       idx_t(0), TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
+
+	vector<AggregateObject> target_aggregates;
+	target_aggregates.push_back(CreateCountAggregate(true));
+	target_aggregates.push_back(CreateCountAggregate(true));
+	target_aggregates.push_back(CreateCountAggregate(false));
+	GroupedAggregateHashTable target_table(context, allocator, {LogicalType::INTEGER}, {LogicalType::INTEGER},
+	                                       std::move(target_aggregates), GroupedAggregateHashTable::InitialCapacity(),
+	                                       idx_t(0), TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
+
+	DataChunk source_groups;
+	source_groups.Initialize(allocator, {LogicalType::UBIGINT});
+	source_groups.data[0].SetValue(0, Value::UBIGINT(1));
+	source_groups.data[0].SetValue(1, Value::UBIGINT(2));
+	source_groups.SetChildCardinality(2);
+	Vector source_addresses(LogicalType::POINTER);
+	SelectionVector source_new_groups(STANDARD_VECTOR_SIZE);
+	REQUIRE(source_table.FindOrCreateGroups(source_groups, source_addresses, source_new_groups) == 2);
+
+	DataChunk source_payload;
+	source_payload.Initialize(allocator, {LogicalType::INTEGER});
+	SetIntegerValues(source_payload, {Value::INTEGER(5), Value(LogicalType::INTEGER)});
+	AggregateHTUpdateState source_update_state(source_table);
+	unsafe_vector<idx_t> source_filter {0, 1};
+	source_table.UpdateAggregatesAtAddresses(source_update_state, source_addresses, source_payload, source_filter);
+
+	DataChunk target_groups;
+	target_groups.Initialize(allocator, {LogicalType::INTEGER});
+	SetIntegerValues(target_groups, {Value::INTEGER(10), Value::INTEGER(20)});
+	Vector target_addresses(LogicalType::POINTER);
+	SelectionVector target_new_groups(STANDARD_VECTOR_SIZE);
+	REQUIRE(target_table.FindOrCreateGroups(target_groups, target_addresses, target_new_groups) == 2);
+
+	ArenaAllocator combine_allocator(allocator);
+	RowOperationsState combine_state(combine_allocator);
+	REQUIRE_THROWS(RowOperations::CombineStatesRange(combine_state, *source_table.GetLayoutPtr(), source_addresses, 0,
+	                                                 *target_table.GetLayoutPtr(), target_addresses, 0, 2));
+	REQUIRE_THROWS(RowOperations::CombineStatesRange(combine_state, *source_table.GetLayoutPtr(), source_addresses, 1,
+	                                                 *target_table.GetLayoutPtr(), target_addresses, 1, 2));
+	AggregateHTUpdateState target_update_state(target_table);
+	REQUIRE_THROWS(
+	    target_table.UpdateAggregatesAtAddressesRange(target_update_state, target_addresses, source_payload, 2, 2));
+	target_table.UpdateAggregatesAtAddressesRange(target_update_state, target_addresses, source_payload, 1, 2);
+
+	RowOperations::CombineStatesRange(combine_state, *source_table.GetLayoutPtr(), source_addresses, 0,
+	                                  *target_table.GetLayoutPtr(), target_addresses, 1, 2);
+	DataChunk result;
+	result.Initialize(allocator, {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT});
+	result.SetChildCardinality(2);
+	RowOperations::FinalizeStates(combine_state, *target_table.GetLayoutPtr(), target_addresses, result, 0);
+	REQUIRE(result.GetValue(0, 0) == Value::BIGINT(0));
+	REQUIRE(result.GetValue(0, 1) == Value::BIGINT(0));
+	REQUIRE(result.GetValue(1, 0) == Value::BIGINT(2));
+	REQUIRE(result.GetValue(1, 1) == Value::BIGINT(2));
+	REQUIRE(result.GetValue(2, 0) == Value::BIGINT(2));
+	REQUIRE(result.GetValue(2, 1) == Value::BIGINT(0));
+}
+
+TEST_CASE("Grouped aggregate scans retain projected columns across radix partitions", "[aggregate_hashtable]") {
+	DuckDB database(nullptr);
+	Connection connection(database);
+	auto &context = *connection.context;
+	auto &allocator = Allocator::Get(context);
+
+	vector<AggregateObject> aggregates;
+	aggregates.push_back(CreateCountAggregate(true));
+	GroupedAggregateHashTable hash_table(context, allocator, {LogicalType::INTEGER}, {}, std::move(aggregates),
+	                                     GroupedAggregateHashTable::InitialCapacity(), 2,
+	                                     TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
+	DataChunk groups;
+	groups.Initialize(allocator, {LogicalType::INTEGER});
+	for (idx_t group_idx = 0; group_idx < 100; group_idx++) {
+		groups.data[0].SetValue(group_idx, Value::INTEGER(NumericCast<int32_t>(group_idx)));
+	}
+	groups.SetChildCardinality(100);
+	Vector addresses(LogicalType::POINTER);
+	SelectionVector new_groups(STANDARD_VECTOR_SIZE);
+	REQUIRE(hash_table.FindOrCreateGroups(groups, addresses, new_groups) == 100);
+
+	AggregateHTScanState scan_state;
+	hash_table.InitializeScan(scan_state);
+	DataChunk scanned_groups;
+	scanned_groups.Initialize(allocator, {LogicalType::INTEGER});
+	unordered_set<int32_t> scanned_values;
+	while (hash_table.ScanGroups(scan_state, scanned_groups)) {
+		for (idx_t row_idx = 0; row_idx < scanned_groups.size(); row_idx++) {
+			scanned_values.insert(scanned_groups.GetValue(0, row_idx).GetValue<int32_t>());
+		}
+	}
+	REQUIRE(scanned_values.size() == 100);
+	for (int32_t value = 0; value < 100; value++) {
+		REQUIRE(scanned_values.find(value) != scanned_values.end());
+	}
+}

@@ -714,6 +714,29 @@ bool ART::SearchEqual(ARTKey &key, idx_t max_count, set<row_t> &row_ids) {
 	return it.Scan(empty_key, output, false) == ARTScanResult::COMPLETED;
 }
 
+bool ART::SearchEqual(DataChunk &keys, idx_t row_idx, idx_t max_count, set<row_t> &row_ids) {
+	D_ASSERT(row_idx < keys.size());
+	SelectionVector selection(1);
+	selection.set_index(0, row_idx);
+	DataChunk key;
+	key.InitializeEmpty(keys.GetTypes());
+	key.Slice(keys, selection, 1);
+	auto key_input = &key;
+	DataChunk converted_key;
+	if (KeyInputNeedConversion(key.GetTypes(), storage_version)) {
+		ConvertKeyInput(key, converted_key);
+		key_input = &converted_key;
+	}
+	ArenaAllocator arena(BufferAllocator::Get(db));
+	unsafe_vector<ARTKey> art_keys(1);
+	GenerateKeys<>(arena, *key_input, art_keys);
+	if (art_keys[0].Empty()) {
+		return true;
+	}
+	lock_guard<mutex> guard(lock);
+	return SearchEqual(art_keys[0], max_count, row_ids);
+}
+
 bool ART::SearchGreater(ARTKey &key, bool equal, idx_t max_count, set<row_t> &row_ids) {
 	if (!tree.HasMetadata()) {
 		return true;

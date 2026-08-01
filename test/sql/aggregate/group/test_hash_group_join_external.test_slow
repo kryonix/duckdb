@@ -1,0 +1,75 @@
+# name: test/sql/aggregate/group/test_hash_group_join_external.test_slow
+# description: Bounded-memory external Hash GroupJoin execution
+# group: [group]
+
+require json
+
+require noforcestorage
+
+require skip_reload
+
+statement ok
+SET threads = 4
+
+statement ok
+SET preserve_insertion_order = false
+
+statement ok
+SET temp_directory = '{TEST_DIR}/hash_group_join_external'
+
+statement ok
+SET debug_group_join_strategy = 'force'
+
+statement ok
+SET debug_group_join_execution = 'external'
+
+statement ok
+CREATE TABLE external_owner AS SELECT i::INTEGER id FROM range(100000) t(i)
+
+statement ok
+ALTER TABLE external_owner ADD PRIMARY KEY(id)
+
+statement ok
+SET memory_limit = '30MB'
+
+statement ok
+PRAGMA enable_profiling = 'json'
+
+statement ok
+SET tracked_metrics = ['system.peak_buffer_memory', 'system.peak_temp_dir_size']
+
+statement ok
+PRAGMA profiling_output = '{TEST_DIR}/hash_group_join_external.json'
+
+query III
+SELECT count(*), sum(n), sum(s) FROM (
+	SELECT o.id, count(*) n, sum(p.v) s
+	FROM external_owner o
+	JOIN (SELECT (i % 125000)::INTEGER id, i::BIGINT v FROM range(5000000) t(i)) p USING (id)
+	GROUP BY o.id
+)
+----
+100000	4000000	9949998000000
+
+query I
+SELECT count(DISTINCT p.v)
+FROM external_owner o
+JOIN (SELECT 0::INTEGER id, i::BIGINT v FROM range(5000000) t(i)) p USING (id)
+GROUP BY o.id
+----
+5000000
+
+statement ok
+PRAGMA disable_profiling
+
+statement ok
+RESET memory_limit
+
+statement ok
+CREATE TEMP TABLE external_metrics AS SELECT * FROM '{TEST_DIR}/hash_group_join_external.json'
+
+query II
+SELECT system.peak_buffer_memory <= 30000000, system.peak_temp_dir_size > 0
+FROM external_metrics
+----
+true	true

@@ -1,0 +1,8 @@
+# name: benchmark/micro/groupjoin/index_separate.benchmark
+# group: [groupjoin]
+
+template benchmark/micro/groupjoin/index_groupjoin.benchmark.in
+LABEL=separate
+STRATEGY=disabled
+EXECUTION=auto
+DISABLED_OPTIMIZERS=partial_aggregate_pushdown,top_n

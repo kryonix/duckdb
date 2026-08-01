@@ -1,25 +1,174 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/function/partition_stats.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
+#include "duckdb/execution/operator/filter/physical_filter.hpp"
+#include "duckdb/execution/operator/join/physical_index_group_join.hpp"
 #include "duckdb/execution/operator/join/physical_hash_group_join.hpp"
 #include "duckdb/execution/operator/aggregate/physical_partitioned_aggregate.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
+#include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/function_binder.hpp"
+#include "duckdb/function/aggregate/distributive_function_utils.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/optimizer/hash_group_join.hpp"
 #include "duckdb/execution/group_join_strategy.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 
 namespace duckdb {
+
+struct IndexGroupJoinInfo {
+	DuckTableEntry *table;
+	Identifier index_name;
+	vector<StorageIndex> probe_column_ids;
+	vector<LogicalType> probe_scan_types;
+	vector<idx_t> probe_projection_ids;
+	unique_ptr<TableFilterSet> probe_filters;
+	vector<unique_ptr<Expression>> probe_residual_filters;
+	vector<idx_t> index_key_map;
+	vector<LogicalType> index_key_types;
+};
+
+static optional<StorageIndex> GetIndexGroupJoinStorageIndex(PhysicalTableScan &scan, DuckTableEntry &table,
+                                                            idx_t output_index) {
+	if (output_index >= scan.GetTypes().size()) {
+		return nullopt;
+	}
+	const auto scan_index = scan.projection_ids.empty() ? output_index : scan.projection_ids[output_index];
+	if (scan_index >= scan.column_ids.size()) {
+		return nullopt;
+	}
+	auto &column = scan.column_ids[scan_index];
+	if (!column.HasPrimaryIndex() || column.HasChildren() || column.IsVirtualColumn()) {
+		return nullopt;
+	}
+	return table.GetStorageIndex(column);
+}
+
+static optional<IndexGroupJoinInfo> TryGetIndexGroupJoinInfo(ClientContext &context, PhysicalOperator &probe,
+                                                             const HashGroupJoinCandidate &candidate) {
+	if (candidate.routed) {
+		return nullopt;
+	}
+	vector<unique_ptr<Expression>> residual_filters;
+	reference<PhysicalOperator> probe_child(probe);
+	while (probe_child.get().type == PhysicalOperatorType::FILTER) {
+		auto &filter = probe_child.get().Cast<PhysicalFilter>();
+		if (filter.expression->IsVolatile() || filter.children.size() != 1) {
+			return nullopt;
+		}
+		residual_filters.push_back(filter.expression->Copy());
+		probe_child = filter.children[0];
+	}
+	if (probe_child.get().type != PhysicalOperatorType::TABLE_SCAN ||
+	    probe_child.get().GetTypes() != probe.GetTypes()) {
+		return nullopt;
+	}
+	auto &scan = probe_child.get().Cast<PhysicalTableScan>();
+	if (scan.function.name != "seq_scan" || (scan.dynamic_filters && scan.dynamic_filters->HasFilters())) {
+		return nullopt;
+	}
+	auto &bind_data = scan.bind_data->Cast<TableScanBindData>();
+	if (bind_data.partitions_to_scan || bind_data.table.type != CatalogType::TABLE_ENTRY) {
+		return nullopt;
+	}
+	auto &table = bind_data.table.Cast<DuckTableEntry>();
+	vector<StorageIndex> probe_column_ids;
+	vector<LogicalType> probe_scan_types;
+	probe_column_ids.reserve(scan.column_ids.size());
+	probe_scan_types.reserve(scan.column_ids.size());
+	for (auto &column : scan.column_ids) {
+		if (!column.HasPrimaryIndex() || column.HasChildren() || column.IsVirtualColumn()) {
+			return nullopt;
+		}
+		probe_column_ids.push_back(table.GetStorageIndex(column));
+		probe_scan_types.push_back(column.HasType() ? column.GetScanType()
+		                                            : scan.returned_types[column.GetPrimaryIndex()]);
+	}
+	vector<idx_t> probe_projection_ids = scan.projection_ids;
+	if (probe_projection_ids.empty()) {
+		if (scan.GetTypes().size() != scan.column_ids.size()) {
+			return nullopt;
+		}
+		for (idx_t column_idx = 0; column_idx < scan.column_ids.size(); column_idx++) {
+			probe_projection_ids.push_back(column_idx);
+		}
+	}
+
+	vector<idx_t> probe_key_columns;
+	probe_key_columns.reserve(candidate.probe_key_indices.size());
+	for (auto output_idx : candidate.probe_key_indices) {
+		auto storage_index = GetIndexGroupJoinStorageIndex(scan, table, output_idx);
+		if (!storage_index || !storage_index->HasPrimaryIndex() || storage_index->HasChildren()) {
+			return nullopt;
+		}
+		probe_key_columns.push_back(storage_index->GetPrimaryIndex());
+	}
+
+	auto &info = table.GetStorage().GetDataTableInfo();
+	info->BindIndexes(context, ART::TYPE_NAME);
+	for (auto &index : info->GetIndexes().Indexes()) {
+		if (!index.IsBound() || index.GetIndexType() != ART::TYPE_NAME) {
+			continue;
+		}
+		auto &art = index.Cast<ART>();
+		if (art.unbound_expressions.size() != probe_key_columns.size()) {
+			continue;
+		}
+		vector<idx_t> index_key_map;
+		vector<bool> used_keys(probe_key_columns.size(), false);
+		bool matches = true;
+		for (idx_t expression_idx = 0; expression_idx < art.unbound_expressions.size(); expression_idx++) {
+			auto &expression = *art.unbound_expressions[expression_idx];
+			if (expression.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+				matches = false;
+				break;
+			}
+			auto &column = expression.Cast<BoundColumnRefExpression>();
+			auto index_column = column.Binding().column_index;
+			if (column.Depth() != 0 || index_column >= art.GetColumnIds().size()) {
+				matches = false;
+				break;
+			}
+			auto physical_column = art.GetColumnIds()[index_column];
+			auto key_entry = std::find(probe_key_columns.begin(), probe_key_columns.end(), physical_column);
+			if (key_entry == probe_key_columns.end()) {
+				matches = false;
+				break;
+			}
+			auto key_idx = NumericCast<idx_t>(key_entry - probe_key_columns.begin());
+			if (used_keys[key_idx]) {
+				matches = false;
+				break;
+			}
+			used_keys[key_idx] = true;
+			index_key_map.push_back(key_idx);
+		}
+		if (matches) {
+			return IndexGroupJoinInfo {&table,
+			                           art.GetIndexName(),
+			                           std::move(probe_column_ids),
+			                           std::move(probe_scan_types),
+			                           std::move(probe_projection_ids),
+			                           scan.table_filters ? scan.table_filters->Copy() : nullptr,
+			                           std::move(residual_filters),
+			                           std::move(index_key_map),
+			                           art.logical_types};
+		}
+	}
+	return nullopt;
+}
 
 static void RewriteGroupJoinProbeReferences(unique_ptr<Expression> &expression, idx_t probe_child,
                                             idx_t left_column_count) {
@@ -27,11 +176,16 @@ static void RewriteGroupJoinProbeReferences(unique_ptr<Expression> &expression, 
 		auto &reference = expression->Cast<BoundReferenceExpression>();
 		if (probe_child == 1) {
 			if (reference.Index() < left_column_count) {
-				throw InternalException("HASH_GROUP_JOIN aggregate unexpectedly referenced the owner child");
+				throw InternalException(
+				    "HASH_GROUP_JOIN aggregate reference %llu unexpectedly referenced the owner child "
+				    "(probe child %llu, left columns %llu)",
+				    reference.Index(), probe_child, left_column_count);
 			}
 			reference.IndexMutable() -= left_column_count;
 		} else if (reference.Index() >= left_column_count) {
-			throw InternalException("HASH_GROUP_JOIN aggregate unexpectedly referenced the owner child");
+			throw InternalException("HASH_GROUP_JOIN aggregate reference %llu unexpectedly referenced the owner child "
+			                        "(probe child %llu, left columns %llu)",
+			                        reference.Index(), probe_child, left_column_count);
 		}
 		return;
 	}
@@ -263,11 +417,18 @@ static bool CanUsePerfectHashAggregate(ClientContext &context, LogicalAggregate 
 
 PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalAggregate &op) {
 	D_ASSERT(op.children.size() == 1);
-	if (Settings::Get<DebugGroupJoinStrategySetting>(context) == GroupJoinStrategy::FORCE &&
-	    op.children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+	if (op.children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto &join = op.children[0]->Cast<LogicalComparisonJoin>();
-		auto candidate = TryGetHashGroupJoinCandidate(op, join, context);
+		auto candidate =
+		    TryGetPlannedHashGroupJoinCandidate(op, join, context, HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER);
 		if (candidate) {
+			for (auto &expression : op.expressions) {
+				auto &aggregate = expression->Cast<BoundAggregateExpression>();
+				if (aggregate.GetOrderBys()) {
+					FunctionBinder::BindSortedAggregate(context, aggregate, op.groups, op.grouping_sets);
+				}
+			}
+			const auto left_column_count = join.children[0]->GetColumnBindings().size();
 			reference<PhysicalOperator> probe = CreatePlan(*join.children[candidate->probe_child]);
 			reference<PhysicalOperator> owner = CreatePlan(*join.children[candidate->owner_child]);
 
@@ -276,22 +437,34 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalAggregate &op) {
 			vector<unique_ptr<Expression>> probe_expressions;
 			vector<LogicalType> probe_types;
 			vector<unique_ptr<Expression>> groups;
-			for (idx_t group_idx = 0; group_idx < candidate->owner_key_indices.size(); group_idx++) {
-				auto owner_idx = candidate->owner_key_indices[group_idx];
-				auto probe_idx = candidate->probe_key_indices[group_idx];
+			for (idx_t key_idx = 0; key_idx < candidate->owner_key_indices.size(); key_idx++) {
+				auto owner_idx = candidate->owner_key_indices[key_idx];
+				auto probe_idx = candidate->probe_key_indices[key_idx];
 				auto type = owner.get().GetTypes()[owner_idx];
 				owner_types.push_back(type);
 				owner_expressions.push_back(make_uniq<BoundReferenceExpression>(type, owner_idx));
 				probe_types.push_back(type);
 				probe_expressions.push_back(make_uniq<BoundReferenceExpression>(type, probe_idx));
-				groups.push_back(make_uniq<BoundReferenceExpression>(type, group_idx));
+				groups.push_back(make_uniq<BoundReferenceExpression>(type, key_idx));
+			}
+
+			FunctionBinder function_binder(context);
+			vector<unique_ptr<Expression>> owner_payload_aggregates;
+			for (idx_t payload_idx = 0; payload_idx < candidate->owner_payload_indices.size(); payload_idx++) {
+				auto owner_idx = candidate->owner_payload_indices[payload_idx];
+				auto type = owner.get().GetTypes()[owner_idx];
+				owner_types.push_back(type);
+				owner_expressions.push_back(make_uniq<BoundReferenceExpression>(type, owner_idx));
+				vector<unique_ptr<Expression>> first_children;
+				first_children.push_back(make_uniq<BoundReferenceExpression>(type, payload_idx));
+				owner_payload_aggregates.push_back(function_binder.BindAggregateFunction(
+				    FirstFunctionGetter::GetFunction(type), std::move(first_children), nullptr,
+				    AggregateType::NON_DISTINCT));
 			}
 
 			vector<unique_ptr<Expression>> aggregates;
-			FunctionBinder function_binder(context);
 			aggregates.push_back(function_binder.BindAggregateFunction(CountStarFun::GetFunction(), {}, nullptr,
 			                                                           AggregateType::NON_DISTINCT));
-			const auto left_column_count = join.children[0]->GetColumnBindings().size();
 			for (auto &expression : op.expressions) {
 				auto &aggregate = expression->Cast<BoundAggregateExpression>();
 				for (auto &child : aggregate.GetChildrenMutable()) {
@@ -302,18 +475,51 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalAggregate &op) {
 					probe_expressions.push_back(std::move(child));
 					child = make_uniq<BoundReferenceExpression>(type, projection_index);
 				}
+			}
+			for (auto &expression : op.expressions) {
+				auto &aggregate = expression->Cast<BoundAggregateExpression>();
+				if (!aggregate.GetFilter()) {
+					continue;
+				}
+				auto &filter = aggregate.GetFilterMutable();
+				RewriteGroupJoinProbeReferences(filter, candidate->probe_child, left_column_count);
+				auto type = filter->GetReturnType();
+				auto payload_index = probe_expressions.size() - candidate->probe_key_indices.size();
+				probe_types.push_back(type);
+				probe_expressions.push_back(std::move(filter));
+				filter = make_uniq<BoundReferenceExpression>(type, payload_index);
+			}
+			for (auto &expression : op.expressions) {
 				aggregates.push_back(std::move(expression));
 			}
 
-			auto &probe_projection = Make<PhysicalProjection>(std::move(probe_types), std::move(probe_expressions),
-			                                                  probe.get().estimated_cardinality);
-			probe_projection.children.push_back(probe);
 			auto &owner_projection = Make<PhysicalProjection>(std::move(owner_types), std::move(owner_expressions),
 			                                                  owner.get().estimated_cardinality);
 			owner_projection.children.push_back(owner);
-			auto &group_join =
-			    Make<PhysicalHashGroupJoin>(op, probe_projection, owner_projection, std::move(aggregates),
-			                                std::move(groups), op.estimated_cardinality);
+			auto execution_mode = Settings::Get<DebugGroupJoinExecutionSetting>(context);
+			if (execution_mode == GroupJoinExecutionMode::INDEX ||
+			    (execution_mode == GroupJoinExecutionMode::AUTO && op.group_join_auto_index)) {
+				auto index_info = TryGetIndexGroupJoinInfo(context, probe, *candidate);
+				if (index_info) {
+					auto &group_join = Make<PhysicalIndexGroupJoin>(
+					    op, owner_projection, *index_info->table, std::move(index_info->index_name),
+					    std::move(index_info->probe_column_ids), std::move(index_info->probe_scan_types),
+					    std::move(index_info->probe_projection_ids), probe.get().GetTypes(),
+					    std::move(index_info->probe_filters), std::move(index_info->probe_residual_filters),
+					    std::move(probe_expressions), std::move(index_info->index_key_map),
+					    std::move(index_info->index_key_types), std::move(aggregates),
+					    std::move(owner_payload_aggregates), std::move(groups), std::move(candidate->output_groups),
+					    candidate->unmatched_policy, op.estimated_cardinality);
+					return group_join;
+				}
+			}
+			auto &probe_projection = Make<PhysicalProjection>(std::move(probe_types), std::move(probe_expressions),
+			                                                  probe.get().estimated_cardinality);
+			probe_projection.children.push_back(probe);
+			auto &group_join = Make<PhysicalHashGroupJoin>(
+			    op, probe_projection, owner_projection, std::move(aggregates), std::move(owner_payload_aggregates),
+			    std::move(groups), std::move(candidate->output_groups), candidate->unmatched_policy, candidate->routed,
+			    op.estimated_cardinality);
 			return group_join;
 		}
 	}

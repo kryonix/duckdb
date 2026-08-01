@@ -24,6 +24,8 @@ class TableIndexIterationHelper;
 //! IndexBindState to transition index binding phases preventing lock order inversion.
 enum class IndexBindState : uint8_t { UNBOUND, BINDING, BOUND };
 
+enum class ARTLookupResult : uint8_t { INDEX_NOT_FOUND, COMPLETE, EXCEEDED_LIMIT };
+
 //! IndexEntry contains an atomic in addition to the index to ensure correct binding.
 struct IndexEntry {
 	explicit IndexEntry(unique_ptr<Index> index);
@@ -73,6 +75,9 @@ public:
 	bool NameIsUnique(const string &name);
 	//! Returns an optional pointer to the index matching the name.
 	optional_ptr<BoundIndex> Find(const Identifier &name);
+	//! Looks up one row of evaluated keys in an ART and its checkpoint deltas.
+	ARTLookupResult SearchART(const Identifier &name, DataChunk &keys, idx_t row_idx, idx_t max_count,
+	                          set<row_t> &row_ids);
 	//! Binds unbound indexes possibly present after loading an extension.
 	void Bind(ClientContext &context, DataTableInfo &table_info, const char *index_type = nullptr);
 	//! Returns true, if there are no index entries.

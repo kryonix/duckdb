@@ -12,10 +12,15 @@ namespace duckdb {
 
 void CompressedMaterialization::CompressAggregate(unique_ptr<LogicalOperator> &op) {
 	auto &aggregate = op->Cast<LogicalAggregate>();
-	if (Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context) == GroupJoinStrategy::FORCE &&
-	    aggregate.children.size() == 1 && aggregate.children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+	if (Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context) == GroupJoinStrategy::FORCE && root &&
+	    IsStaticHashGroupJoinAggregate(*root, aggregate, optimizer.context,
+	                                   HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER)) {
+		return;
+	}
+	if (aggregate.children.size() == 1 && aggregate.children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto &join = aggregate.children[0]->Cast<LogicalComparisonJoin>();
-		if (TryGetHashGroupJoinCandidate(aggregate, join, optimizer.context)) {
+		if (TryGetPlannedHashGroupJoinCandidate(aggregate, join, optimizer.context,
+		                                        HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER)) {
 			return;
 		}
 	}

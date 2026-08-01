@@ -1,5 +1,5 @@
 # name: test/sql/aggregate/group/test_hash_group_join.test
-# description: Serial physical Hash GroupJoin eligibility and execution
+# description: Physical Hash GroupJoin eligibility and serial/local/ownership execution
 # group: [group]
 
 statement ok
@@ -183,6 +183,23 @@ GROUP BY o.k
 alpha	4.000000
 beta	NULL
 
+# Planning a projection probe child must retain the join's column count while its physical child is constructed.
+statement ok
+CREATE TABLE gj_projection_owner AS SELECT i::INTEGER id FROM range(10) t(i)
+
+statement ok
+ALTER TABLE gj_projection_owner ADD PRIMARY KEY(id)
+
+query III
+SELECT count(*), sum(n), sum(s) FROM (
+	SELECT o.id, count(*) n, sum(p.value) s
+	FROM gj_projection_owner o
+	JOIN (SELECT (i % 12)::INTEGER id, i::BIGINT value FROM range(50) t(i)) p USING (id)
+	GROUP BY o.id
+)
+----
+10	42	997
+
 # Exercise multiple chunks, vector boundaries, unmatched rows, and a high fan-out group.
 statement ok
 CREATE TABLE gj_large_owner(id INTEGER PRIMARY KEY)
@@ -207,6 +224,64 @@ SELECT count(*), sum(c) FROM (
 )
 ----
 4097	13194
+
+# Force genuinely parallel probe scheduling and compare every memoization mode on the same data.
+statement ok
+PRAGMA threads=4
+
+statement ok
+PRAGMA verify_parallelism
+
+statement ok
+CREATE TABLE gj_parallel_owner(id BIGINT PRIMARY KEY)
+
+statement ok
+INSERT INTO gj_parallel_owner SELECT i FROM range(1000) t(i)
+
+statement ok
+CREATE TABLE gj_parallel_probe(id BIGINT, value BIGINT)
+
+statement ok
+INSERT INTO gj_parallel_probe SELECT i % 1000, i FROM range(200000) t(i)
+
+foreach mode serial local ownership external auto
+
+statement ok
+SET debug_group_join_execution = '{mode}'
+
+query III
+SELECT count(*), sum(n), sum(s) FROM (
+	SELECT o.id, count(*) n, sum(p.value) s
+	FROM gj_parallel_owner o JOIN gj_parallel_probe p USING (id)
+	GROUP BY o.id
+)
+----
+1000	200000	19999900000
+
+endloop
+
+# Destructive cross-layout combine retains variable-sized aggregate allocations.
+foreach mode local ownership external
+
+statement ok
+SET debug_group_join_execution = '{mode}'
+
+query II
+SELECT count(*), sum(n) FROM (
+	SELECT o.id, array_length(list(p.value)) n
+	FROM gj_parallel_owner o JOIN gj_parallel_probe p USING (id)
+	GROUP BY o.id
+)
+----
+1000	200000
+
+endloop
+
+statement ok
+RESET debug_group_join_execution
+
+statement ok
+PRAGMA disable_verify_parallelism
 
 # Empty/no-match inputs and one-match-per-group all retain INNER semantics.
 statement ok
@@ -295,7 +370,61 @@ physical_plan	<!REGEX>:.*Hash Group Join.*
 query II
 EXPLAIN SELECT o.id, count(*) FROM gj_owner o LEFT JOIN gj_probe p ON o.id = p.owner_id GROUP BY o.id
 ----
+physical_plan	<REGEX>:.*Hash Group Join.*
+
+# Owner-preserving outer joins evaluate each aggregate once against a synthetic NULL probe row for unmatched owners.
+foreach mode serial local ownership external
+
+statement ok
+SET debug_group_join_execution = '{mode}'
+
+query IIIIIT rowsort
+SELECT o.id, count(*), count(p.value), sum(p.value), sum(coalesce(p.value, 5)),
+       list(DISTINCT p.value ORDER BY p.value DESC NULLS FIRST)
+FROM gj_owner o LEFT JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+1	3	2	20	25	[NULL, 10]
+2	3	2	10	15	[NULL, 5]
+3	1	0	NULL	5	[NULL]
+4	1	0	NULL	5	[NULL]
+
+endloop
+
+statement ok
+RESET debug_group_join_execution
+
+# A probe-side outer-join key is NULL for unmatched owners and cannot be canonicalized to the owner key.
+query II
+EXPLAIN SELECT p.owner_id, count(*)
+FROM gj_owner o LEFT JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY p.owner_id
+----
 physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II rowsort
+SELECT p.owner_id, count(*)
+FROM gj_owner o LEFT JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY p.owner_id
+----
+1	3
+2	3
+NULL	2
+
+query II
+EXPLAIN SELECT o.id, count(*) FROM gj_probe p RIGHT JOIN gj_owner o ON p.owner_id = o.id GROUP BY o.id
+----
+physical_plan	<REGEX>:.*Hash Group Join.*
+
+query III rowsort
+SELECT o.id, count(*), sum(coalesce(p.value, 5))
+FROM gj_probe p RIGHT JOIN gj_owner o ON p.owner_id = o.id
+GROUP BY o.id
+----
+1	3	25
+2	3	15
+3	1	5
+4	1	5
 
 query II
 EXPLAIN SELECT o.id, count(*) FROM gj_owner o RIGHT JOIN gj_probe p ON o.id = p.owner_id GROUP BY o.id
@@ -341,7 +470,15 @@ EXPLAIN SELECT o.payload, count(*)
 FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
 GROUP BY o.payload
 ----
-physical_plan	<!REGEX>:.*Hash Group Join.*
+physical_plan	<REGEX>:.*Hash Group Join.*
+
+query II rowsort
+SELECT o.payload, count(*)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.payload
+----
+10	3
+20	3
 
 query II
 EXPLAIN SELECT o.owner_key, count(*)
@@ -357,12 +494,28 @@ GROUP BY o.a
 ----
 physical_plan	<!REGEX>:.*Hash Group Join.*
 
+# The complete composite key can be used for lookup while a strict subset selects a routed final group.
+query II
+EXPLAIN SELECT o.a, count(*), sum(p.value)
+FROM gj_composite_owner o JOIN gj_composite_probe p ON o.a = p.a AND o.b = p.b
+GROUP BY o.a
+----
+physical_plan	<REGEX>:.*Hash Group Join.*
+
+query III rowsort
+SELECT o.a, count(*), sum(p.value)
+FROM gj_composite_owner o JOIN gj_composite_probe p ON o.a = p.a AND o.b = p.b
+GROUP BY o.a
+----
+1	3	12
+2	1	9
+
 query II
 EXPLAIN SELECT o.id, first(p.value ORDER BY p.value)
 FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
 GROUP BY o.id
 ----
-physical_plan	<!REGEX>:.*Hash Group Join.*
+physical_plan	<REGEX>:.*Hash Group Join.*
 
 query II rowsort
 SELECT o.id, first(p.value ORDER BY p.value)
@@ -372,36 +525,204 @@ GROUP BY o.id
 1	10
 2	5
 
+# A proven owner key functionally determines additional owner output columns. They are stored once as immutable
+# aggregate-row payload rather than becoming hash-key columns.
 query II
 EXPLAIN SELECT o.id, o.payload, count(*)
 FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
 GROUP BY o.id, o.payload
 ----
-physical_plan	<!REGEX>:.*Hash Group Join.*
+physical_plan	<REGEX>:.*Hash Group Join.*
+
+query III rowsort
+SELECT o.id, o.payload, count(*)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id, o.payload
+----
+1	10	3
+2	20	3
+
+statement ok
+CREATE TABLE gj_fd_owner(id INTEGER PRIMARY KEY, region VARCHAR, note VARCHAR)
+
+statement ok
+INSERT INTO gj_fd_owner VALUES (1, 'north', 'a'), (2, NULL, 'b'), (3, 'south', NULL)
+
+query TIII rowsort
+SELECT o.region, o.id, count(*), sum(p.value)
+FROM gj_fd_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.region, o.id
+----
+NULL	2	3	10
+north	1	3	20
+
+# Omitting the determinant key uses the routed variant: the owner key remains the lookup key while the dependent
+# output value identifies a shared aggregate destination.
+query II
+EXPLAIN SELECT o.region, count(*)
+FROM gj_fd_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.region
+----
+physical_plan	<REGEX>:.*Hash Group Join.*
+
+query TI rowsort
+SELECT o.region, count(*)
+FROM gj_fd_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.region
+----
+NULL	3
+north	3
+
+statement ok
+CREATE TABLE gj_route_owner(id INTEGER PRIMARY KEY, region VARCHAR)
+
+statement ok
+INSERT INTO gj_route_owner VALUES (1, 'east'), (2, 'east'), (3, 'west'), (4, NULL), (5, 'east')
+
+statement ok
+CREATE TABLE gj_route_probe(owner_id INTEGER, value INTEGER, flag BOOLEAN)
+
+statement ok
+INSERT INTO gj_route_probe VALUES
+	(1, 5, true), (1, 7, false), (2, 5, true), (2, 9, NULL), (3, NULL, true), (4, 2, false)
+
+foreach mode serial local ownership external
+
+statement ok
+SET debug_group_join_execution = '{mode}'
+
+query TIIIT rowsort
+SELECT o.region, count(*), sum(p.value), count(DISTINCT p.value),
+       list(DISTINCT p.value ORDER BY p.value NULLS FIRST)
+FROM gj_route_owner o JOIN gj_route_probe p ON o.id = p.owner_id
+GROUP BY o.region
+----
+NULL	1	2	1	[2]
+east	4	26	3	[5, 7, 9]
+west	1	NULL	0	[NULL]
+
+query TIIIIT rowsort
+SELECT o.region, count(*), count(p.value), sum(p.value), sum(coalesce(p.value, 5)),
+       list(DISTINCT p.value ORDER BY p.value NULLS FIRST)
+FROM gj_route_owner o LEFT JOIN gj_route_probe p ON o.id = p.owner_id
+GROUP BY o.region
+----
+NULL	1	1	2	2	[2]
+east	5	4	26	31	[NULL, 5, 7, 9]
+west	1	0	NULL	5	[NULL]
+
+endloop
+
+statement ok
+RESET debug_group_join_execution
 
 query II
 EXPLAIN SELECT o.id, count(DISTINCT p.value)
 FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
 GROUP BY o.id
 ----
-physical_plan	<!REGEX>:.*Hash Group Join.*
+physical_plan	<REGEX>:.*Hash Group Join.*
 
+# DISTINCT deduplicates by dense destination ID and arguments before updating the final state. The same probe payload
+# can feed several DISTINCT and regular aggregates without changing NULL or FILTER behavior.
+foreach mode serial local ownership external
+
+statement ok
+SET debug_group_join_execution = '{mode}'
+
+query IIIII rowsort
+SELECT o.id, count(DISTINCT p.value), sum(DISTINCT p.value), count(*),
+       count(DISTINCT p.value) FILTER (WHERE p.flag)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+1	1	10	3	1
+2	1	5	3	1
+
+query II
+SELECT count(*), sum(n) FROM (
+	SELECT o.id, count(DISTINCT p.value % 10) n
+	FROM gj_parallel_owner o JOIN gj_parallel_probe p USING (id)
+	GROUP BY o.id
+)
+----
+1000	1000
+
+endloop
+
+statement ok
+RESET debug_group_join_execution
+
+# FILTER expressions over the probe payload retain SQL three-valued semantics. Multiple filters exercise the compact
+# payload layout shared by direct global updates and local partial tables.
 query II
 EXPLAIN SELECT o.id, count(*) FILTER (WHERE p.value > 0)
 FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
 GROUP BY o.id
 ----
-physical_plan	<!REGEX>:.*Hash Group Join.*
+physical_plan	<REGEX>:.*Hash Group Join.*
+
+foreach mode serial local ownership external
+
+statement ok
+SET debug_group_join_execution = '{mode}'
+
+query IIIII rowsort
+SELECT o.id, count(*) FILTER (WHERE p.value > 0), count(p.value) FILTER (WHERE p.flag),
+       sum(p.value) FILTER (WHERE p.flag IS NOT FALSE), count(*) FILTER (WHERE p.flag IS NULL)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+1	2	1	20	1
+2	2	1	5	0
+
+endloop
+
+statement ok
+RESET debug_group_join_execution
 
 query II
 EXPLAIN SELECT o.id, list(p.value ORDER BY p.value)
 FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
 GROUP BY o.id
 ----
-physical_plan	<!REGEX>:.*Hash Group Join.*
+physical_plan	<REGEX>:.*Hash Group Join.*
+
+foreach mode serial local ownership external
+
+statement ok
+SET debug_group_join_execution = '{mode}'
+
+query IT rowsort
+SELECT o.id, list(p.value ORDER BY p.value DESC NULLS FIRST)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+1	[NULL, 10, 10]
+2	[NULL, 5, 5]
+
+query IT rowsort
+SELECT o.id, list(DISTINCT p.value ORDER BY p.value DESC NULLS FIRST)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+1	[NULL, 10]
+2	[NULL, 5]
+
+endloop
+
+statement ok
+RESET debug_group_join_execution
 
 query II
 EXPLAIN SELECT o.id, sum(o.payload)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.id, count(*) FILTER (WHERE o.payload > 0)
 FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
 GROUP BY o.id
 ----
@@ -428,6 +749,124 @@ GROUP BY GROUPING SETS ((o.id), ())
 ----
 physical_plan	<!REGEX>:.*Hash Group Join.*
 
+# Decorrelated scalar aggregates use EMPTY_AGGREGATE rather than LEFT-join row semantics. The owner input can contain
+# duplicate and NULL correlation keys: one state is shared per key while every original owner row is emitted.
+statement ok
+CREATE TABLE gj_static_owner(k INTEGER, label VARCHAR)
+
+statement ok
+INSERT INTO gj_static_owner VALUES (1, 'a'), (1, 'b'), (2, 'c'), (NULL, 'n')
+
+statement ok
+CREATE TABLE gj_static_probe(k INTEGER, value INTEGER, flag BOOLEAN)
+
+statement ok
+INSERT INTO gj_static_probe VALUES (1, 10, true), (1, 20, false), (NULL, 7, true), (3, 30, true)
+
+query II
+EXPLAIN SELECT label, (SELECT sum(value) FROM gj_static_probe p WHERE p.k = o.k)
+FROM gj_static_owner o
+----
+physical_plan	<REGEX>:.*Hash Group Join.*EMPTY_AGGREGATE.*STATIC.*
+
+statement ok
+SET debug_group_join_strategy = 'disabled'
+
+statement ok
+CREATE TEMP TABLE gj_static_baseline AS
+SELECT label,
+       (SELECT count(*) FROM gj_static_probe p WHERE p.k = o.k) AS c,
+       (SELECT sum(value) FILTER (WHERE flag) FROM gj_static_probe p WHERE p.k = o.k) AS s,
+       (SELECT list(DISTINCT value ORDER BY value) FROM gj_static_probe p WHERE p.k = o.k) AS l
+FROM gj_static_owner o
+
+statement ok
+SET debug_group_join_strategy = 'force'
+
+foreach mode serial local ownership external
+
+statement ok
+SET debug_group_join_execution = '{mode}'
+
+query TIIT rowsort
+SELECT label,
+       (SELECT count(*) FROM gj_static_probe p WHERE p.k = o.k),
+       (SELECT sum(value) FILTER (WHERE flag) FROM gj_static_probe p WHERE p.k = o.k),
+       (SELECT list(DISTINCT value ORDER BY value) FROM gj_static_probe p WHERE p.k = o.k)
+FROM gj_static_owner o
+----
+a	2	10	[10, 20]
+b	2	10	[10, 20]
+c	0	NULL	NULL
+n	0	NULL	NULL
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM gj_static_baseline EXCEPT ALL
+	 SELECT label,
+	        (SELECT count(*) FROM gj_static_probe p WHERE p.k = o.k),
+	        (SELECT sum(value) FILTER (WHERE flag) FROM gj_static_probe p WHERE p.k = o.k),
+	        (SELECT list(DISTINCT value ORDER BY value) FROM gj_static_probe p WHERE p.k = o.k)
+	 FROM gj_static_owner o)
+	UNION ALL
+	(SELECT label,
+	        (SELECT count(*) FROM gj_static_probe p WHERE p.k = o.k),
+	        (SELECT sum(value) FILTER (WHERE flag) FROM gj_static_probe p WHERE p.k = o.k),
+	        (SELECT list(DISTINCT value ORDER BY value) FROM gj_static_probe p WHERE p.k = o.k)
+	 FROM gj_static_owner o EXCEPT ALL SELECT * FROM gj_static_baseline)
+) differences
+----
+0
+
+endloop
+
+statement ok
+RESET debug_group_join_execution
+
+# Static result caching spans vector boundaries and reuses one finalized state for duplicate owner keys.
+statement ok
+CREATE TABLE gj_static_many_owner AS SELECT i % 3000 AS k FROM range(6000) t(i)
+
+statement ok
+CREATE TABLE gj_static_many_probe AS SELECT i AS k, i::BIGINT AS value FROM range(3000) t(i)
+
+query II
+EXPLAIN SELECT (SELECT sum(value) FROM gj_static_many_probe p WHERE p.k = o.k)
+FROM gj_static_many_owner o
+----
+physical_plan	<REGEX>:.*Hash Group Join.*STATIC.*
+
+foreach mode serial external
+
+statement ok
+SET debug_group_join_execution = '{mode}'
+
+query I
+SELECT sum(value_sum)::BIGINT
+FROM (
+	SELECT (SELECT sum(value) FROM gj_static_many_probe p WHERE p.k = o.k) AS value_sum
+	FROM gj_static_many_owner o
+)
+----
+8997000
+
+endloop
+
+statement ok
+RESET debug_group_join_execution
+
+# An ineligible static-shaped join must still use the normal DISTINCT aggregate rewrite.
+query II
+EXPLAIN SELECT o.label, a.c
+FROM gj_static_owner o
+LEFT JOIN (
+	SELECT k, count(DISTINCT value) AS c
+	FROM gj_static_probe
+	GROUP BY k
+) a ON abs(o.k) IS NOT DISTINCT FROM a.k
+----
+physical_plan	<REGEX>:.*Groups: #0, #1.*
+
 # Force does not suppress the existing eager aggregate rewrite for an ineligible candidate.
 statement ok
 CREATE TABLE gj_eager_probe(id INTEGER, value INTEGER)
@@ -442,8 +881,341 @@ GROUP BY o.id
 ----
 physical_plan	<REGEX>:.*EXPORT_STATE.*
 
+# INDEX probes a matching ART for every owner key. If no direct-column ART covers the complete key, the forced
+# execution mode falls back to the hash implementation rather than changing eligibility or query semantics.
+statement ok
+SET debug_group_join_execution = 'index'
+
+query II
+EXPLAIN SELECT o.id, count(*)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+physical_plan	<REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.id, count(*)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Index Group Join.*
+
+statement ok
+CREATE TABLE gj_index_probe(owner_id INTEGER, value INTEGER, tag VARCHAR, flag BOOLEAN)
+
+statement ok
+INSERT INTO gj_index_probe VALUES
+	(1, 10, 'a', true), (1, 20, 'a', false), (1, NULL, 'b', true),
+	(2, 5, 'c', true), (2, 5, 'c', false), (NULL, 99, 'n', true), (9, 100, 'z', true)
+
+statement ok
+CREATE INDEX gj_index_probe_owner ON gj_index_probe(owner_id)
+
+query II
+EXPLAIN SELECT o.id, o.payload, count(*), sum(p.value)
+FROM gj_owner o JOIN gj_index_probe p ON o.id = p.owner_id
+GROUP BY o.id, o.payload
+----
+physical_plan	<REGEX>:.*Index Group Join.*gj_index_probe_owner.*Strategy: INDEX.*
+
+query IIIIIIIT rowsort
+SELECT o.id, o.payload, count(*), count(p.value), sum(p.value), count(DISTINCT p.tag),
+       sum(p.value) FILTER (WHERE p.flag), list(DISTINCT p.value ORDER BY p.value NULLS FIRST)
+FROM gj_owner o JOIN gj_index_probe p ON o.id = p.owner_id
+GROUP BY o.id, o.payload
+----
+1	10	3	2	30	2	10	[NULL, 10, 20]
+2	20	2	2	10	1	5	[5]
+
+# Pushed-down probe filters are evaluated after the ART fetch. This protects original WHERE semantics while allowing
+# optimizer-derived range filters on the indexed key.
+query III rowsort
+SELECT o.id, count(*), sum(p.value)
+FROM gj_owner o JOIN gj_index_probe p ON o.id = p.owner_id
+WHERE p.value >= 20
+GROUP BY o.id
+----
+1	1	20
+
+query II
+EXPLAIN SELECT o.id, count(*)
+FROM gj_owner o JOIN gj_index_probe p ON o.id = p.owner_id
+WHERE p.value >= 20
+GROUP BY o.id
+----
+physical_plan	<REGEX>:.*Index Group Join.*
+
+# Owner-preserving joins still evaluate one synthetic NULL probe row for unmatched owners.
+query IIIII rowsort
+SELECT o.id, count(*), count(p.value), sum(coalesce(p.value, 7)),
+       count(DISTINCT p.tag) FILTER (WHERE p.value > 10)
+FROM gj_owner o LEFT JOIN gj_index_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+1	3	2	37	1
+2	2	2	10	0
+3	1	0	7	0
+4	1	0	7	0
+
+# The ART expression order is independent of the join-condition order.
+statement ok
+CREATE TABLE gj_index_composite_owner(a INTEGER, b VARCHAR, payload VARCHAR, PRIMARY KEY(a, b))
+
+statement ok
+INSERT INTO gj_index_composite_owner VALUES (1, 'x', 'A'), (1, 'y', 'B'), (2, 'x', 'C')
+
+statement ok
+CREATE TABLE gj_index_composite_probe(a INTEGER, b VARCHAR, value INTEGER)
+
+statement ok
+INSERT INTO gj_index_composite_probe VALUES (1, 'x', 10), (1, 'x', 20), (1, 'y', 5), (2, 'z', 99)
+
+statement ok
+CREATE INDEX gj_index_composite_ba ON gj_index_composite_probe(b, a)
+
+query II
+EXPLAIN SELECT o.a, o.b, o.payload, count(*), sum(p.value)
+FROM gj_index_composite_owner o JOIN gj_index_composite_probe p ON o.a = p.a AND o.b = p.b
+GROUP BY o.a, o.b, o.payload
+----
+physical_plan	<REGEX>:.*Index Group Join.*gj_index_composite_ba.*
+
+query ITTII rowsort
+SELECT o.a, o.b, o.payload, count(*), sum(p.value)
+FROM gj_index_composite_owner o JOIN gj_index_composite_probe p ON o.a = p.a AND o.b = p.b
+GROUP BY o.a, o.b, o.payload
+----
+1	x	A	2	30
+1	y	B	1	5
+
+# Expression indexes and routed grouping are not exact ART range probes and retain the hash implementation.
+statement ok
+CREATE TABLE gj_index_expression_probe(owner_id INTEGER, value INTEGER)
+
+statement ok
+INSERT INTO gj_index_expression_probe VALUES (1, 10), (2, 20)
+
+statement ok
+CREATE INDEX gj_index_expression ON gj_index_expression_probe((owner_id + 0))
+
+query II
+EXPLAIN SELECT o.id, count(*)
+FROM gj_owner o JOIN gj_index_expression_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+physical_plan	<REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.payload, count(*)
+FROM gj_owner o JOIN gj_index_probe p ON o.id = p.owner_id
+GROUP BY o.payload
+----
+physical_plan	<REGEX>:.*Hash Group Join.*
+
+# Persistent ART row IDs are fetched through MVCC. Transaction-local appends have no secondary-index delta, so the
+# index variant scans only that bounded local relation and routes matching rows into the same owner states.
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+INSERT INTO gj_index_probe VALUES (1, 30, 'd', true), (3, 8, 'e', true)
+
+statement ok
+DELETE FROM gj_index_probe WHERE owner_id = 1 AND value = 10
+
+statement ok
+UPDATE gj_index_probe SET owner_id = 4 WHERE owner_id = 2 AND value = 5 AND NOT flag
+
+statement ok
+SET debug_group_join_strategy = 'disabled'
+
+statement ok
+CREATE TEMP TABLE gj_index_transaction_baseline AS
+SELECT o.id, count(*) AS c, count(p.value) AS cv, sum(p.value) AS s, count(DISTINCT p.tag) AS d
+FROM gj_owner o JOIN gj_index_probe p ON o.id = p.owner_id
+GROUP BY o.id
+
+statement ok
+SET debug_group_join_strategy = 'force'
+
+query II
+EXPLAIN SELECT o.id, count(*), sum(p.value)
+FROM gj_owner o JOIN gj_index_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+physical_plan	<REGEX>:.*Index Group Join.*
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM gj_index_transaction_baseline EXCEPT ALL
+	 SELECT o.id, count(*), count(p.value), sum(p.value), count(DISTINCT p.tag)
+	 FROM gj_owner o JOIN gj_index_probe p ON o.id = p.owner_id GROUP BY o.id)
+	UNION ALL
+	(SELECT o.id, count(*), count(p.value), sum(p.value), count(DISTINCT p.tag)
+	 FROM gj_owner o JOIN gj_index_probe p ON o.id = p.owner_id GROUP BY o.id
+	 EXCEPT ALL SELECT * FROM gj_index_transaction_baseline)
+) differences
+----
+0
+
+statement ok
+ROLLBACK
+
+# Multiple owner chunks can probe the shared ART concurrently while retaining task-local aggregate state.
+statement ok
+CREATE INDEX gj_parallel_probe_id ON gj_parallel_probe(id)
+
+statement ok
+SET index_scan_max_count = 1000000
+
+query II
+SELECT count(*), sum(n) FROM (
+	SELECT o.id, count(*) n
+	FROM gj_parallel_owner o JOIN gj_parallel_probe p USING (id)
+	GROUP BY o.id
+)
+----
+1000	200000
+
+# A dense range exceeding the row-ID budget switches the owner batch to a vectorized probe scan.
+statement ok
+SET index_scan_max_count = 1
+
+statement ok
+SET index_scan_percentage = 0
+
+query II
+SELECT count(*), sum(n) FROM (
+	SELECT o.id, count(*) n
+	FROM gj_parallel_owner o JOIN gj_parallel_probe p USING (id)
+	GROUP BY o.id
+)
+----
+1000	200000
+
+statement ok
+RESET index_scan_max_count
+
+statement ok
+RESET index_scan_percentage
+
+statement ok
+RESET debug_group_join_execution
+
 statement ok
 RESET debug_group_join_strategy
+
+# AUTO is deliberately narrow. The hash cost gate retains the mature alternative when its calibrated margin is
+# insufficient, while a selective exact ART range plan is selected and retained through physical planning.
+statement ok
+SET threads = 1
+
+statement ok
+CREATE TABLE gj_auto_owner(a BIGINT, b BIGINT, PRIMARY KEY(a, b))
+
+statement ok
+INSERT INTO gj_auto_owner SELECT i, i % 17 FROM range(4096) t(i)
+
+statement ok
+CREATE TABLE gj_auto_probe AS
+SELECT i // 10 AS a, (i // 10) % 17 AS b, i::BIGINT AS value
+FROM range(40960) t(i)
+
+statement ok
+SET debug_group_join_strategy = 'disabled'
+
+statement ok
+CREATE TEMP TABLE gj_auto_baseline AS
+SELECT o.a, o.b, count(*) AS n, sum(p.value) AS s
+FROM gj_auto_owner o JOIN gj_auto_probe p USING (a, b)
+GROUP BY o.a, o.b
+
+statement ok
+SET debug_group_join_strategy = 'auto'
+
+query II
+EXPLAIN SELECT o.a, o.b, count(*), sum(p.value)
+FROM gj_auto_owner o JOIN gj_auto_probe p USING (a, b)
+GROUP BY o.a, o.b
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM gj_auto_baseline EXCEPT ALL
+	 SELECT o.a, o.b, count(*), sum(p.value)
+	 FROM gj_auto_owner o JOIN gj_auto_probe p USING (a, b) GROUP BY o.a, o.b)
+	UNION ALL
+	(SELECT o.a, o.b, count(*), sum(p.value)
+	 FROM gj_auto_owner o JOIN gj_auto_probe p USING (a, b) GROUP BY o.a, o.b
+	 EXCEPT ALL SELECT * FROM gj_auto_baseline)
+) differences
+----
+0
+
+# Parallel execution and low-retention inputs retain the mature eager/separate alternatives.
+statement ok
+SET threads = 4
+
+query II
+EXPLAIN SELECT o.a, o.b, count(*), sum(p.value)
+FROM gj_auto_owner o JOIN gj_auto_probe p USING (a, b)
+GROUP BY o.a, o.b
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+statement ok
+SET threads = 1
+
+statement ok
+CREATE TABLE gj_auto_sparse_probe AS
+SELECT CASE WHEN i < 4096 THEN i ELSE i + 100000 END AS a,
+       CASE WHEN i < 4096 THEN i % 17 ELSE 0 END AS b,
+       i::BIGINT AS value
+FROM range(40960) t(i)
+
+query II
+EXPLAIN SELECT o.a, o.b, count(*), sum(p.value)
+FROM gj_auto_owner o JOIN gj_auto_sparse_probe p USING (a, b)
+GROUP BY o.a, o.b
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+statement ok
+CREATE TABLE gj_auto_index_owner(id BIGINT PRIMARY KEY)
+
+statement ok
+INSERT INTO gj_auto_index_owner VALUES (1)
+
+statement ok
+CREATE TABLE gj_auto_index_probe AS
+SELECT CASE WHEN i % 2000 = 0 THEN 1 ELSE i + 100 END AS id, i::BIGINT AS value
+FROM range(10000) t(i)
+
+statement ok
+CREATE INDEX gj_auto_probe_art ON gj_auto_index_probe(id)
+
+query II
+EXPLAIN SELECT o.id, count(*), sum(p.value)
+FROM gj_auto_index_owner o JOIN gj_auto_index_probe p USING (id)
+GROUP BY o.id
+----
+physical_plan	<REGEX>:.*Index Group Join.*gj_auto_probe_art.*
+
+query III
+SELECT count(*), sum(n), sum(s) FROM (
+	SELECT o.id, count(*) AS n, sum(p.value) AS s
+	FROM gj_auto_index_owner o JOIN gj_auto_index_probe p USING (id)
+	GROUP BY o.id
+)
+----
+1	5	20000
+
+statement ok
+RESET debug_group_join_strategy
+
+statement ok
+RESET threads
 
 # The default remains disabled after reset.
 query II

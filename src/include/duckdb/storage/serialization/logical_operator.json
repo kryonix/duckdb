@@ -109,6 +109,18 @@
         "name": "distinct_validity",
         "type": "TupleDataValidityType",
         "default": "TupleDataValidityType::CAN_HAVE_NULL_VALUES"
+      },
+      {
+        "id": 208,
+        "name": "group_join_auto_selected",
+        "type": "bool",
+        "default": "false"
+      },
+      {
+        "id": 209,
+        "name": "group_join_auto_index",
+        "type": "bool",
+        "default": "false"
       }
     ],
     "constructor": [

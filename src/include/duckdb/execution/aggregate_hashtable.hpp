@@ -39,6 +39,7 @@ public:
 
 	idx_t partition_idx = 0;
 	TupleDataScanState scan_states;
+	vector<column_t> group_indexes;
 };
 
 //! Scratch shared by mutable append probes and task-local read-only lookups.
@@ -72,6 +73,7 @@ public:
 struct AggregateHTUpdateState {
 public:
 	explicit AggregateHTUpdateState(GroupedAggregateHashTable &hash_table);
+	AggregateHTUpdateState(GroupedAggregateHashTable &hash_table, shared_ptr<ArenaAllocator> aggregate_allocator);
 
 	optional_ptr<const GroupedAggregateHashTable> owner;
 	shared_ptr<ArenaAllocator> aggregate_allocator;
@@ -147,6 +149,13 @@ public:
 	//! Updates aggregate states at existing row-start addresses without changing the hash table.
 	void UpdateAggregatesAtAddresses(AggregateHTUpdateState &state, Vector &addresses, DataChunk &payload,
 	                                 const unsafe_vector<idx_t> &filter);
+	//! Updates a contiguous aggregate range using a payload containing only that range's aggregate arguments.
+	void UpdateAggregatesAtAddressesRange(AggregateHTUpdateState &state, Vector &addresses, DataChunk &payload,
+	                                      idx_t aggregate_begin, idx_t aggregate_count);
+	//! Updates selected aggregates within a contiguous range. Filter indexes are relative to the range.
+	void UpdateAggregatesAtAddressesRange(AggregateHTUpdateState &state, Vector &addresses, DataChunk &payload,
+	                                      idx_t aggregate_begin, idx_t aggregate_count,
+	                                      const unsafe_vector<idx_t> &filter);
 	//! Gathers matched group values from state.addresses in the order specified by found_groups.
 	void GatherGroups(AggregateHTLookupState &state, const SelectionVector &found_groups, idx_t found_count,
 	                  DataChunk &result) const;
@@ -159,6 +168,10 @@ public:
 	void Abandon();
 	void Repartition();
 	shared_ptr<ArenaAllocator> GetAggregateAllocator();
+	//! Retains an allocator used by aggregate states stored in this table.
+	void StoreAggregateAllocator(shared_ptr<ArenaAllocator> allocator);
+	//! Retains all allocators that can be referenced by destructively combined states from another table.
+	void InheritAggregateAllocators(const GroupedAggregateHashTable &other);
 
 	//! Resize the HT to the specified size. Must be larger than the current size.
 	void Resize(idx_t size);

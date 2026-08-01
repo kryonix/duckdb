@@ -71,7 +71,12 @@ public:
 		// grouping_functions: their per-row grouping-set bitmasks reference
 		// the original AVG column directly, and the rewrite has no way to
 		// translate those references.
-		return !aggr.grouping_functions.empty();
+		if (!aggr.grouping_functions.empty()) {
+			return true;
+		}
+		return Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context) == GroupJoinStrategy::FORCE &&
+		       IsStaticHashGroupJoinAggregate(optimizer.GetPlan(), aggr, optimizer.context,
+		                                      HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER);
 	}
 
 	unique_ptr<Expression> Rewrite(unique_ptr<Expression> &expr, vector<reference<Expression>> &bindings,
@@ -236,7 +241,14 @@ public:
 
 	bool ShouldSkip(LogicalAggregate &aggr) const override {
 		if (Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context) != GroupJoinStrategy::FORCE ||
-		    aggr.children.size() != 1 || aggr.children[0]->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		    aggr.children.size() != 1) {
+			return false;
+		}
+		if (IsStaticHashGroupJoinAggregate(optimizer.GetPlan(), aggr, optimizer.context,
+		                                   HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER)) {
+			return true;
+		}
+		if (aggr.children[0]->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 			return false;
 		}
 		auto &join = aggr.children[0]->Cast<LogicalComparisonJoin>();

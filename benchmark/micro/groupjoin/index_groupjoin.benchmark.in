@@ -1,0 +1,50 @@
+# description: Selective ART-backed GroupJoin comparison
+# group: [groupjoin]
+
+name Index GroupJoin ${LABEL} (B=${owner_rows}, P=${probe_rows}, fanout=${fanout})
+group micro
+subgroup groupjoin
+
+argument owner_rows 10
+argument probe_rows 1000000
+argument fanout 10
+argument groupjoin_threads 4
+
+load
+SET threads TO ${groupjoin_threads};
+SET debug_group_join_strategy TO '${STRATEGY}';
+SET debug_group_join_execution TO '${EXECUTION}';
+SET disabled_optimizers TO '${DISABLED_OPTIMIZERS}';
+CREATE TABLE index_groupjoin_owner(id BIGINT PRIMARY KEY);
+INSERT INTO index_groupjoin_owner SELECT i FROM range(${owner_rows}) t(i);
+CREATE TABLE index_groupjoin_probe AS
+SELECT CASE WHEN i % (${probe_rows} // (${owner_rows} * ${fanout})) = 0
+	       THEN (i // (${probe_rows} // (${owner_rows} * ${fanout}))) % ${owner_rows}
+	       ELSE ${owner_rows} + i END AS id,
+       i::BIGINT AS value
+FROM range(${probe_rows}) t(i);
+CREATE INDEX index_groupjoin_probe_art ON index_groupjoin_probe(id);
+
+run
+SELECT count(*), sum(n), sum(s) FROM (
+	SELECT o.id, count(*) AS n, sum(p.value) AS s
+	FROM index_groupjoin_owner o JOIN index_groupjoin_probe p USING (id)
+	GROUP BY o.id
+);
+
+result_query I
+WITH expected AS (
+	SELECT count(*) AS group_count, sum(n) AS match_count, sum(s) AS total_value FROM (
+		SELECT id, count(*) AS n, sum(value) AS s
+		FROM index_groupjoin_probe
+		WHERE id < ${owner_rows}
+		GROUP BY id
+	)
+)
+SELECT count(*) FROM (
+	(SELECT * FROM __answer EXCEPT ALL SELECT * FROM expected)
+	UNION ALL
+	(SELECT * FROM expected EXCEPT ALL SELECT * FROM __answer)
+) differences
+----
+0

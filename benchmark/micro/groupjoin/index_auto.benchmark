@@ -1,0 +1,8 @@
+# name: benchmark/micro/groupjoin/index_auto.benchmark
+# group: [groupjoin]
+
+template benchmark/micro/groupjoin/index_groupjoin.benchmark.in
+LABEL=auto
+STRATEGY=auto
+EXECUTION=auto
+DISABLED_OPTIMIZERS=top_n

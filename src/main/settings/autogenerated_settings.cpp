@@ -90,6 +90,16 @@ void DebugCheckpointAbortSetting::OnSet(SettingCallbackInfo &info, Value &parame
 }
 
 //===----------------------------------------------------------------------===//
+// Debug Group Join Execution
+//===----------------------------------------------------------------------===//
+void DebugGroupJoinExecutionSetting::OnSet(SettingCallbackInfo &info, Value &parameter) {
+	if (parameter.IsNull()) {
+		throw InvalidInputException("debug_group_join_execution setting cannot be NULL");
+	}
+	EnumUtil::FromString<GroupJoinExecutionMode>(StringValue::Get(parameter));
+}
+
+//===----------------------------------------------------------------------===//
 // Debug Group Join Strategy
 //===----------------------------------------------------------------------===//
 void DebugGroupJoinStrategySetting::OnSet(SettingCallbackInfo &info, Value &parameter) {

@@ -1,0 +1,8 @@
+# name: benchmark/micro/groupjoin/index_forced.benchmark
+# group: [groupjoin]
+
+template benchmark/micro/groupjoin/index_groupjoin.benchmark.in
+LABEL=forced index
+STRATEGY=force
+EXECUTION=index
+DISABLED_OPTIMIZERS=top_n

@@ -158,6 +158,36 @@ optional_ptr<BoundIndex> TableIndexList::Find(const Identifier &name) {
 	return nullptr;
 }
 
+ARTLookupResult TableIndexList::SearchART(const Identifier &name, DataChunk &keys, idx_t row_idx, idx_t max_count,
+                                          set<row_t> &row_ids) {
+	lock_guard<mutex> list_guard(index_entries_lock);
+	for (auto &entry : index_entries) {
+		auto &index = *entry->index;
+		if (index.GetIndexName() != name) {
+			continue;
+		}
+		if (!index.IsBound() || index.GetIndexType() != ART::TYPE_NAME) {
+			return ARTLookupResult::INDEX_NOT_FOUND;
+		}
+		lock_guard<mutex> entry_guard(entry->lock);
+		vector<reference<ART>> indexes;
+		indexes.push_back(index.Cast<ART>());
+		if (entry->deleted_rows_in_use) {
+			indexes.push_back(entry->deleted_rows_in_use->Cast<ART>());
+		}
+		if (entry->added_data_during_checkpoint) {
+			indexes.push_back(entry->added_data_during_checkpoint->Cast<ART>());
+		}
+		for (auto &art : indexes) {
+			if (!art.get().SearchEqual(keys, row_idx, max_count, row_ids)) {
+				return ARTLookupResult::EXCEEDED_LIMIT;
+			}
+		}
+		return ARTLookupResult::COMPLETE;
+	}
+	return ARTLookupResult::INDEX_NOT_FOUND;
+}
+
 void TableIndexList::Bind(ClientContext &context, DataTableInfo &table_info, const char *index_type) {
 	{
 		// Early-out, if we have no unbound indexes.

@@ -70,11 +70,11 @@ void ColumnLifetimeAnalyzer::VisitOperator(LogicalOperator &op) {
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
 		auto &aggregate = op.Cast<LogicalAggregate>();
-		if (Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context) == GroupJoinStrategy::FORCE &&
-		    aggregate.children.size() == 1 &&
+		if (aggregate.children.size() == 1 &&
 		    aggregate.children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 			auto &join = aggregate.children[0]->Cast<LogicalComparisonJoin>();
-			if (TryGetHashGroupJoinCandidate(aggregate, join, optimizer.context)) {
+			if (TryGetPlannedHashGroupJoinCandidate(aggregate, join, optimizer.context,
+			                                        HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER)) {
 				ColumnLifetimeAnalyzer analyzer(optimizer, root, true);
 				analyzer.StandardVisitOperator(op);
 				return;

@@ -945,14 +945,23 @@ bool PartialAggregatePushdown::FuseInterveningProjections(LogicalOperator &op) {
 }
 
 void PartialAggregatePushdown::VisitOperator(unique_ptr<LogicalOperator> &op) {
-	LogicalOperatorVisitor::VisitOperator(op);
-	FuseInterveningProjections(*op);
-	if (Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context) == GroupJoinStrategy::FORCE &&
-	    op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && op->children.size() == 1 &&
+	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && op->children.size() == 1 &&
 	    op->children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto &aggregate = op->Cast<LogicalAggregate>();
 		auto &join = op->children[0]->Cast<LogicalComparisonJoin>();
-		if (TryGetHashGroupJoinCandidate(aggregate, join, optimizer.context)) {
+		if (TrySelectHashGroupJoinCandidate(aggregate, join, optimizer.context,
+		                                    HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER)) {
+			return;
+		}
+	}
+	LogicalOperatorVisitor::VisitOperator(op);
+	FuseInterveningProjections(*op);
+	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && op->children.size() == 1 &&
+	    op->children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &aggregate = op->Cast<LogicalAggregate>();
+		auto &join = op->children[0]->Cast<LogicalComparisonJoin>();
+		if (TrySelectHashGroupJoinCandidate(aggregate, join, optimizer.context,
+		                                    HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER)) {
 			return;
 		}
 	}

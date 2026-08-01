@@ -59,6 +59,10 @@ struct RowOperations {
 	                                  bool skip_addresses);
 	//! combine - unaligned addresses, updated
 	static void CombineStates(RowOperationsState &state, TupleDataLayout &layout, Vector &sources, Vector &targets);
+	//! combine a contiguous range of compatible aggregate states from one layout into another
+	static void CombineStatesRange(RowOperationsState &state, TupleDataLayout &source_layout, Vector &sources,
+	                               idx_t source_begin, TupleDataLayout &target_layout, Vector &targets,
+	                               idx_t target_begin, idx_t aggregate_count);
 	//! finalize - unaligned addresses, updated
 	static void FinalizeStates(RowOperationsState &state, TupleDataLayout &layout, Vector &addresses, DataChunk &result,
 	                           idx_t aggr_idx);

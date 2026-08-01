@@ -32,6 +32,7 @@ add_library_unity(
   hash_group_join.cpp
   in_clause_rewriter.cpp
   join_filter_pushdown_optimizer.cpp
+  key_properties.cpp
   late_materialization.cpp
   late_materialization_helper.cpp
   optimizer.cpp

@@ -147,6 +147,7 @@ OptionValueSet GetValueForOption(const string &name, const LogicalType &type) {
 	    {"default_transaction_invalidation_policy", {"SYNTACTIC_ERRORS_DO_NOT_INVALIDATE"}},
 	    {"checkpoint_on_detach", {"ENABLED"}},
 	    {"debug_verify_statement", {"copy_statement"}},
+	    {"debug_group_join_execution", {"serial"}},
 	    {"debug_group_join_strategy", {"force"}},
 	    {"enable_caching_operators", {false}},
 	    {"enable_optimistic_write", {false}},

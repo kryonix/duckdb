@@ -270,6 +270,8 @@ void LogicalAggregate::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<vector<GroupingSet>>(205, "grouping_sets", grouping_sets);
 	serializer.WritePropertyWithDefault<vector<unsafe_vector<ProjectionIndex>>>(206, "grouping_functions", grouping_functions);
 	serializer.WritePropertyWithDefault<TupleDataValidityType>(207, "distinct_validity", distinct_validity, TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+	serializer.WritePropertyWithDefault<bool>(208, "group_join_auto_selected", group_join_auto_selected, false);
+	serializer.WritePropertyWithDefault<bool>(209, "group_join_auto_index", group_join_auto_index, false);
 }
 
 unique_ptr<LogicalOperator> LogicalAggregate::Deserialize(Deserializer &deserializer) {
@@ -282,6 +284,8 @@ unique_ptr<LogicalOperator> LogicalAggregate::Deserialize(Deserializer &deserial
 	deserializer.ReadPropertyWithDefault<vector<GroupingSet>>(205, "grouping_sets", result->grouping_sets);
 	deserializer.ReadPropertyWithDefault<vector<unsafe_vector<ProjectionIndex>>>(206, "grouping_functions", result->grouping_functions);
 	deserializer.ReadPropertyWithExplicitDefault<TupleDataValidityType>(207, "distinct_validity", result->distinct_validity, TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+	deserializer.ReadPropertyWithExplicitDefault<bool>(208, "group_join_auto_selected", result->group_join_auto_selected, false);
+	deserializer.ReadPropertyWithExplicitDefault<bool>(209, "group_join_auto_index", result->group_join_auto_index, false);
 	return std::move(result);
 }
 

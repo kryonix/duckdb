@@ -471,10 +471,10 @@ unique_ptr<NodeStatistics> StatisticsPropagator::PropagateStatistics(LogicalAggr
                                                                      unique_ptr<LogicalOperator> &node_ptr) {
 	// first propagate statistics in the child node
 	const auto previous_suppression = suppress_compressed_materialization;
-	if (Settings::Get<DebugGroupJoinStrategySetting>(context) == GroupJoinStrategy::FORCE &&
-	    aggr.children.size() == 1 && aggr.children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+	if (aggr.children.size() == 1 && aggr.children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto &join = aggr.children[0]->Cast<LogicalComparisonJoin>();
-		if (TryGetHashGroupJoinCandidate(aggr, join, context)) {
+		if (TryGetPlannedHashGroupJoinCandidate(aggr, join, context,
+		                                        HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER)) {
 			suppress_compressed_materialization = true;
 		}
 	}

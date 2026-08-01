@@ -7,14 +7,21 @@
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/execution/operator/join/physical_piecewise_merge_join.hpp"
 #include "duckdb/execution/operator/join/physical_recursive_cte_key_join.hpp"
+#include "duckdb/execution/operator/join/physical_hash_group_join.hpp"
+#include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/function/function_binder.hpp"
+#include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/common/atomic.hpp"
+#include "duckdb/optimizer/hash_group_join.hpp"
 #include "duckdb/planner/joinside.hpp"
 
 namespace duckdb {
@@ -102,6 +109,89 @@ static bool TryGetRecursiveKeyProbe(LogicalComparisonJoin &op, PhysicalOperator 
 }
 
 PhysicalOperator &PhysicalPlanGenerator::PlanComparisonJoin(LogicalComparisonJoin &op) {
+	if (Settings::Get<DebugGroupJoinStrategySetting>(context) == GroupJoinStrategy::FORCE) {
+		auto candidate =
+		    TryGetStaticHashGroupJoinCandidate(op, context, HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER);
+		if (candidate) {
+			auto &aggregate_op = *candidate->aggregate;
+			for (auto &expression : aggregate_op.expressions) {
+				auto &aggregate = expression->Cast<BoundAggregateExpression>();
+				if (aggregate.GetOrderBys()) {
+					FunctionBinder::BindSortedAggregate(context, aggregate, aggregate_op.groups,
+					                                    aggregate_op.grouping_sets);
+				}
+			}
+
+			reference<PhysicalOperator> owner = CreatePlan(*op.children[0]);
+			reference<PhysicalOperator> probe = CreatePlan(*aggregate_op.children[0]);
+			owner.get().estimated_cardinality = op.children[0]->EstimateCardinality(context);
+			probe.get().estimated_cardinality = aggregate_op.children[0]->EstimateCardinality(context);
+
+			vector<unique_ptr<Expression>> owner_expressions;
+			vector<LogicalType> owner_types;
+			vector<unique_ptr<Expression>> probe_expressions;
+			vector<LogicalType> probe_types;
+			vector<unique_ptr<Expression>> groups;
+			for (idx_t key_idx = 0; key_idx < candidate->owner_key_indices.size(); key_idx++) {
+				auto owner_idx = candidate->owner_key_indices[key_idx];
+				auto type = owner.get().GetTypes()[owner_idx];
+				owner_types.push_back(type);
+				owner_expressions.push_back(make_uniq<BoundReferenceExpression>(type, owner_idx));
+				probe_types.push_back(type);
+				probe_expressions.push_back(std::move(aggregate_op.groups[key_idx]));
+				groups.push_back(make_uniq<BoundReferenceExpression>(type, key_idx));
+			}
+
+			FunctionBinder function_binder(context);
+			vector<unique_ptr<Expression>> owner_payload_aggregates;
+			for (idx_t payload_idx = 0; payload_idx < candidate->owner_payload_indices.size(); payload_idx++) {
+				auto owner_idx = candidate->owner_payload_indices[payload_idx];
+				auto type = owner.get().GetTypes()[owner_idx];
+				owner_types.push_back(type);
+				owner_expressions.push_back(make_uniq<BoundReferenceExpression>(type, owner_idx));
+			}
+
+			vector<unique_ptr<Expression>> aggregates;
+			aggregates.push_back(function_binder.BindAggregateFunction(CountStarFun::GetFunction(), {}, nullptr,
+			                                                           AggregateType::NON_DISTINCT));
+			for (auto &expression : aggregate_op.expressions) {
+				auto &aggregate = expression->Cast<BoundAggregateExpression>();
+				for (auto &child : aggregate.GetChildrenMutable()) {
+					auto type = child->GetReturnType();
+					auto projection_index = probe_expressions.size();
+					probe_types.push_back(type);
+					probe_expressions.push_back(std::move(child));
+					child = make_uniq<BoundReferenceExpression>(type,
+					                                            projection_index - candidate->owner_key_indices.size());
+				}
+			}
+			for (auto &expression : aggregate_op.expressions) {
+				auto &aggregate = expression->Cast<BoundAggregateExpression>();
+				if (!aggregate.GetFilter()) {
+					continue;
+				}
+				auto &filter = aggregate.GetFilterMutable();
+				auto type = filter->GetReturnType();
+				auto payload_index = probe_expressions.size() - candidate->owner_key_indices.size();
+				probe_types.push_back(type);
+				probe_expressions.push_back(std::move(filter));
+				filter = make_uniq<BoundReferenceExpression>(type, payload_index);
+			}
+			for (auto &expression : aggregate_op.expressions) {
+				aggregates.push_back(std::move(expression));
+			}
+
+			auto &probe_projection = Make<PhysicalProjection>(std::move(probe_types), std::move(probe_expressions),
+			                                                  probe.get().estimated_cardinality);
+			probe_projection.children.push_back(probe);
+			auto &owner_projection = Make<PhysicalProjection>(std::move(owner_types), std::move(owner_expressions),
+			                                                  owner.get().estimated_cardinality);
+			owner_projection.children.push_back(owner);
+			return Make<PhysicalHashGroupJoin>(op, probe_projection, owner_projection, std::move(aggregates),
+			                                   std::move(owner_payload_aggregates), std::move(groups),
+			                                   std::move(candidate->output_columns), op.estimated_cardinality);
+		}
+	}
 	// now visit the children
 	D_ASSERT(op.children.size() == 2);
 	idx_t lhs_cardinality = op.children[0]->EstimateCardinality(context);

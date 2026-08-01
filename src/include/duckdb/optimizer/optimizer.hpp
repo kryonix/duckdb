@@ -30,6 +30,10 @@ public:
 	//! Whether the specific optimizer is disabled
 	bool OptimizerDisabled(OptimizerType type);
 	static bool OptimizerDisabled(ClientContext &context, OptimizerType type);
+	LogicalOperator &GetPlan() {
+		D_ASSERT(plan);
+		return *plan;
+	}
 
 	//! Pre-binder statement-level optimization pass
 	void OptimizeStatement(unique_ptr<SQLStatement> &statement);

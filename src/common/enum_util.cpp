@@ -167,6 +167,7 @@
 #include "duckdb/optimizer/hash_group_join.hpp"
 #include "duckdb/optimizer/join_order/join_order_operator.hpp"
 #include "duckdb/optimizer/join_order/relation_statistics_helper.hpp"
+#include "duckdb/optimizer/key_properties.hpp"
 #include "duckdb/optimizer/remove_unused_columns.hpp"
 #include "duckdb/optimizer/rule/like_optimizations.hpp"
 #include "duckdb/parallel/async_result.hpp"
@@ -2757,6 +2758,28 @@ GroupByExpressionInfoType EnumUtil::FromString<GroupByExpressionInfoType>(const 
 	return static_cast<GroupByExpressionInfoType>(StringUtil::StringToEnum(GetGroupByExpressionInfoTypeValues(), 5, "GroupByExpressionInfoType", value));
 }
 
+const StringUtil::EnumStringLiteral *GetGroupJoinExecutionModeValues() {
+	static constexpr StringUtil::EnumStringLiteral values[] {
+		{ static_cast<uint32_t>(GroupJoinExecutionMode::AUTO), "AUTO" },
+		{ static_cast<uint32_t>(GroupJoinExecutionMode::SERIAL), "SERIAL" },
+		{ static_cast<uint32_t>(GroupJoinExecutionMode::LOCAL), "LOCAL" },
+		{ static_cast<uint32_t>(GroupJoinExecutionMode::OWNERSHIP), "OWNERSHIP" },
+		{ static_cast<uint32_t>(GroupJoinExecutionMode::EXTERNAL), "EXTERNAL" },
+		{ static_cast<uint32_t>(GroupJoinExecutionMode::INDEX), "INDEX" }
+	};
+	return values;
+}
+
+template<>
+const char* EnumUtil::ToChars<GroupJoinExecutionMode>(GroupJoinExecutionMode value) {
+	return StringUtil::EnumToString(GetGroupJoinExecutionModeValues(), 6, "GroupJoinExecutionMode", static_cast<uint32_t>(value));
+}
+
+template<>
+GroupJoinExecutionMode EnumUtil::FromString<GroupJoinExecutionMode>(const char *value) {
+	return static_cast<GroupJoinExecutionMode>(StringUtil::StringToEnum(GetGroupJoinExecutionModeValues(), 6, "GroupJoinExecutionMode", value));
+}
+
 const StringUtil::EnumStringLiteral *GetGroupJoinStrategyValues() {
 	static constexpr StringUtil::EnumStringLiteral values[] {
 		{ static_cast<uint32_t>(GroupJoinStrategy::DISABLED), "DISABLED" },
@@ -2890,6 +2913,45 @@ const char* EnumUtil::ToChars<HashGroupJoinCandidateMode>(HashGroupJoinCandidate
 template<>
 HashGroupJoinCandidateMode EnumUtil::FromString<HashGroupJoinCandidateMode>(const char *value) {
 	return static_cast<HashGroupJoinCandidateMode>(StringUtil::StringToEnum(GetHashGroupJoinCandidateModeValues(), 2, "HashGroupJoinCandidateMode", value));
+}
+
+const StringUtil::EnumStringLiteral *GetHashGroupJoinOutputSourceValues() {
+	static constexpr StringUtil::EnumStringLiteral values[] {
+		{ static_cast<uint32_t>(HashGroupJoinOutputSource::KEY), "KEY" },
+		{ static_cast<uint32_t>(HashGroupJoinOutputSource::OWNER_PAYLOAD), "OWNER_PAYLOAD" },
+		{ static_cast<uint32_t>(HashGroupJoinOutputSource::MATCHED_KEY), "MATCHED_KEY" },
+		{ static_cast<uint32_t>(HashGroupJoinOutputSource::AGGREGATE), "AGGREGATE" }
+	};
+	return values;
+}
+
+template<>
+const char* EnumUtil::ToChars<HashGroupJoinOutputSource>(HashGroupJoinOutputSource value) {
+	return StringUtil::EnumToString(GetHashGroupJoinOutputSourceValues(), 4, "HashGroupJoinOutputSource", static_cast<uint32_t>(value));
+}
+
+template<>
+HashGroupJoinOutputSource EnumUtil::FromString<HashGroupJoinOutputSource>(const char *value) {
+	return static_cast<HashGroupJoinOutputSource>(StringUtil::StringToEnum(GetHashGroupJoinOutputSourceValues(), 4, "HashGroupJoinOutputSource", value));
+}
+
+const StringUtil::EnumStringLiteral *GetHashGroupJoinUnmatchedPolicyValues() {
+	static constexpr StringUtil::EnumStringLiteral values[] {
+		{ static_cast<uint32_t>(HashGroupJoinUnmatchedPolicy::DISCARD), "DISCARD" },
+		{ static_cast<uint32_t>(HashGroupJoinUnmatchedPolicy::EMPTY_AGGREGATE), "EMPTY_AGGREGATE" },
+		{ static_cast<uint32_t>(HashGroupJoinUnmatchedPolicy::NULL_EXTENDED_ROW), "NULL_EXTENDED_ROW" }
+	};
+	return values;
+}
+
+template<>
+const char* EnumUtil::ToChars<HashGroupJoinUnmatchedPolicy>(HashGroupJoinUnmatchedPolicy value) {
+	return StringUtil::EnumToString(GetHashGroupJoinUnmatchedPolicyValues(), 3, "HashGroupJoinUnmatchedPolicy", static_cast<uint32_t>(value));
+}
+
+template<>
+HashGroupJoinUnmatchedPolicy EnumUtil::FromString<HashGroupJoinUnmatchedPolicy>(const char *value) {
+	return static_cast<HashGroupJoinUnmatchedPolicy>(StringUtil::StringToEnum(GetHashGroupJoinUnmatchedPolicyValues(), 3, "HashGroupJoinUnmatchedPolicy", value));
 }
 
 const StringUtil::EnumStringLiteral *GetIndexAppendModeValues() {

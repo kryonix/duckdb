@@ -356,6 +356,13 @@
         "default_value": "false"
     },
     {
+        "name": "debug_group_join_execution",
+        "description": "DEBUG SETTING: choose the Hash GroupJoin execution mode",
+        "type": "ENUM<GroupJoinExecutionMode>",
+        "default_scope": "local",
+        "default_value": "AUTO"
+    },
+    {
         "name": "debug_group_join_strategy",
         "description": "DEBUG SETTING: choose the physical GroupJoin strategy",
         "type": "ENUM<GroupJoinStrategy>",

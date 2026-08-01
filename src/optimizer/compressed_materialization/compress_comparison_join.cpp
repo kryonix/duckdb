@@ -1,5 +1,8 @@
 #include "duckdb/optimizer/compressed_materialization.hpp"
+#include "duckdb/optimizer/hash_group_join.hpp"
 #include "duckdb/optimizer/statistics_propagator.hpp"
+#include "duckdb/execution/group_join_strategy.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
@@ -116,6 +119,11 @@ bool CompressedMaterialization::TryCompressVariantComparisonJoinKey(JoinConditio
 
 void CompressedMaterialization::CompressComparisonJoin(unique_ptr<LogicalOperator> &op) {
 	auto &join = op->Cast<LogicalComparisonJoin>();
+	if (Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context) == GroupJoinStrategy::FORCE &&
+	    TryGetStaticHashGroupJoinCandidate(join, optimizer.context,
+	                                       HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER)) {
+		return;
+	}
 	if (join.join_type == JoinType::MARK) {
 		// Tricky to get bindings right. RHS binding stays the same even though it changes type. Skip for now
 		return;

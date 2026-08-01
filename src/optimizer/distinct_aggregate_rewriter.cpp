@@ -2,7 +2,10 @@
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/optimizer/aggregate_rewrite_helper.hpp"
+#include "duckdb/optimizer/hash_group_join.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/execution/group_join_strategy.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/bound_result_modifier.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -262,6 +265,19 @@ bool DistinctAggregateRewriter::TryRewrite(unique_ptr<LogicalOperator> &op) {
 		return false;
 	}
 	auto &aggr = op->Cast<LogicalAggregate>();
+	if (Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context) == GroupJoinStrategy::FORCE &&
+	    IsStaticHashGroupJoinAggregate(optimizer.GetPlan(), aggr, optimizer.context,
+	                                   HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER)) {
+		return false;
+	}
+	if (Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context) == GroupJoinStrategy::FORCE &&
+	    aggr.children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = aggr.children[0]->Cast<LogicalComparisonJoin>();
+		if (TryGetHashGroupJoinCandidate(aggr, join, optimizer.context,
+		                                 HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER)) {
+			return false;
+		}
+	}
 	if (aggr.grouping_sets.size() > 1 || aggr.expressions.empty()) {
 		return false;
 	}

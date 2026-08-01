@@ -119,34 +119,72 @@ void RowOperations::UpdateStatesClustered(RowOperationsState &state, vector<Aggr
 
 void RowOperations::CombineStates(RowOperationsState &state, TupleDataLayout &layout, Vector &sources,
                                   Vector &targets) {
+	CombineStatesRange(state, layout, sources, 0, layout, targets, 0, layout.GetAggregates().size());
+}
+
+static idx_t GetAggregateStateOffset(TupleDataLayout &layout, idx_t aggregate_idx) {
+	idx_t result = layout.GetAggrOffset();
+	auto &aggregates = layout.GetAggregates();
+	for (idx_t i = 0; i < aggregate_idx; i++) {
+		result += aggregates[i].payload_size;
+	}
+	return result;
+}
+
+void RowOperations::CombineStatesRange(RowOperationsState &state, TupleDataLayout &source_layout, Vector &sources,
+                                       idx_t source_begin, TupleDataLayout &target_layout, Vector &targets,
+                                       idx_t target_begin, idx_t aggregate_count) {
+	if (sources.size() != targets.size()) {
+		throw InternalException("CombineStatesRange: source count (%llu) does not match target count (%llu)",
+		                        sources.size(), targets.size());
+	}
+	auto &source_aggregates = source_layout.GetAggregates();
+	auto &target_aggregates = target_layout.GetAggregates();
+	if (source_begin > source_aggregates.size() || aggregate_count > source_aggregates.size() - source_begin) {
+		throw InternalException("CombineStatesRange: source range [%llu, %llu) exceeds aggregate count %llu",
+		                        source_begin, source_begin + aggregate_count, source_aggregates.size());
+	}
+	if (target_begin > target_aggregates.size() || aggregate_count > target_aggregates.size() - target_begin) {
+		throw InternalException("CombineStatesRange: target range [%llu, %llu) exceeds aggregate count %llu",
+		                        target_begin, target_begin + aggregate_count, target_aggregates.size());
+	}
+	for (idx_t i = 0; i < aggregate_count; i++) {
+		auto &source = source_aggregates[source_begin + i];
+		auto &target = target_aggregates[target_begin + i];
+		if (source.function != target.function ||
+		    !FunctionData::Equals(source.GetFunctionData(), target.GetFunctionData()) ||
+		    source.payload_size != target.payload_size) {
+			throw InternalException("CombineStatesRange: incompatible aggregate states at range offset %llu", i);
+		}
+		if (!target.function.HasStateCombineCallback()) {
+			throw InternalException("CombineStatesRange: aggregate at range offset %llu does not support combine", i);
+		}
+	}
+
 	auto count = sources.size();
-	if (count == 0) {
+	if (count == 0 || aggregate_count == 0) {
 		return;
 	}
 
-	//	Move to the first aggregate states
-	VectorOperations::AddInPlace(sources, UnsafeNumericCast<int64_t>(layout.GetAggrOffset()));
-	VectorOperations::AddInPlace(targets, UnsafeNumericCast<int64_t>(layout.GetAggrOffset()));
+	auto source_offset = GetAggregateStateOffset(source_layout, source_begin);
+	auto target_offset = GetAggregateStateOffset(target_layout, target_begin);
+	VectorOperations::AddInPlace(sources, UnsafeNumericCast<int64_t>(source_offset));
+	VectorOperations::AddInPlace(targets, UnsafeNumericCast<int64_t>(target_offset));
 
-	// Keep track of the offset
-	idx_t offset = layout.GetAggrOffset();
+	for (idx_t i = 0; i < aggregate_count; i++) {
+		auto &source = source_aggregates[source_begin + i];
+		auto &target = target_aggregates[target_begin + i];
+		AggregateInputData aggr_input_data(target, state.allocator, AggregateCombineType::ALLOW_DESTRUCTIVE);
+		target.function.GetStateCombineCallback()(sources, targets, aggr_input_data, count);
 
-	for (auto &aggr : layout.GetAggregates()) {
-		D_ASSERT(aggr.function.HasStateCombineCallback());
-		AggregateInputData aggr_input_data(aggr, state.allocator, AggregateCombineType::ALLOW_DESTRUCTIVE);
-		aggr.function.GetStateCombineCallback()(sources, targets, aggr_input_data, count);
-
-		// Move to the next aggregate states
-		VectorOperations::AddInPlace(sources, UnsafeNumericCast<int64_t>(aggr.payload_size));
-		VectorOperations::AddInPlace(targets, UnsafeNumericCast<int64_t>(aggr.payload_size));
-
-		// Increment the offset
-		offset += aggr.payload_size;
+		VectorOperations::AddInPlace(sources, UnsafeNumericCast<int64_t>(source.payload_size));
+		VectorOperations::AddInPlace(targets, UnsafeNumericCast<int64_t>(target.payload_size));
+		source_offset += source.payload_size;
+		target_offset += target.payload_size;
 	}
 
-	// Now subtract the offset to get back to the original position
-	VectorOperations::AddInPlace(sources, -UnsafeNumericCast<int64_t>(offset));
-	VectorOperations::AddInPlace(targets, -UnsafeNumericCast<int64_t>(offset));
+	VectorOperations::AddInPlace(sources, -UnsafeNumericCast<int64_t>(source_offset));
+	VectorOperations::AddInPlace(targets, -UnsafeNumericCast<int64_t>(target_offset));
 }
 
 void RowOperations::FinalizeStates(RowOperationsState &state, TupleDataLayout &layout, Vector &addresses,
