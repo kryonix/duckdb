@@ -1815,9 +1815,10 @@ static void ProcessExternalRoutedLookupPartition(const PhysicalHashGroupJoin &op
 				for (idx_t route_idx = 0; route_idx < routed_count; route_idx++) {
 					route_order[route_idx] = route_idx;
 				}
-				std::sort(route_order.begin(), route_order.begin() + routed_count, [&](idx_t left, idx_t right) {
-					return route_owner_buffer[left] < route_owner_buffer[right];
-				});
+				std::sort(
+				    route_order.begin(),
+				    route_order.begin() + NumericCast<vector<idx_t>::difference_type>(routed_count),
+				    [&](idx_t left, idx_t right) { return route_owner_buffer[left] < route_owner_buffer[right]; });
 				for (idx_t output_idx = 0; output_idx < routed_count; output_idx++) {
 					auto route_idx = route_order[output_idx];
 					auto owner_row = route_owner_buffer[route_idx];
