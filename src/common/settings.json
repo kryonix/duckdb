@@ -364,7 +364,7 @@
     },
     {
         "name": "debug_group_join_strategy",
-        "description": "DEBUG SETTING: choose the physical GroupJoin strategy",
+        "description": "DEBUG SETTING: choose the aggregate/join strategy",
         "type": "ENUM<GroupJoinStrategy>",
         "default_scope": "local",
         "default_value": "AUTO"

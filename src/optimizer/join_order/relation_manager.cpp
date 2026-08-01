@@ -6,6 +6,7 @@
 #include "duckdb/optimizer/join_order/join_order_optimizer.hpp"
 #include "duckdb/optimizer/join_order/join_relation_set.hpp"
 #include "duckdb/optimizer/join_order/relation_statistics_helper.hpp"
+#include "duckdb/optimizer/hash_group_join.hpp"
 #include "duckdb/parser/expression_map.hpp"
 #include "duckdb/planner/expression/list.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
@@ -352,6 +353,10 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 		// optimize children
 		RelationStats child_stats;
 		auto child_optimizer = optimizer.CreateChildOptimizer();
+		auto group_join_context = GetHashGroupJoinOrderContext(op->Cast<LogicalAggregate>(), context);
+		if (group_join_context) {
+			child_optimizer.SetGroupJoinContext(std::move(*group_join_context));
+		}
 		op->children[0] = child_optimizer.Optimize(std::move(op->children[0]), &child_stats);
 		auto &aggr = op->Cast<LogicalAggregate>();
 		auto operator_stats = RelationStatisticsHelper::ExtractAggregationStats(aggr, child_stats);

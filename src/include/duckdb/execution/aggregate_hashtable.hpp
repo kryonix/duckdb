@@ -38,6 +38,7 @@ public:
 	}
 
 	idx_t partition_idx = 0;
+	idx_t partition_end = 0;
 	TupleDataScanState scan_states;
 	vector<column_t> group_indexes;
 };
@@ -130,6 +131,8 @@ public:
 	void FetchAggregates(DataChunk &groups, DataChunk &result);
 
 	void InitializeScan(AggregateHTScanState &scan_state);
+	//! Initializes a scan restricted to one radix partition.
+	void InitializeScan(AggregateHTScanState &scan_state, idx_t partition_idx);
 	//! Scans group columns without reading or finalizing aggregate states.
 	bool ScanGroups(AggregateHTScanState &scan_state, DataChunk &distinct_rows);
 	//! Scans group columns and references their stable row-start addresses until the next scan call.
@@ -172,6 +175,16 @@ public:
 	void StoreAggregateAllocator(shared_ptr<ArenaAllocator> allocator);
 	//! Retains all allocators that can be referenced by destructively combined states from another table.
 	void InheritAggregateAllocators(const GroupedAggregateHashTable &other);
+	//! Moves initialized rows from a table with the same layout without combining aggregate states.
+	//! The caller must prove that every moved group is globally unique and call PrepareUniqueFinalize afterwards.
+	void MoveUniqueGroups(GroupedAggregateHashTable &other);
+	//! Allocates an empty pointer directory for rows moved with MoveUniqueGroups.
+	void PrepareUniqueFinalize(idx_t group_count);
+	//! Atomically publishes one radix partition and returns its stable row addresses.
+	//! Duplicate groups are rejected even when different partitions are finalized concurrently.
+	void FinalizeUniquePartition(idx_t partition_idx, vector<data_ptr_t> &row_addresses);
+	//! Verifies the completed unique pointer directory.
+	void VerifyUniqueFinalize();
 
 	//! Resize the HT to the specified size. Must be larger than the current size.
 	void Resize(idx_t size);

@@ -249,3 +249,71 @@ TEST_CASE("Grouped aggregate scans retain projected columns across radix partiti
 		REQUIRE(scanned_values.find(value) != scanned_values.end());
 	}
 }
+
+TEST_CASE("Move and atomically finalize globally unique aggregate groups", "[aggregate_hashtable]") {
+	DuckDB database(nullptr);
+	Connection connection(database);
+	auto &context = *connection.context;
+	auto &allocator = Allocator::Get(context);
+
+	auto create_table = [&]() {
+		return make_uniq<GroupedAggregateHashTable>(context, allocator, vector<LogicalType> {LogicalType::INTEGER},
+		                                            vector<LogicalType> {}, vector<AggregateObject> {},
+		                                            GroupedAggregateHashTable::InitialCapacity(), 2,
+		                                            TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
+	};
+	auto add_groups = [&](GroupedAggregateHashTable &table, const vector<Value> &values) {
+		DataChunk groups;
+		groups.Initialize(allocator, {LogicalType::INTEGER});
+		SetIntegerValues(groups, values);
+		Vector addresses(LogicalType::POINTER);
+		SelectionVector new_groups(STANDARD_VECTOR_SIZE);
+		REQUIRE(table.FindOrCreateGroups(groups, addresses, new_groups) == values.size());
+	};
+
+	SECTION("disjoint local tables publish one lookup directory") {
+		auto first = create_table();
+		auto second = create_table();
+		add_groups(*first, {Value::INTEGER(1), Value::INTEGER(2)});
+		add_groups(*second, {Value::INTEGER(3), Value::INTEGER(4)});
+		auto target = create_table();
+		target->MoveUniqueGroups(*first);
+		target->MoveUniqueGroups(*second);
+		target->PrepareUniqueFinalize(4);
+		vector<data_ptr_t> row_addresses;
+		for (idx_t partition_idx = 0; partition_idx < target->GetPartitionedData().PartitionCount(); partition_idx++) {
+			target->FinalizeUniquePartition(partition_idx, row_addresses);
+		}
+		target->VerifyUniqueFinalize();
+		REQUIRE(row_addresses.size() == 4);
+
+		DataChunk lookup;
+		lookup.Initialize(allocator, {LogicalType::INTEGER});
+		SetIntegerValues(lookup, {Value::INTEGER(4), Value::INTEGER(2), Value::INTEGER(1), Value::INTEGER(3)});
+		AggregateHTLookupState lookup_state;
+		SelectionVector found(STANDARD_VECTOR_SIZE);
+		REQUIRE(target->LookupGroups(lookup, lookup_state, found) == 4);
+	}
+
+	SECTION("duplicates across local tables violate the unique finalize contract") {
+		auto first = create_table();
+		auto second = create_table();
+		add_groups(*first, {Value::INTEGER(1), Value::INTEGER(2)});
+		add_groups(*second, {Value::INTEGER(2), Value::INTEGER(3)});
+		auto target = create_table();
+		target->MoveUniqueGroups(*first);
+		target->MoveUniqueGroups(*second);
+		target->PrepareUniqueFinalize(4);
+		vector<data_ptr_t> row_addresses;
+		bool duplicate_detected = false;
+		try {
+			for (idx_t partition_idx = 0; partition_idx < target->GetPartitionedData().PartitionCount();
+			     partition_idx++) {
+				target->FinalizeUniquePartition(partition_idx, row_addresses);
+			}
+		} catch (const InternalException &) {
+			duplicate_detected = true;
+		}
+		REQUIRE(duplicate_detected);
+	}
+}

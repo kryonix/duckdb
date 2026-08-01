@@ -356,6 +356,8 @@ enum class NType : uint8_t;
 
 enum class NewLineIdentifier : uint8_t;
 
+enum class NumericDistributionSource : uint8_t;
+
 enum class OnConflictAction : uint8_t;
 
 enum class OnCreateConflict : uint8_t;
@@ -1106,6 +1108,9 @@ const char* EnumUtil::ToChars<NType>(NType value);
 
 template<>
 const char* EnumUtil::ToChars<NewLineIdentifier>(NewLineIdentifier value);
+
+template<>
+const char* EnumUtil::ToChars<NumericDistributionSource>(NumericDistributionSource value);
 
 template<>
 const char* EnumUtil::ToChars<OnConflictAction>(OnConflictAction value);
@@ -1989,6 +1994,9 @@ NType EnumUtil::FromString<NType>(const char *value);
 
 template<>
 NewLineIdentifier EnumUtil::FromString<NewLineIdentifier>(const char *value);
+
+template<>
+NumericDistributionSource EnumUtil::FromString<NumericDistributionSource>(const char *value);
 
 template<>
 OnConflictAction EnumUtil::FromString<OnConflictAction>(const char *value);

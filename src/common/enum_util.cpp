@@ -2803,19 +2803,23 @@ const StringUtil::EnumStringLiteral *GetGroupJoinStrategyValues() {
 	static constexpr StringUtil::EnumStringLiteral values[] {
 		{ static_cast<uint32_t>(GroupJoinStrategy::DISABLED), "DISABLED" },
 		{ static_cast<uint32_t>(GroupJoinStrategy::FORCE), "FORCE" },
-		{ static_cast<uint32_t>(GroupJoinStrategy::AUTO), "AUTO" }
+		{ static_cast<uint32_t>(GroupJoinStrategy::AUTO), "AUTO" },
+		{ static_cast<uint32_t>(GroupJoinStrategy::SEPARATE), "SEPARATE" },
+		{ static_cast<uint32_t>(GroupJoinStrategy::EAGER), "EAGER" },
+		{ static_cast<uint32_t>(GroupJoinStrategy::HASH), "HASH" },
+		{ static_cast<uint32_t>(GroupJoinStrategy::INDEX), "INDEX" }
 	};
 	return values;
 }
 
 template<>
 const char* EnumUtil::ToChars<GroupJoinStrategy>(GroupJoinStrategy value) {
-	return StringUtil::EnumToString(GetGroupJoinStrategyValues(), 3, "GroupJoinStrategy", static_cast<uint32_t>(value));
+	return StringUtil::EnumToString(GetGroupJoinStrategyValues(), 7, "GroupJoinStrategy", static_cast<uint32_t>(value));
 }
 
 template<>
 GroupJoinStrategy EnumUtil::FromString<GroupJoinStrategy>(const char *value) {
-	return static_cast<GroupJoinStrategy>(StringUtil::StringToEnum(GetGroupJoinStrategyValues(), 3, "GroupJoinStrategy", value));
+	return static_cast<GroupJoinStrategy>(StringUtil::StringToEnum(GetGroupJoinStrategyValues(), 7, "GroupJoinStrategy", value));
 }
 
 const StringUtil::EnumStringLiteral *GetHLLStorageTypeValues() {
@@ -3859,6 +3863,27 @@ const char* EnumUtil::ToChars<NewLineIdentifier>(NewLineIdentifier value) {
 template<>
 NewLineIdentifier EnumUtil::FromString<NewLineIdentifier>(const char *value) {
 	return static_cast<NewLineIdentifier>(StringUtil::StringToEnum(GetNewLineIdentifierValues(), 4, "NewLineIdentifier", value));
+}
+
+const StringUtil::EnumStringLiteral *GetNumericDistributionSourceValues() {
+	static constexpr StringUtil::EnumStringLiteral values[] {
+		{ static_cast<uint32_t>(NumericDistributionSource::BASE_COLUMN), "BASE_COLUMN" },
+		{ static_cast<uint32_t>(NumericDistributionSource::SUM), "SUM" },
+		{ static_cast<uint32_t>(NumericDistributionSource::COUNT), "COUNT" },
+		{ static_cast<uint32_t>(NumericDistributionSource::AVERAGE), "AVERAGE" },
+		{ static_cast<uint32_t>(NumericDistributionSource::DERIVED), "DERIVED" }
+	};
+	return values;
+}
+
+template<>
+const char* EnumUtil::ToChars<NumericDistributionSource>(NumericDistributionSource value) {
+	return StringUtil::EnumToString(GetNumericDistributionSourceValues(), 5, "NumericDistributionSource", static_cast<uint32_t>(value));
+}
+
+template<>
+NumericDistributionSource EnumUtil::FromString<NumericDistributionSource>(const char *value) {
+	return static_cast<NumericDistributionSource>(StringUtil::StringToEnum(GetNumericDistributionSourceValues(), 5, "NumericDistributionSource", value));
 }
 
 const StringUtil::EnumStringLiteral *GetOnConflictActionValues() {

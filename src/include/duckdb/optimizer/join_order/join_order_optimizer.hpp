@@ -11,6 +11,7 @@
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/optimizer/join_order/query_graph_manager.hpp"
+#include "duckdb/optimizer/hash_group_join.hpp"
 #include "duckdb/parser/expression_map.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 
@@ -30,6 +31,8 @@ public:
 	//! Adds/gets delim scan stats
 	void AddDelimScanStats(RelationStats &stats);
 	RelationStats GetDelimScanStats();
+	//! Sets a proven aggregate-boundary GroupJoin split for this join graph.
+	void SetGroupJoinContext(HashGroupJoinOrderContext context);
 
 private:
 	ClientContext &context;
@@ -51,6 +54,7 @@ private:
 	unordered_map<TableIndex, RelationStats> materialized_cte_stats;
 	//! Stats of Delim Scans of the Delim Join that is currently being optimized
 	optional_ptr<RelationStats> delim_scan_stats;
+	optional<HashGroupJoinOrderContext> group_join_context;
 	idx_t depth;
 
 public:

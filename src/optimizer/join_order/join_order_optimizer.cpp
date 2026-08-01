@@ -25,6 +25,10 @@ JoinOrderOptimizer JoinOrderOptimizer::CreateChildOptimizer() {
 	return child_optimizer;
 }
 
+void JoinOrderOptimizer::SetGroupJoinContext(HashGroupJoinOrderContext context) {
+	group_join_context = std::move(context);
+}
+
 unique_ptr<LogicalOperator> JoinOrderOptimizer::Optimize(unique_ptr<LogicalOperator> plan,
                                                          optional_ptr<RelationStats> stats) {
 	auto max_expression_depth = Settings::Get<MaxExpressionDepthSetting>(query_graph_manager.context);
@@ -49,7 +53,40 @@ unique_ptr<LogicalOperator> JoinOrderOptimizer::Optimize(unique_ptr<LogicalOpera
 		// query graph now has filters and relations
 		auto cardinality_estimator =
 		    CardinalityEstimator(query_graph_manager.set_manager, query_graph_manager.GetPredicateModel());
-		auto cost_model = CostModel(query_graph_manager, cardinality_estimator);
+		optional<GroupJoinOrderCostContext> group_join_cost_context;
+		if (group_join_context) {
+			GroupJoinOrderCostContext mapped {{},
+			                                  {},
+			                                  group_join_context->key_width,
+			                                  group_join_context->state_width,
+			                                  group_join_context->routed,
+			                                  group_join_context->direct_inner,
+			                                  group_join_context->strategy};
+			bool valid = true;
+			auto map_relations = [&](const unordered_set<TableIndex> &tables, unordered_set<RelationIndex> &relations) {
+				for (auto table : tables) {
+					auto entry = query_graph_manager.relation_manager.relation_mapping.find(table);
+					if (entry == query_graph_manager.relation_manager.relation_mapping.end()) {
+						valid = false;
+						return;
+					}
+					relations.insert(entry->second);
+				}
+			};
+			map_relations(group_join_context->owner_tables, mapped.owner_relations);
+			map_relations(group_join_context->probe_tables, mapped.probe_relations);
+			for (auto relation : mapped.owner_relations) {
+				if (mapped.probe_relations.find(relation) != mapped.probe_relations.end()) {
+					valid = false;
+					break;
+				}
+			}
+			if (valid && !mapped.owner_relations.empty() && !mapped.probe_relations.empty()) {
+				group_join_cost_context = std::move(mapped);
+			}
+		}
+		auto cost_model = CostModel(query_graph_manager, cardinality_estimator,
+		                            group_join_cost_context ? &*group_join_cost_context : nullptr);
 
 		// Initialize a plan enumerator.
 		auto plan_enumerator =

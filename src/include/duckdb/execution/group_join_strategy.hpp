@@ -13,7 +13,7 @@
 
 namespace duckdb {
 
-enum class GroupJoinStrategy : uint8_t { DISABLED, FORCE, AUTO };
+enum class GroupJoinStrategy : uint8_t { DISABLED, FORCE, AUTO, SEPARATE, EAGER, HASH, INDEX };
 
 enum class GroupJoinExecutionMode : uint8_t { AUTO, SERIAL, LOCAL, OWNERSHIP, EXTERNAL, INDEX };
 

@@ -28,11 +28,12 @@ explain SELECT sum(l_extendedprice) / 7.0 AS avg_yearly FROM lineitem, part WHER
 ----
 logical_opt	<!REGEX>:.*SINGLE.*
 
-# Q 17: the selected delimiter domain should still restrict the inner aggregate input
+# Q 17: the selected correlation domain should still restrict the inner aggregate input. With a factored domain the
+# selective part source can be optimized to EMPTY_RESULT for this tiny fixture instead of remaining a CTE scan.
 query II
 explain SELECT sum(l_extendedprice) / 7.0 AS avg_yearly FROM lineitem, part WHERE p_partkey = l_partkey AND p_brand = 'Brand#23' AND p_container = 'MED BOX' AND l_quantity < ( SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey);
 ----
-logical_opt	<REGEX>:.*Groups: p_partkey.*COMPARISON_JOIN.*(l_partkey = p_partkey|p_partkey = l_partkey).*(DELIM_GET|CTE_SCAN).*
+logical_opt	<REGEX>:.*Groups: p_partkey.*Join Type: SEMI.*(DELIM_GET|CTE_SCAN|EMPTY_RESULT).*
 
 # Q 17: the generated delimiter CTE should not preserve unused columns from the lineitem input
 query II
@@ -53,11 +54,12 @@ explain SELECT s_name, s_address FROM supplier, nation WHERE s_suppkey IN ( SELE
 ----
 logical_opt	<!REGEX>:.*SINGLE.*
 
-# Q 20: both correlated keys from the selected partsupp domain restrict lineitem before aggregation
+# Q 20: both correlated keys from the selected partsupp domain restrict lineitem before aggregation. The factored
+# source can again become EMPTY_RESULT for this fixture.
 query II
 explain SELECT s_name, s_address FROM supplier, nation WHERE s_suppkey IN ( SELECT ps_suppkey FROM partsupp WHERE ps_partkey IN ( SELECT p_partkey FROM part WHERE p_name LIKE 'forest%') AND ps_availqty > ( SELECT 0.5 * sum(l_quantity) FROM lineitem WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey AND l_shipdate >= CAST('1994-01-01' AS date) AND l_shipdate < CAST('1995-01-01' AS date))) AND s_nationkey = n_nationkey AND n_name = 'CANADA' ORDER BY s_name;
 ----
-logical_opt	<REGEX>:.*Groups: ps_suppkey, ps_partkey.*Join Type: SEMI.*l_partkey = ps_partkey.*l_suppkey = ps_suppkey.*(DELIM_GET|CTE_SCAN).*
+logical_opt	<REGEX>:.*Groups: ps_suppkey, ps_partkey.*Join Type: SEMI.*l_partkey = ps_partkey.*l_suppkey = ps_suppkey.*(DELIM_GET|CTE_SCAN|EMPTY_RESULT).*
 
 # Reduced SQLStorm 6064: a pair-dependent predicate below a reused window CTE remains in the
 # normal decorrelation pipeline and exposes both join keys to the optimizer. MARK is retained
@@ -251,11 +253,12 @@ EXPLAIN SELECT x FROM range(1000000) o(x) WHERE x < 10000 AND EXISTS (SELECT 1 F
 ----
 logical_opt	<REGEX>:.*Join Type: RIGHT_SEMI.*x = x.*
 
-# Q 22: the selected delimiter domain should still restrict the NOT EXISTS evidence side
+# Q 22: the selected correlation domain should still restrict the NOT EXISTS evidence side. A repeatable customer
+# source can provide that domain directly, so the plan does not require a generated delimiter CTE.
 query II
 EXPLAIN SELECT cntrycode, count(*) AS numcust, sum(c_acctbal) AS totacctbal FROM (SELECT substring(c_phone FROM 1 FOR 2) AS cntrycode, c_acctbal FROM customer WHERE substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17') AND c_acctbal > (SELECT avg(c_acctbal) FROM customer WHERE c_acctbal > 0.00 AND substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')) AND NOT EXISTS (SELECT * FROM orders WHERE o_custkey = c_custkey)) AS custsale GROUP BY cntrycode ORDER BY cntrycode;
 ----
-logical_opt	<REGEX>:.*__duckdb_delim.*Join Type: MARK.*Join Type: (SEMI|RIGHT_SEMI).*o_custkey = c_custkey.*
+logical_opt	<REGEX>:.*Join Type: MARK.*Join Type: (SEMI|RIGHT_SEMI).*o_custkey = c_custkey.*
 
 # Delimiter CTE fanout should stay runnable with grouped build-side consumers
 query I

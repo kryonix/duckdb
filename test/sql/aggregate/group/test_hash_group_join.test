@@ -75,6 +75,61 @@ GROUP BY o.id
 ----
 logical_opt	<REGEX>:(?s).*Group Join.*Strategy: OWNERSHIP.*Strategy Costs:.*
 
+# A conceptual candidate reaches join enumeration before the join tree is rebuilt. The disabled plan joins the tiny
+# probe first; forcing HASH retains the proven owner subtree at the aggregate boundary and produces GroupJoin.
+statement ok
+CREATE TABLE gj_order_owner(id BIGINT PRIMARY KEY, dimension_id BIGINT)
+
+statement ok
+INSERT INTO gj_order_owner SELECT i, i FROM range(10000) t(i)
+
+statement ok
+CREATE TABLE gj_order_dimension(dimension_id BIGINT PRIMARY KEY)
+
+statement ok
+INSERT INTO gj_order_dimension SELECT i FROM range(10000) t(i)
+
+statement ok
+CREATE TABLE gj_order_probe(id BIGINT, value BIGINT)
+
+statement ok
+INSERT INTO gj_order_probe SELECT i, i FROM range(10) t(i)
+
+statement ok
+ANALYZE
+
+statement ok
+SET debug_group_join_strategy = 'disabled'
+
+query II
+EXPLAIN SELECT o.id, sum(p.value)
+FROM (gj_order_owner o JOIN gj_order_dimension d USING (dimension_id)) JOIN gj_order_probe p USING (id)
+GROUP BY o.id
+----
+logical_opt	<!REGEX>:.*Group Join.*
+
+statement ok
+SET debug_group_join_strategy = 'hash'
+
+query II
+EXPLAIN SELECT o.id, sum(p.value)
+FROM (gj_order_owner o JOIN gj_order_dimension d USING (dimension_id)) JOIN gj_order_probe p USING (id)
+GROUP BY o.id
+----
+logical_opt	<REGEX>:(?s).*Group Join.*Conditions: dimension_id = dimension_id.*
+
+query II
+SELECT count(*), sum(s) FROM (
+	SELECT o.id, sum(p.value) s
+	FROM (gj_order_owner o JOIN gj_order_dimension d USING (dimension_id)) JOIN gj_order_probe p USING (id)
+	GROUP BY o.id
+)
+----
+10	45
+
+statement ok
+SET debug_group_join_strategy = 'force'
+
 statement ok
 SET threads = 1
 
@@ -418,6 +473,29 @@ physical_plan	<REGEX>:(?s).*Hash Group Join.*Strategy: EXTERNAL.*
 
 statement ok
 RESET memory_limit
+
+# Large proven-unique owners use task-local row construction and atomically publish one shared lookup directory.
+statement ok
+CREATE TABLE gj_parallel_build_owner(id BIGINT PRIMARY KEY, payload VARCHAR)
+
+statement ok
+INSERT INTO gj_parallel_build_owner SELECT i, 'v-' || i::VARCHAR FROM range(1048576) t(i)
+
+query II
+EXPLAIN SELECT o.id, o.payload, count(*)
+FROM gj_parallel_build_owner o JOIN range(1048576) p(id) USING (id)
+GROUP BY o.id, o.payload
+----
+physical_plan	<REGEX>:(?s).*Hash Group Join.*Owner Build: PARALLEL.*
+
+query IITT
+SELECT count(*), sum(n), min(payload), max(payload) FROM (
+	SELECT o.id, o.payload, count(*) n
+	FROM gj_parallel_build_owner o JOIN range(1048576) p(id) USING (id)
+	GROUP BY o.id, o.payload
+)
+----
+1048576	1048576	v-0	v-999999
 
 statement ok
 PRAGMA disable_verify_parallelism
@@ -1419,15 +1497,41 @@ SELECT o.a, o.b, count(*) AS n, sum(p.value) AS s
 FROM gj_auto_owner o JOIN gj_auto_probe p USING (a, b)
 GROUP BY o.a, o.b
 
+# Exact strategy controls make the cost alternatives independently reproducible.
 statement ok
-SET debug_group_join_strategy = 'auto'
+SET debug_group_join_strategy = 'separate'
 
 query II
 EXPLAIN SELECT o.a, o.b, count(*), sum(p.value)
 FROM gj_auto_owner o JOIN gj_auto_probe p USING (a, b)
 GROUP BY o.a, o.b
 ----
-physical_plan	<!REGEX>:.*Hash Group Join.*
+physical_plan	<!REGEX>:.*(Hash Group Join|EXPORT_STATE).*
+
+statement ok
+SET debug_group_join_strategy = 'eager'
+
+query II
+EXPLAIN SELECT o.a, o.b, count(*), sum(p.value)
+FROM gj_auto_owner o JOIN gj_auto_probe p USING (a, b)
+GROUP BY o.a, o.b
+----
+physical_plan	<REGEX>:.*EXPORT_STATE.*
+
+statement ok
+SET debug_group_join_strategy = 'hash'
+
+query II
+EXPLAIN SELECT o.a, o.b, count(*), sum(p.value)
+FROM gj_auto_owner o JOIN gj_auto_probe p USING (a, b)
+GROUP BY o.a, o.b
+----
+physical_plan	<REGEX>:.*Hash Group Join.*
+
+foreach strategy separate eager hash
+
+statement ok
+SET debug_group_join_strategy = '{strategy}'
 
 query I
 SELECT count(*) FROM (
@@ -1441,6 +1545,61 @@ SELECT count(*) FROM (
 ) differences
 ----
 0
+
+endloop
+
+statement ok
+SET debug_group_join_strategy = 'auto'
+
+query II
+EXPLAIN SELECT o.a, o.b, count(*), sum(p.value)
+FROM gj_auto_owner o JOIN gj_auto_probe p USING (a, b)
+GROUP BY o.a, o.b
+----
+physical_plan	<REGEX>:(?s).*EXPORT_STATE.*
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM gj_auto_baseline EXCEPT ALL
+	 SELECT o.a, o.b, count(*), sum(p.value)
+	 FROM gj_auto_owner o JOIN gj_auto_probe p USING (a, b) GROUP BY o.a, o.b)
+	UNION ALL
+	(SELECT o.a, o.b, count(*), sum(p.value)
+	 FROM gj_auto_owner o JOIN gj_auto_probe p USING (a, b) GROUP BY o.a, o.b
+	 EXCEPT ALL SELECT * FROM gj_auto_baseline)
+) differences
+----
+0
+
+# AUTO distinguishes the measured narrow-key fan-out boundary: fan-out 10 retains the separate join/aggregate,
+# while fan-out 100 uses eager probe aggregation.
+statement ok
+CREATE TABLE gj_auto_narrow_owner(id BIGINT PRIMARY KEY)
+
+statement ok
+INSERT INTO gj_auto_narrow_owner SELECT i FROM range(4096) t(i)
+
+statement ok
+CREATE TABLE gj_auto_narrow_probe AS
+SELECT i // 10 AS id, i::BIGINT AS value FROM range(40960) t(i)
+
+query II
+EXPLAIN SELECT o.id, count(*), sum(p.value)
+FROM gj_auto_narrow_owner o JOIN gj_auto_narrow_probe p USING (id)
+GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*(Hash Group Join|EXPORT_STATE).*
+
+statement ok
+CREATE TABLE gj_auto_collapse_probe AS
+SELECT i // 100 AS id, i::BIGINT AS value FROM range(409600) t(i)
+
+query II
+EXPLAIN SELECT o.id, count(*), sum(p.value)
+FROM gj_auto_narrow_owner o JOIN gj_auto_collapse_probe p USING (id)
+GROUP BY o.id
+----
+physical_plan	<REGEX>:(?s).*EXPORT_STATE.*
 
 # Parallel execution and low-retention inputs retain the mature eager/separate alternatives.
 statement ok
@@ -1482,7 +1641,27 @@ SELECT CASE WHEN i % 2000 = 0 THEN 1 ELSE i + 100 END AS id, i::BIGINT AS value
 FROM range(10000) t(i)
 
 statement ok
+SET debug_group_join_strategy = 'index'
+
+query II
+EXPLAIN SELECT o.id, count(*), sum(p.value)
+FROM gj_auto_index_owner o JOIN gj_auto_index_probe p USING (id)
+GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*(Hash|Index) Group Join.*
+
+statement ok
 CREATE INDEX gj_auto_probe_art ON gj_auto_index_probe(id)
+
+query II
+EXPLAIN SELECT o.id, count(*), sum(p.value)
+FROM gj_auto_index_owner o JOIN gj_auto_index_probe p USING (id)
+GROUP BY o.id
+----
+physical_plan	<REGEX>:.*Index Group Join.*gj_auto_probe_art.*
+
+statement ok
+SET debug_group_join_strategy = 'auto'
 
 query II
 EXPLAIN SELECT o.id, count(*), sum(p.value)

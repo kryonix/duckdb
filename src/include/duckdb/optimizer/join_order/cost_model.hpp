@@ -9,14 +9,26 @@
 
 #include "duckdb/optimizer/join_order/join_node.hpp"
 #include "duckdb/optimizer/join_order/cardinality_estimator.hpp"
+#include "duckdb/execution/group_join_strategy.hpp"
 
 namespace duckdb {
 
 class QueryGraphManager;
 
+struct GroupJoinOrderCostContext {
+	unordered_set<RelationIndex> owner_relations;
+	unordered_set<RelationIndex> probe_relations;
+	idx_t key_width;
+	idx_t state_width;
+	bool routed;
+	bool direct_inner;
+	GroupJoinStrategy strategy;
+};
+
 class CostModel {
 public:
-	explicit CostModel(QueryGraphManager &query_graph_manager, CardinalityEstimator &cardinality_estimator);
+	explicit CostModel(QueryGraphManager &query_graph_manager, CardinalityEstimator &cardinality_estimator,
+	                   optional_ptr<GroupJoinOrderCostContext> group_join_context = nullptr);
 
 public:
 	//! Compute cost of a join relation set
@@ -28,6 +40,7 @@ private:
 	//! query graph storing relation manager information
 	QueryGraphManager &query_graph_manager;
 	CardinalityEstimator &cardinality_estimator;
+	optional_ptr<GroupJoinOrderCostContext> group_join_context;
 };
 
 } // namespace duckdb

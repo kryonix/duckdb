@@ -58,6 +58,16 @@ struct HashGroupJoinCostEstimate {
 	bool hash_selected = false;
 };
 
+struct HashGroupJoinOrderContext {
+	unordered_set<TableIndex> owner_tables;
+	unordered_set<TableIndex> probe_tables;
+	idx_t key_width = 0;
+	idx_t state_width = 0;
+	bool routed = false;
+	bool direct_inner = false;
+	GroupJoinStrategy strategy = GroupJoinStrategy::AUTO;
+};
+
 //! Returns whether GroupJoin planning is enabled by both the strategy setting and optimizer configuration.
 bool HashGroupJoinPlanningEnabled(ClientContext &context);
 //! Returns whether the complete forced GroupJoin planning path is enabled.
@@ -69,6 +79,12 @@ TryGetHashGroupJoinCandidate(LogicalAggregate &aggregate, LogicalComparisonJoin 
 
 HashGroupJoinCostEstimate EstimateHashGroupJoinCost(LogicalAggregate &aggregate, LogicalComparisonJoin &join,
                                                     const HashGroupJoinCandidate &candidate, ClientContext &context);
+
+HashGroupJoinCostEstimate EstimateHashGroupJoinAlternatives(idx_t owner_rows, idx_t probe_rows, idx_t match_rows,
+                                                            idx_t matched_groups, idx_t key_width, idx_t state_width,
+                                                            bool routed, bool direct_inner, ClientContext &context);
+
+optional<HashGroupJoinOrderContext> GetHashGroupJoinOrderContext(LogicalAggregate &aggregate, ClientContext &context);
 
 //! Selects a forced or cost-qualified automatic candidate and records an automatic selection on the aggregate.
 optional<HashGroupJoinCandidate>

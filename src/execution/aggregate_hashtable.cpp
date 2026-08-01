@@ -377,6 +377,122 @@ void GroupedAggregateHashTable::ReinsertTuples(PartitionedTupleData &data) {
 	}
 }
 
+void GroupedAggregateHashTable::MoveUniqueGroups(GroupedAggregateHashTable &other) {
+	D_ASSERT(Count() == 0);
+	D_ASSERT(radix_bits == other.radix_bits);
+	D_ASSERT(GetLayout().GetTypes() == other.GetLayout().GetTypes());
+	D_ASSERT(GetLayout().GetAggrWidth() == other.GetLayout().GetAggrWidth());
+	D_ASSERT(GetLayout().GetDataWidth() == other.GetLayout().GetDataWidth());
+	D_ASSERT(GetLayout().GetRowWidth() == other.GetLayout().GetRowWidth());
+	if (other.radix_bits >= UNPARTITIONED_RADIX_BITS_THRESHOLD) {
+		throw InternalException("Moving unique aggregate groups requires directly partitioned row storage");
+	}
+
+	// Keep the row and heap blocks pinned: their addresses become the immutable global lookup payload.
+	other.partitioned_data->FlushAppendState(other.state.partitioned_append_state);
+	auto other_data = std::move(other.partitioned_data);
+	other.InitializePartitionedData();
+	partitioned_data->Combine(*other_data);
+	InheritAggregateAllocators(other);
+	other.ClearPointerTable();
+	other.count = 0;
+	other.sink_count = 0;
+}
+
+void GroupedAggregateHashTable::PrepareUniqueFinalize(idx_t group_count) {
+	D_ASSERT(Count() == 0);
+	D_ASSERT(GetMaterializedCount() == group_count);
+	Resize(GetCapacityForCount(group_count));
+	count = group_count;
+	sink_count = group_count;
+}
+
+void GroupedAggregateHashTable::FinalizeUniquePartition(idx_t partition_idx, vector<data_ptr_t> &row_addresses) {
+	D_ASSERT(partition_idx < partitioned_data->PartitionCount());
+	auto &collection = *partitioned_data->GetPartitions()[partition_idx];
+	if (collection.Count() == 0) {
+		return;
+	}
+
+	vector<LogicalType> group_types;
+	vector<column_t> group_columns;
+	group_types.reserve(layout_ptr->ColumnCount() - 1);
+	group_columns.reserve(layout_ptr->ColumnCount() - 1);
+	for (idx_t group_idx = 0; group_idx + 1 < layout_ptr->ColumnCount(); group_idx++) {
+		group_types.push_back(layout_ptr->GetTypes()[group_idx]);
+		group_columns.push_back(NumericCast<column_t>(group_idx));
+	}
+	DataChunk groups;
+	groups.Initialize(Allocator::Get(context), group_types);
+	TupleDataChunkState gather_state;
+	TupleDataCollection::InitializeChunkState(gather_state, group_types);
+	RowMatcher finalize_matcher;
+	finalize_matcher.Initialize(true, *layout_ptr, predicates);
+	Vector candidate_addresses(LogicalType::POINTER);
+	auto candidate_data = FlatVector::GetDataMutable<data_ptr_t>(candidate_addresses);
+	SelectionVector compare_sel(STANDARD_VECTOR_SIZE);
+	SelectionVector no_match_sel(STANDARD_VECTOR_SIZE);
+	auto atomic_entries = reinterpret_cast<atomic<ht_entry_t> *>(entries);
+
+	row_addresses.reserve(row_addresses.size() + collection.Count());
+	TupleDataChunkIterator iterator(collection, TupleDataPinProperties::KEEP_EVERYTHING_PINNED, false);
+	do {
+		const auto chunk_count = iterator.GetCurrentChunkCount();
+		auto &locations = iterator.GetChunkState().row_locations;
+		collection.ResetCachedCastVectors(gather_state, group_columns);
+		groups.Reset();
+		collection.Gather(locations, *FlatVector::IncrementalSelectionVector(), chunk_count, group_columns, groups,
+		                  *FlatVector::IncrementalSelectionVector(), gather_state.cached_cast_vectors);
+		groups.SetChildCardinality(chunk_count);
+		TupleDataCollection::ToUnifiedFormat(gather_state, groups);
+		auto location_data = FlatVector::GetData<data_ptr_t>(locations);
+
+		for (idx_t row_idx = 0; row_idx < chunk_count; row_idx++) {
+			const auto row_location = location_data[row_idx];
+			const auto hash = Load<hash_t>(row_location + hash_offset);
+			const auto salt = ht_entry_t::ExtractSalt(hash);
+			auto ht_offset = ApplyBitMask(hash);
+			idx_t iteration_count = 0;
+			for (; iteration_count < capacity; iteration_count++) {
+				auto &atomic_entry = atomic_entries[ht_offset];
+				auto entry = atomic_entry.load(std::memory_order_acquire);
+				if (!entry.IsOccupied()) {
+					const ht_entry_t desired(salt, row_location);
+					ht_entry_t expected;
+					if (atomic_entry.compare_exchange_strong(expected, desired, std::memory_order_release,
+					                                         std::memory_order_acquire)) {
+						break;
+					}
+					entry = expected;
+				}
+				if (entry.GetSalt() == salt) {
+					candidate_data[row_idx] = entry.GetPointer();
+					FlatVector::SetSize(candidate_addresses, chunk_count);
+					compare_sel.set_index(0, row_idx);
+					idx_t no_match_count = 0;
+					auto match_count = finalize_matcher.Match(groups, gather_state.vector_data, compare_sel, 1,
+					                                          candidate_addresses, &no_match_sel, no_match_count);
+					D_ASSERT(match_count + no_match_count == 1);
+					if (match_count != 0) {
+						throw InternalException(
+						    "Unique aggregate hash-table finalization encountered a duplicate group");
+					}
+				}
+				SaltIncrementAndWrap(ht_offset, salt, bitmask);
+			}
+			if (iteration_count == capacity) {
+				throw InternalException("Maximum iteration count reached during unique aggregate finalization");
+			}
+			row_addresses.push_back(row_location);
+		}
+	} while (iterator.Next());
+}
+
+void GroupedAggregateHashTable::VerifyUniqueFinalize() {
+	D_ASSERT(Count() == GetMaterializedCount());
+	Verify();
+}
+
 idx_t GroupedAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload, AggregateType filter) {
 	unsafe_vector<idx_t> aggregate_filter;
 
@@ -1288,6 +1404,7 @@ void GroupedAggregateHashTable::Combine(TupleDataCollection &other_data, optiona
 
 void GroupedAggregateHashTable::InitializeScan(AggregateHTScanState &scan_state) {
 	scan_state.partition_idx = 0;
+	scan_state.partition_end = partitioned_data->PartitionCount();
 	scan_state.group_indexes.resize(layout_ptr->ColumnCount() - 1);
 	for (idx_t i = 0; i < scan_state.group_indexes.size(); i++) {
 		scan_state.group_indexes[i] = NumericCast<column_t>(i);
@@ -1297,8 +1414,20 @@ void GroupedAggregateHashTable::InitializeScan(AggregateHTScanState &scan_state)
 	partition->InitializeScan(scan_state.scan_states, scan_state.group_indexes);
 }
 
+void GroupedAggregateHashTable::InitializeScan(AggregateHTScanState &scan_state, idx_t partition_idx) {
+	D_ASSERT(partition_idx < partitioned_data->PartitionCount());
+	scan_state.partition_idx = partition_idx;
+	scan_state.partition_end = partition_idx + 1;
+	scan_state.group_indexes.resize(layout_ptr->ColumnCount() - 1);
+	for (idx_t i = 0; i < scan_state.group_indexes.size(); i++) {
+		scan_state.group_indexes[i] = NumericCast<column_t>(i);
+	}
+	auto &partition = partitioned_data->GetPartitions()[partition_idx];
+	partition->InitializeScan(scan_state.scan_states, scan_state.group_indexes);
+}
+
 bool GroupedAggregateHashTable::ScanGroups(AggregateHTScanState &scan_state, DataChunk &distinct_rows) {
-	if (scan_state.partition_idx >= partitioned_data->PartitionCount()) {
+	if (scan_state.partition_idx >= scan_state.partition_end) {
 		return false;
 	}
 
@@ -1308,7 +1437,7 @@ bool GroupedAggregateHashTable::ScanGroups(AggregateHTScanState &scan_state, Dat
 	if (current_partition->Scan(scan_state.scan_states, distinct_rows)) {
 		return true;
 	} else {
-		if (++(scan_state.partition_idx) >= partitioned_data->PartitionCount()) {
+		if (++(scan_state.partition_idx) >= scan_state.partition_end) {
 			return false;
 		} else {
 			auto &new_partition = partitioned_data->GetPartitions()[scan_state.partition_idx];

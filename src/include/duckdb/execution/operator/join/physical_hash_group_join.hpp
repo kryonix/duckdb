@@ -56,6 +56,7 @@ public:
 	bool single_match;
 	bool null_equal;
 	bool static_mode;
+	bool parallel_owner_build;
 	GroupJoinExecutionMode planned_execution_mode;
 	vector<LogicalType> output_group_types;
 	unique_ptr<JoinFilterPushdownInfo> filter_pushdown;
@@ -71,6 +72,7 @@ public:
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
+	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	                          OperatorSinkFinalizeInput &input) const override;
 
@@ -87,13 +89,13 @@ public:
 		return true;
 	}
 	bool ParallelSink() const override {
-		return false;
+		return parallel_owner_build;
 	}
 	bool ParallelOperator() const override {
 		return true;
 	}
 	bool ParallelSource() const override {
-		return false;
+		return true;
 	}
 	bool RequiresOperatorFinalize() const override {
 		return true;

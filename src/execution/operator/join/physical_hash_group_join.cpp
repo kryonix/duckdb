@@ -12,6 +12,9 @@
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/parallel/base_pipeline_event.hpp"
+#include "duckdb/parallel/executor_task.hpp"
+#include "duckdb/parallel/pipeline.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
@@ -22,6 +25,7 @@ namespace duckdb {
 
 static constexpr idx_t GROUP_JOIN_LOCAL_RADIX_BITS = 2;
 static constexpr idx_t GROUP_JOIN_EXTERNAL_RADIX_BITS = 4;
+static constexpr idx_t GROUP_JOIN_PARALLEL_BUILD_THRESHOLD = 1048576;
 
 struct GroupJoinIdState {
 	uint64_t value;
@@ -126,6 +130,8 @@ PhysicalHashGroupJoin::PhysicalHashGroupJoin(PhysicalPlan &physical_plan, Logica
     : PhysicalJoin(physical_plan, op, PhysicalOperatorType::HASH_GROUP_JOIN, JoinType::INNER, estimated_cardinality),
       output_groups(std::move(output_groups_p)), unmatched_policy(unmatched_policy_p), routed(routed_p),
       unique_owner(unique_owner_p), single_match(single_match_p), null_equal(false), static_mode(false),
+      parallel_owner_build(unique_owner_p && !routed_p &&
+                           owner.estimated_cardinality >= GROUP_JOIN_PARALLEL_BUILD_THRESHOLD),
       planned_execution_mode(execution_mode_p), filter_pushdown(std::move(filter_pushdown_p)) {
 	for (auto &group : op.groups) {
 		output_group_types.push_back(group->GetReturnType());
@@ -172,7 +178,7 @@ PhysicalHashGroupJoin::PhysicalHashGroupJoin(PhysicalPlan &physical_plan, Logica
     : PhysicalJoin(physical_plan, op, PhysicalOperatorType::HASH_GROUP_JOIN, JoinType::INNER, estimated_cardinality),
       output_columns(std::move(output_columns_p)), unmatched_policy(HashGroupJoinUnmatchedPolicy::EMPTY_AGGREGATE),
       routed(false), unique_owner(false), single_match(false), null_equal(true), static_mode(true),
-      planned_execution_mode(GroupJoinExecutionMode::AUTO) {
+      parallel_owner_build(false), planned_execution_mode(GroupJoinExecutionMode::AUTO) {
 	for (auto &group : groups) {
 		output_group_types.push_back(group->GetReturnType());
 		output_group_names.push_back(group->GetName().GetIdentifierName());
@@ -213,10 +219,11 @@ static bool UseExternalHashGroupJoin(const PhysicalHashGroupJoin &op, ClientCont
 class HashGroupJoinGlobalSinkState : public GlobalSinkState {
 public:
 	HashGroupJoinGlobalSinkState(const PhysicalHashGroupJoin &op, ClientContext &context)
-	    : external(UseExternalHashGroupJoin(op, context)) {
+	    : external(UseExternalHashGroupJoin(op, context)),
+	      parallel_build(!external && op.parallel_owner_build &&
+	                     TaskScheduler::GetScheduler(context).NumberOfThreads() > 1) {
 		if (op.filter_pushdown) {
 			global_filter_state = op.filter_pushdown->GetGlobalState(context, op);
-			local_filter_state = op.filter_pushdown->GetLocalState(*global_filter_state);
 			const auto owner_rows = op.children[1].get().estimated_cardinality;
 			const auto probe_rows = op.children[0].get().estimated_cardinality;
 			if (op.filter_pushdown->join_condition.size() == 1 && owner_rows <= probe_rows) {
@@ -229,8 +236,6 @@ public:
 			owner_partitions =
 			    make_uniq<RadixPartitionedColumnData>(context, std::move(owner_types), GROUP_JOIN_EXTERNAL_RADIX_BITS,
 			                                          op.children[1].get().GetTypes().size());
-			owner_local_partitions = owner_partitions->CreateShared();
-			owner_local_partitions->InitializeAppendState(owner_partition_append);
 			return;
 		}
 		if (op.static_mode) {
@@ -252,7 +257,7 @@ public:
 			hash_table = make_uniq<GroupedAggregateHashTable>(
 			    context, BufferAllocator::Get(context), op.grouped_aggregate_data.group_types,
 			    CreateGlobalGroupJoinPayloadTypes(op), CreateGlobalGroupJoinAggregates(op),
-			    GroupedAggregateHashTable::InitialCapacity(), idx_t(0),
+			    GroupedAggregateHashTable::InitialCapacity(), parallel_build ? GROUP_JOIN_LOCAL_RADIX_BITS : idx_t(0),
 			    op.null_equal ? TupleDataValidityType::CAN_HAVE_NULL_VALUES
 			                  : TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 		}
@@ -268,16 +273,17 @@ public:
 	unique_ptr<atomic<idx_t>[]> owners;
 	unique_ptr<ColumnDataCollection> static_owner_rows;
 	unique_ptr<JoinFilterGlobalState> global_filter_state;
-	unique_ptr<JoinFilterLocalState> local_filter_state;
 	vector<unique_ptr<BloomFilter>> bloom_filters;
 	vector<unique_ptr<PrefixRangeFilter>> prefix_range_filters;
 	unique_ptr<ColumnDataCollection> filter_keys;
 	bool external;
+	bool parallel_build;
+	mutex lock;
+	vector<unique_ptr<GroupedAggregateHashTable>> local_hash_tables;
 	unique_ptr<RadixPartitionedColumnData> owner_partitions;
-	unique_ptr<PartitionedColumnData> owner_local_partitions;
-	PartitionedColumnDataAppendState owner_partition_append;
 	bool build_finalized = false;
 	idx_t owner_rows = 0;
+	atomic<idx_t> next_group_id {0};
 	atomic<idx_t> probe_rows {0};
 	atomic<idx_t> matched_rows {0};
 };
@@ -303,10 +309,26 @@ public:
 		owner_keys.InitializeEmpty(op.grouped_aggregate_data.group_types);
 		owner_payload.InitializeEmpty(op.owner_payload_data.payload_types);
 		final_groups.InitializeEmpty(op.output_group_types);
+		if (op.filter_pushdown) {
+			local_filter_state = op.filter_pushdown->GetLocalState(*sink.global_filter_state);
+			if (sink.filter_keys) {
+				filter_keys = make_uniq<ColumnDataCollection>(context.client, op.grouped_aggregate_data.group_types);
+			}
+		}
 		if (sink.external) {
 			auto partition_types = op.children[1].get().GetTypes();
 			partition_types.push_back(LogicalType::HASH);
 			partition_chunk.InitializeEmpty(partition_types);
+			owner_partitions = sink.owner_partitions->CreateShared();
+			owner_partitions->InitializeAppendState(owner_partition_append);
+		} else if (sink.parallel_build) {
+			hash_table = make_uniq<GroupedAggregateHashTable>(
+			    context.client, BufferAllocator::Get(context.client), op.grouped_aggregate_data.group_types,
+			    CreateGlobalGroupJoinPayloadTypes(op), CreateGlobalGroupJoinAggregates(op),
+			    GroupedAggregateHashTable::InitialCapacity(), GROUP_JOIN_LOCAL_RADIX_BITS,
+			    op.null_equal ? TupleDataValidityType::CAN_HAVE_NULL_VALUES
+			                  : TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
+			update_state = make_uniq<AggregateHTUpdateState>(*hash_table);
 		} else {
 			update_state = make_uniq<AggregateHTUpdateState>(*sink.hash_table);
 		}
@@ -326,8 +348,14 @@ public:
 	Vector final_addresses;
 	SelectionVector final_new_groups;
 	unique_ptr<AggregateHTUpdateState> update_state;
+	unique_ptr<GroupedAggregateHashTable> hash_table;
+	unique_ptr<JoinFilterLocalState> local_filter_state;
+	unique_ptr<ColumnDataCollection> filter_keys;
 	Vector hashes;
 	DataChunk partition_chunk;
+	unique_ptr<PartitionedColumnData> owner_partitions;
+	PartitionedColumnDataAppendState owner_partition_append;
+	idx_t owner_rows = 0;
 };
 
 unique_ptr<LocalSinkState> PhysicalHashGroupJoin::GetLocalSinkState(ExecutionContext &context) const {
@@ -348,10 +376,10 @@ SinkResultType PhysicalHashGroupJoin::Sink(ExecutionContext &context, DataChunk 
 	}
 	local_state.owner_keys.CheckCardinality(chunk.size());
 	if (filter_pushdown) {
-		D_ASSERT(global_state.local_filter_state);
-		filter_pushdown->Sink(local_state.owner_keys, *global_state.local_filter_state);
-		if (global_state.filter_keys) {
-			global_state.filter_keys->Append(local_state.owner_keys);
+		D_ASSERT(local_state.local_filter_state);
+		filter_pushdown->Sink(local_state.owner_keys, *local_state.local_filter_state);
+		if (local_state.filter_keys) {
+			local_state.filter_keys->Append(local_state.owner_keys);
 		}
 	}
 	if (unique_owner && !null_equal && PhysicalJoin::HasNullValues(local_state.owner_keys)) {
@@ -365,24 +393,30 @@ SinkResultType PhysicalHashGroupJoin::Sink(ExecutionContext &context, DataChunk 
 		}
 		local_state.partition_chunk.data.back().Reference(local_state.hashes);
 		local_state.partition_chunk.SetChildCardinality(chunk.size());
-		global_state.owner_local_partitions->Append(global_state.owner_partition_append, local_state.partition_chunk);
-		global_state.owner_rows += chunk.size();
+		local_state.owner_partitions->Append(local_state.owner_partition_append, local_state.partition_chunk);
+		local_state.owner_rows += chunk.size();
 		return SinkResultType::NEED_MORE_INPUT;
 	}
-	const auto new_group_count = global_state.hash_table->FindOrCreateGroups(
-	    local_state.owner_keys, local_state.addresses, local_state.new_groups);
+	auto &build_table = local_state.hash_table ? *local_state.hash_table : *global_state.hash_table;
+	const auto new_group_count =
+	    build_table.FindOrCreateGroups(local_state.owner_keys, local_state.addresses, local_state.new_groups);
 	if (unique_owner && new_group_count != chunk.size()) {
 		throw InternalException("HASH_GROUP_JOIN owner key uniqueness proof was violated at execution time");
 	}
 	auto addresses = FlatVector::GetData<data_ptr_t>(local_state.addresses);
-	auto &layout = global_state.hash_table->GetLayout();
+	auto &layout = build_table.GetLayout();
+	const auto group_id_begin = global_state.parallel_build
+	                                ? global_state.next_group_id.fetch_add(new_group_count, std::memory_order_relaxed)
+	                                : idx_t(0);
 	for (idx_t new_idx = 0; new_idx < new_group_count; new_idx++) {
 		auto row_idx = local_state.new_groups.get_index_unsafe(new_idx);
-		const auto group_id = routed ? global_state.route_build_groups.size() : global_state.group_addresses.size();
+		const auto group_id = global_state.parallel_build ? group_id_begin + new_idx
+		                      : routed                    ? global_state.route_build_groups.size()
+		                                                  : global_state.group_addresses.size();
 		StoreGroupJoinId(layout, addresses[row_idx], group_id);
 		if (routed) {
 			global_state.route_build_groups.emplace_back();
-		} else {
+		} else if (!global_state.parallel_build) {
 			global_state.group_addresses.push_back(addresses[row_idx]);
 		}
 	}
@@ -438,12 +472,35 @@ SinkResultType PhysicalHashGroupJoin::Sink(ExecutionContext &context, DataChunk 
 			local_state.owner_payload.data[payload_idx].Reference(chunk.data[key_count + payload_idx]);
 		}
 		local_state.owner_payload.CheckCardinality(chunk.size());
-		global_state.hash_table->UpdateAggregatesAtAddressesRange(*local_state.update_state, local_state.addresses,
-		                                                          local_state.owner_payload, 1,
-		                                                          owner_payload_data.aggregates.size());
+		build_table.UpdateAggregatesAtAddressesRange(*local_state.update_state, local_state.addresses,
+		                                             local_state.owner_payload, 1,
+		                                             owner_payload_data.aggregates.size());
 	}
-	global_state.owner_rows += chunk.size();
+	local_state.owner_rows += chunk.size();
 	return SinkResultType::NEED_MORE_INPUT;
+}
+
+SinkCombineResultType PhysicalHashGroupJoin::Combine(ExecutionContext &, OperatorSinkCombineInput &input) const {
+	auto &global_state = input.global_state.Cast<HashGroupJoinGlobalSinkState>();
+	auto &local_state = input.local_state.Cast<HashGroupJoinLocalSinkState>();
+	lock_guard<mutex> guard(global_state.lock);
+	if (filter_pushdown) {
+		D_ASSERT(global_state.global_filter_state && local_state.local_filter_state);
+		filter_pushdown->Combine(*global_state.global_filter_state, *local_state.local_filter_state);
+		if (local_state.filter_keys) {
+			D_ASSERT(global_state.filter_keys);
+			global_state.filter_keys->Combine(*local_state.filter_keys);
+		}
+	}
+	if (global_state.external) {
+		local_state.owner_partitions->FlushAppendState(local_state.owner_partition_append);
+		global_state.owner_partitions->Combine(*local_state.owner_partitions);
+		local_state.owner_partitions.reset();
+	} else if (local_state.hash_table) {
+		global_state.local_hash_tables.push_back(std::move(local_state.hash_table));
+	}
+	global_state.owner_rows += local_state.owner_rows;
+	return SinkCombineResultType::FINISHED;
 }
 
 static void BuildGroupJoinRuntimeFilters(const PhysicalHashGroupJoin &op, ClientContext &context,
@@ -515,13 +572,88 @@ static void BuildGroupJoinRuntimeFilters(const PhysicalHashGroupJoin &op, Client
 	state.filter_keys.reset();
 }
 
+class HashGroupJoinBuildFinalizeTask : public ExecutorTask {
+public:
+	HashGroupJoinBuildFinalizeTask(shared_ptr<Event> event_p, ClientContext &context, const PhysicalHashGroupJoin &op_p,
+	                               HashGroupJoinGlobalSinkState &sink_p, idx_t partition_idx_p)
+	    : ExecutorTask(context, std::move(event_p), op_p), sink(sink_p), partition_idx(partition_idx_p) {
+	}
+
+	TaskExecutionResult ExecuteTask(TaskExecutionMode) override {
+		vector<data_ptr_t> addresses;
+		sink.hash_table->FinalizeUniquePartition(partition_idx, addresses);
+		for (auto address : addresses) {
+			auto group_id = LoadGroupJoinId(sink.hash_table->GetLayout(), address);
+			if (group_id >= sink.group_addresses.size()) {
+				throw InternalException("HASH_GROUP_JOIN parallel build identifier is out of range");
+			}
+			D_ASSERT(sink.group_addresses[group_id] == nullptr);
+			sink.group_addresses[group_id] = address;
+		}
+		event->FinishTask();
+		return TaskExecutionResult::TASK_FINISHED;
+	}
+
+	string TaskType() const override {
+		return "HashGroupJoinBuildFinalizeTask";
+	}
+
+private:
+	HashGroupJoinGlobalSinkState &sink;
+	idx_t partition_idx;
+};
+
+class HashGroupJoinBuildFinalizeEvent : public BasePipelineEvent {
+public:
+	HashGroupJoinBuildFinalizeEvent(Pipeline &pipeline_p, const PhysicalHashGroupJoin &op_p,
+	                                HashGroupJoinGlobalSinkState &sink_p)
+	    : BasePipelineEvent(pipeline_p), op(op_p), sink(sink_p) {
+	}
+
+	void Schedule() override {
+		vector<shared_ptr<Task>> tasks;
+		auto partition_count = sink.hash_table->GetPartitionedData().PartitionCount();
+		tasks.reserve(partition_count);
+		auto &context = pipeline->GetClientContext();
+		for (idx_t partition_idx = 0; partition_idx < partition_count; partition_idx++) {
+			tasks.push_back(
+			    make_uniq<HashGroupJoinBuildFinalizeTask>(shared_from_this(), context, op, sink, partition_idx));
+		}
+		SetTasks(std::move(tasks));
+	}
+
+	void FinishEvent() override {
+		sink.hash_table->VerifyUniqueFinalize();
+		for (auto address : sink.group_addresses) {
+			if (!address) {
+				throw InternalException("HASH_GROUP_JOIN parallel build did not publish every owner group");
+			}
+		}
+	}
+
+private:
+	const PhysicalHashGroupJoin &op;
+	HashGroupJoinGlobalSinkState &sink;
+};
+
 SinkFinalizeType PhysicalHashGroupJoin::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                                  OperatorSinkFinalizeInput &input) const {
 	auto &state = input.global_state.Cast<HashGroupJoinGlobalSinkState>();
 	state.build_finalized = true;
+	if (state.parallel_build) {
+		const auto group_count = state.next_group_id.load(std::memory_order_relaxed);
+		if (group_count != state.owner_rows) {
+			throw InternalException("HASH_GROUP_JOIN parallel owner build lost a unique owner row");
+		}
+		for (auto &local_table : state.local_hash_tables) {
+			state.hash_table->MoveUniqueGroups(*local_table);
+		}
+		state.local_hash_tables.clear();
+		state.hash_table->PrepareUniqueFinalize(group_count);
+		state.group_addresses.resize(group_count, nullptr);
+	}
 	if (filter_pushdown) {
-		D_ASSERT(state.global_filter_state && state.local_filter_state);
-		filter_pushdown->Combine(*state.global_filter_state, *state.local_filter_state);
+		D_ASSERT(state.global_filter_state);
 		vector<string> key_names;
 		for (auto &group : grouped_aggregate_data.groups) {
 			key_names.push_back(group->GetName().GetIdentifierName());
@@ -533,9 +665,6 @@ SinkFinalizeType PhysicalHashGroupJoin::Finalize(Pipeline &pipeline, Event &even
 		                                          std::move(final_min_max));
 	}
 	if (state.external) {
-		state.owner_local_partitions->FlushAppendState(state.owner_partition_append);
-		state.owner_partitions->Combine(*state.owner_local_partitions);
-		state.owner_local_partitions.reset();
 		return state.owner_rows == 0 ? SinkFinalizeType::NO_OUTPUT_POSSIBLE : SinkFinalizeType::READY;
 	}
 	if (routed) {
@@ -549,7 +678,7 @@ SinkFinalizeType PhysicalHashGroupJoin::Finalize(Pipeline &pipeline, Event &even
 		state.route_offsets.push_back(state.route_group_ids.size());
 		state.route_build_groups.clear();
 		D_ASSERT(state.group_addresses.size() == state.final_hash_table->Count());
-	} else {
+	} else if (!state.parallel_build) {
 		D_ASSERT(state.group_addresses.size() == state.hash_table->Count());
 	}
 	state.owners = unique_ptr<atomic<idx_t>[]>(new atomic<idx_t>[state.group_addresses.size()]);
@@ -561,6 +690,9 @@ SinkFinalizeType PhysicalHashGroupJoin::Finalize(Pipeline &pipeline, Event &even
 		for (idx_t owner_id = 0; owner_id < state.route_group_ids.size(); owner_id++) {
 			state.route_matches[owner_id].store(false, std::memory_order_relaxed);
 		}
+	}
+	if (state.parallel_build && state.hash_table->Count() != 0) {
+		event.InsertEvent(make_shared_ptr<HashGroupJoinBuildFinalizeEvent>(pipeline, *this, state));
 	}
 	return state.hash_table->Count() == 0 ? SinkFinalizeType::NO_OUTPUT_POSSIBLE : SinkFinalizeType::READY;
 }
@@ -2184,11 +2316,23 @@ public:
 			static_results = make_uniq<StaticHashGroupJoinResults>(op, context, *sink.hash_table, sink.group_addresses);
 			sink.static_owner_rows->InitializeScan(static_owner_scan);
 		} else {
-			GetHashGroupJoinTarget(sink).InitializeScan(scan_state);
+			auto &target = GetHashGroupJoinTarget(sink);
+			partition_count = target.GetPartitionedData().PartitionCount();
+			parallel_scan = partition_count > 1;
+			if (!parallel_scan) {
+				target.InitializeScan(scan_state);
+			}
 		}
 	}
 
+	idx_t MaxThreads() override {
+		return parallel_scan ? partition_count : 1;
+	}
+
 	AggregateHTScanState scan_state;
+	atomic<idx_t> next_partition {0};
+	idx_t partition_count = 0;
+	bool parallel_scan = false;
 	ColumnDataScanState static_owner_scan;
 	unique_ptr<StaticHashGroupJoinResults> static_results;
 	unique_ptr<ColumnDataCollection> external_output;
@@ -2215,6 +2359,8 @@ public:
 	Vector row_addresses;
 	Vector matched_addresses;
 	SelectionVector matched_sel;
+	AggregateHTScanState scan_state;
+	bool partition_assigned = false;
 	ArenaAllocator arena;
 	RowOperationsState row_state;
 };
@@ -2290,7 +2436,23 @@ SourceResultType PhysicalHashGroupJoin::GetDataInternal(ExecutionContext &contex
 		return SourceResultType::FINISHED;
 	}
 
-	while (target.ScanGroupsAndAddresses(gstate.scan_state, state.groups, state.row_addresses)) {
+	while (true) {
+		if (gstate.parallel_scan && !state.partition_assigned) {
+			auto partition_idx = gstate.next_partition.fetch_add(1, std::memory_order_relaxed);
+			if (partition_idx >= gstate.partition_count) {
+				return SourceResultType::FINISHED;
+			}
+			target.InitializeScan(state.scan_state, partition_idx);
+			state.partition_assigned = true;
+		}
+		auto &scan_state = gstate.parallel_scan ? state.scan_state : gstate.scan_state;
+		if (!target.ScanGroupsAndAddresses(scan_state, state.groups, state.row_addresses)) {
+			if (!gstate.parallel_scan) {
+				return SourceResultType::FINISHED;
+			}
+			state.partition_assigned = false;
+			continue;
+		}
 		if (state.groups.size() == 0) {
 			continue;
 		}
@@ -2336,7 +2498,6 @@ SourceResultType PhysicalHashGroupJoin::GetDataInternal(ExecutionContext &contex
 		                                   aggregate_offset + 1, user_aggregate_count);
 		return SourceResultType::HAVE_MORE_OUTPUT;
 	}
-	return SourceResultType::FINISHED;
 }
 
 string PhysicalHashGroupJoin::GetName() const {
@@ -2360,6 +2521,7 @@ InsertionOrderPreservingMap<string> PhysicalHashGroupJoin::ParamsToString() cons
 		break;
 	}
 	result["Build Side"] = "OWNER";
+	result["Owner Build"] = parallel_owner_build ? "PARALLEL" : "SERIAL";
 	string groups;
 	for (idx_t group_idx = 0; group_idx < output_group_names.size(); group_idx++) {
 		if (group_idx > 0) {

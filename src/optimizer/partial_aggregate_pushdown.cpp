@@ -335,7 +335,8 @@ static bool JoinPreservesAggregateSide(const LogicalComparisonJoin &join, const 
 	}
 }
 
-static bool AnalyzePushdown(LogicalAggregate &aggr, LogicalComparisonJoin &join, PartialAggregatePushdownInfo &info) {
+static bool AnalyzePushdown(LogicalAggregate &aggr, LogicalComparisonJoin &join, PartialAggregatePushdownInfo &info,
+                            bool force) {
 	LogicalJoin::GetTableReferences(*join.children[0], info.side_bindings[0]);
 	LogicalJoin::GetTableReferences(*join.children[1], info.side_bindings[1]);
 	if (!FindAggregateSide(aggr, info)) {
@@ -350,7 +351,7 @@ static bool AnalyzePushdown(LogicalAggregate &aggr, LogicalComparisonJoin &join,
 	if (info.side_bindings[info.dimension_side].empty()) {
 		return false;
 	}
-	if (!PassesCardinalityHeuristic(join, info)) {
+	if (!force && !PassesCardinalityHeuristic(join, info)) {
 		return false;
 	}
 	if (!ValidateJoinConditions(join, info)) {
@@ -593,7 +594,7 @@ struct DoubleEagerHeuristics {
 	static constexpr idx_t MIN_COLLAPSE = 2;
 };
 
-static bool DEEstimateCollapse(const LogicalComparisonJoin &join, idx_t &effective_ndv) {
+static bool DEEstimateCollapse(const LogicalComparisonJoin &join, idx_t &effective_ndv, bool force) {
 	if (!join.has_estimated_cardinality || !join.children[0]->has_estimated_cardinality ||
 	    !join.children[1]->has_estimated_cardinality) {
 		return false;
@@ -604,8 +605,8 @@ static bool DEEstimateCollapse(const LogicalComparisonJoin &join, idx_t &effecti
 	double ndv = MaxValue<double>(1.0, (c0 * c1) / cj);
 	ndv = MinValue<double>(ndv, MinValue<double>(c0, c1));
 	effective_ndv = MaxValue<idx_t>(static_cast<idx_t>(ndv), 1);
-	return c0 >= static_cast<double>(DoubleEagerHeuristics::MIN_COLLAPSE) * ndv &&
-	       c1 >= static_cast<double>(DoubleEagerHeuristics::MIN_COLLAPSE) * ndv;
+	return force || (c0 >= static_cast<double>(DoubleEagerHeuristics::MIN_COLLAPSE) * ndv &&
+	                 c1 >= static_cast<double>(DoubleEagerHeuristics::MIN_COLLAPSE) * ndv);
 }
 
 static bool DECanRepeatAggregateState(const BoundAggregateExpression &aggr) {
@@ -811,7 +812,7 @@ static unique_ptr<LogicalAggregate> DECreateUpperAggregate(Optimizer &optimizer,
 	return upper_aggr;
 }
 
-bool PartialAggregatePushdown::TryDoubleEagerPushdown(unique_ptr<LogicalOperator> &op) {
+bool PartialAggregatePushdown::TryDoubleEagerPushdown(unique_ptr<LogicalOperator> &op, bool force) {
 	LogicalAggregate *aggr_ptr;
 	LogicalComparisonJoin *join_ptr;
 	if (!GetPushdownOperators(*op, aggr_ptr, join_ptr)) {
@@ -827,7 +828,7 @@ bool PartialAggregatePushdown::TryDoubleEagerPushdown(unique_ptr<LogicalOperator
 	}
 
 	idx_t effective_ndv;
-	if (!DEEstimateCollapse(join, effective_ndv)) {
+	if (!DEEstimateCollapse(join, effective_ndv, force)) {
 		return false;
 	}
 
@@ -956,6 +957,7 @@ void PartialAggregatePushdown::VisitOperator(unique_ptr<LogicalOperator> &op) {
 	}
 	LogicalOperatorVisitor::VisitOperator(op);
 	FuseInterveningProjections(*op);
+	bool force_eager = false;
 	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && op->children.size() == 1 &&
 	    op->children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto &aggregate = op->Cast<LogicalAggregate>();
@@ -964,8 +966,26 @@ void PartialAggregatePushdown::VisitOperator(unique_ptr<LogicalOperator> &op) {
 		                                    HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER)) {
 			return;
 		}
+		auto candidate = TryGetHashGroupJoinCandidate(aggregate, join, optimizer.context,
+		                                              HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER);
+		if (candidate) {
+			auto strategy = Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context);
+			if (strategy == GroupJoinStrategy::SEPARATE || strategy == GroupJoinStrategy::HASH ||
+			    strategy == GroupJoinStrategy::INDEX) {
+				return;
+			}
+			force_eager = strategy == GroupJoinStrategy::EAGER;
+			if (strategy == GroupJoinStrategy::AUTO) {
+				auto cost = EstimateHashGroupJoinCost(aggregate, join, *candidate, optimizer.context);
+				if (cost.separate_cost != 0 && cost.eager_cost > cost.separate_cost) {
+					return;
+				}
+			}
+		}
 	}
-	if (TryDoubleEagerPushdown(op) || TryPushdownAggregate(op)) {
+	const auto rewritten = force_eager ? TryPushdownAggregate(op, true) || TryDoubleEagerPushdown(op, true)
+	                                   : TryDoubleEagerPushdown(op, false) || TryPushdownAggregate(op, false);
+	if (rewritten) {
 		// Revisit rewritten subtrees so nested aggregate-over-join shapes can be pushed too.
 		LogicalOperatorVisitor::VisitOperator(op);
 	}
@@ -980,7 +1000,7 @@ unique_ptr<Expression> PartialAggregatePushdown::VisitReplace(BoundColumnRefExpr
 	return nullptr;
 }
 
-bool PartialAggregatePushdown::TryPushdownAggregate(unique_ptr<LogicalOperator> &op) {
+bool PartialAggregatePushdown::TryPushdownAggregate(unique_ptr<LogicalOperator> &op, bool force) {
 	LogicalAggregate *aggr;
 	LogicalComparisonJoin *join;
 	if (!GetPushdownOperators(*op, aggr, join)) {
@@ -988,7 +1008,7 @@ bool PartialAggregatePushdown::TryPushdownAggregate(unique_ptr<LogicalOperator> 
 	}
 
 	PartialAggregatePushdownInfo info;
-	if (!AnalyzePushdown(*aggr, *join, info)) {
+	if (!AnalyzePushdown(*aggr, *join, info, force)) {
 		return false;
 	}
 	info.lower_group_index = optimizer.binder.GenerateTableIndex();
