@@ -196,6 +196,14 @@ void StorageManager::SetWALSize(idx_t size) {
 	wal_size = size;
 }
 
+void StorageManager::MarkStatisticsChanged() {
+	statistics_version++;
+}
+
+bool StorageManager::HasUncheckpointedStatistics() const {
+	return statistics_version.load() != checkpointed_statistics_version.load();
+}
+
 idx_t StorageManager::GetWALEntriesCount() const {
 	return wal_entries_count;
 }
@@ -754,9 +762,11 @@ void SingleFileStorageManager::CreateCheckpoint(QueryContext context, Checkpoint
 	}
 
 	auto &config = DBConfig::Get(db);
-	// We only need to checkpoint if there is anything in the WAL.
+	// Statistics are not written to the WAL, but a clean checkpoint must still persist them.
 	auto wal_size = GetWALSize();
-	if (wal_size > 0 || config.options.force_checkpoint || options.action == CheckpointAction::ALWAYS_CHECKPOINT) {
+	auto statistics_version_before_checkpoint = statistics_version.load();
+	if (wal_size > 0 || HasUncheckpointedStatistics() || config.options.force_checkpoint ||
+	    options.action == CheckpointAction::ALWAYS_CHECKPOINT) {
 		try {
 			// Start timing the checkpoint.
 			auto client_context = context.GetClientContext();
@@ -768,6 +778,7 @@ void SingleFileStorageManager::CreateCheckpoint(QueryContext context, Checkpoint
 			// Write the checkpoint.
 			auto checkpointer = CreateCheckpointWriter(context, options);
 			checkpointer->CreateCheckpoint();
+			checkpointed_statistics_version = statistics_version_before_checkpoint;
 			timer.EndTimer();
 
 		} catch (std::exception &ex) {

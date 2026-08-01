@@ -77,6 +77,9 @@ public:
 	bool HasWAL() const;
 	void AddWALSize(idx_t size);
 	void SetWALSize(idx_t size);
+	//! Mark optimizer statistics that need to be included in the next checkpoint.
+	void MarkStatisticsChanged();
+	bool HasUncheckpointedStatistics() const;
 	//! Gets the number of WAL entries since last checkpoint
 	idx_t GetWALEntriesCount() const;
 	void ResetWALEntriesCount();
@@ -184,6 +187,9 @@ protected:
 	//! WAL.
 	atomic<idx_t> wal_size;
 	atomic<idx_t> wal_entries_count;
+	//! Statistics are not WAL-logged, but should survive clean checkpoints and shutdowns.
+	atomic<idx_t> statistics_version {0};
+	atomic<idx_t> checkpointed_statistics_version {0};
 	//! Storage options passed in through configuration
 	StorageOptions storage_options;
 	//! Header prefetched during file-type detection, consumed by LoadDatabase. Empty unless a DuckDB file via ATTACH.

@@ -42,6 +42,8 @@ public:
 	void MergeStats(idx_t i, BaseStatistics &stats);
 	void MergeStats(TableStatisticsLock &lock, idx_t i, BaseStatistics &stats,
 	                StatsMergeType merge_type = StatsMergeType::MERGE_STATS);
+	void ClearNumericMoments();
+	void ClearNumericMoments(idx_t i);
 
 	void SetStats(TableStatistics &other);
 	void CopyStats(TableStatistics &other);

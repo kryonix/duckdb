@@ -43,6 +43,9 @@ void TableStatistics::InitializeEmpty(const TableStatistics &other) {
 		if (stats->HasDistinctStats()) {
 			new_column_stats->SetDistinct(stats->DistinctStats().Copy());
 		}
+		if (stats->HasNumericMoments()) {
+			new_column_stats->SetNumericMoments(stats->GetNumericMoments().Copy());
+		}
 
 		auto &base_stats = new_column_stats->Statistics();
 		if (new_column_stats->HasDistinctStats()) {
@@ -170,6 +173,18 @@ void TableStatistics::MergeStats(TableStatisticsLock &lock, idx_t i, BaseStatist
 	column_stats[i]->Statistics().Merge(stats, merge_type);
 }
 
+void TableStatistics::ClearNumericMoments() {
+	auto lock = GetLock();
+	for (auto &stats : column_stats) {
+		stats->ClearNumericMoments();
+	}
+}
+
+void TableStatistics::ClearNumericMoments(idx_t i) {
+	auto lock = GetLock();
+	column_stats[i]->ClearNumericMoments();
+}
+
 ColumnStatistics &TableStatistics::GetStats(TableStatisticsLock &lock, idx_t i) {
 	return *column_stats[i];
 }
@@ -207,6 +222,9 @@ unique_ptr<BaseStatistics> TableStatistics::CopyStats(const StorageIndex &index)
 	auto result = stats.Statistics().Copy();
 	if (stats.HasDistinctStats()) {
 		result.SetDistinctCount(stats.DistinctStats().GetCount());
+	}
+	if (stats.HasNumericMoments()) {
+		result.SetNumericMoments(stats.GetNumericMoments().Copy());
 	}
 	if (index.IsPushdownExtract()) {
 		return result.PushdownExtract(index.GetChildIndexes()[0]);

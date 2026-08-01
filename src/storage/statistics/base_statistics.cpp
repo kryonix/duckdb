@@ -56,6 +56,7 @@ BaseStatistics::BaseStatistics(BaseStatistics &&other) noexcept {
 	stats_union = other.stats_union;
 	std::swap(extra_data, other.extra_data);
 	std::swap(child_stats, other.child_stats);
+	std::swap(numeric_moments, other.numeric_moments);
 }
 
 BaseStatistics &BaseStatistics::operator=(BaseStatistics &&other) noexcept {
@@ -66,6 +67,7 @@ BaseStatistics &BaseStatistics::operator=(BaseStatistics &&other) noexcept {
 	stats_union = other.stats_union;
 	std::swap(extra_data, other.extra_data);
 	std::swap(child_stats, other.child_stats);
+	std::swap(numeric_moments, other.numeric_moments);
 	return *this;
 }
 
@@ -178,6 +180,11 @@ void BaseStatistics::Merge(const BaseStatistics &other, StatsMergeType merge_typ
 		break;
 	default:
 		break;
+	}
+	if (numeric_moments && other.numeric_moments) {
+		numeric_moments->Merge(*other.numeric_moments);
+	} else {
+		numeric_moments.reset();
 	}
 }
 
@@ -302,6 +309,7 @@ void BaseStatistics::CopyBase(const BaseStatistics &other) {
 	has_null = other.has_null;
 	has_no_null = other.has_no_null;
 	distinct_count = other.distinct_count;
+	numeric_moments = other.numeric_moments ? other.numeric_moments->Copy() : nullptr;
 }
 
 void BaseStatistics::Set(StatsInfo info) {
@@ -365,6 +373,25 @@ void BaseStatistics::CopyValidity(const BaseStatistics &stats) {
 
 void BaseStatistics::SetDistinctCount(idx_t count) {
 	this->distinct_count = count;
+}
+
+bool BaseStatistics::HasNumericMoments() const {
+	return numeric_moments != nullptr;
+}
+
+const NumericMoments &BaseStatistics::GetNumericMoments() const {
+	if (!numeric_moments) {
+		throw InternalException("GetNumericMoments called without numeric moments");
+	}
+	return *numeric_moments;
+}
+
+void BaseStatistics::SetNumericMoments(unique_ptr<NumericMoments> moments) {
+	numeric_moments = std::move(moments);
+}
+
+void BaseStatistics::ClearNumericMoments() {
+	numeric_moments.reset();
 }
 
 void BaseStatistics::Serialize(Serializer &serializer) const {
@@ -477,6 +504,9 @@ Value BaseStatistics::ToStruct() const {
 	children.emplace_back("has_no_null", Value::BOOLEAN(has_no_null));
 	if (distinct_count > 0) {
 		children.emplace_back("approx_unique", Value::UBIGINT(distinct_count));
+	}
+	if (numeric_moments) {
+		children.emplace_back("numeric_moments", numeric_moments->ToStruct());
 	}
 	return Value::STRUCT(std::move(children));
 }

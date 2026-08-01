@@ -14,6 +14,7 @@
 #include "duckdb/storage/storage_index.hpp"
 
 #include "duckdb/storage/statistics/numeric_stats.hpp"
+#include "duckdb/storage/statistics/numeric_moments.hpp"
 #include "duckdb/storage/statistics/string_stats.hpp"
 #include "duckdb/storage/statistics/geometry_stats.hpp"
 #include "duckdb/storage/statistics/variant_stats.hpp"
@@ -95,6 +96,10 @@ public:
 	DUCKDB_API bool CanHaveNoNull() const;
 
 	void SetDistinctCount(idx_t distinct_count);
+	bool HasNumericMoments() const;
+	const NumericMoments &GetNumericMoments() const;
+	void SetNumericMoments(unique_ptr<NumericMoments> moments);
+	void ClearNumericMoments();
 
 	bool IsConstant() const;
 
@@ -185,6 +190,8 @@ private:
 	unique_ptr<ExtraStatsData> extra_data;
 	//! Child stats (for LIST and STRUCT)
 	unsafe_unique_array<BaseStatistics> child_stats;
+	//! Optimizer-only numeric distribution metadata
+	unique_ptr<NumericMoments> numeric_moments;
 };
 
 template <>

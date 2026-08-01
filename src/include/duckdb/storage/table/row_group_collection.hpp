@@ -190,6 +190,9 @@ public:
 	unique_ptr<BaseStatistics> CopyStats(const StorageIndex &column_id);
 	unique_ptr<BlockingSample> GetSample();
 	void SetDistinct(column_t column_id, unique_ptr<DistinctStatistics> distinct_stats);
+	void SetNumericMoments(column_t column_id, unique_ptr<NumericMoments> numeric_moments);
+	void ClearNumericMoments();
+	void ClearNumericMoments(column_t column_id);
 
 	AttachedDatabase &GetAttached() const;
 	DatabaseInstance &GetDatabase() const;
@@ -250,6 +253,10 @@ private:
 	MetaBlockPointer metadata_pointer;
 	//! Other metadata pointers
 	vector<MetaBlockPointer> metadata_pointers;
+	//! Tracks table statistics changed independently of row-group data
+	atomic<idx_t> statistics_version {0};
+	atomic<idx_t> checkpointed_statistics_version {0};
+	idx_t pending_checkpoint_statistics_version = 0;
 	//! Controls whether the next append creates a new row group or reuses the existing one
 	RowGroupAppendMode row_group_append_mode;
 	//! Whether or not we can append to a checkpointed row group

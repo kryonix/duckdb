@@ -17,7 +17,8 @@ class Serializer;
 class ColumnStatistics {
 public:
 	explicit ColumnStatistics(BaseStatistics stats_p);
-	ColumnStatistics(BaseStatistics stats_p, unique_ptr<DistinctStatistics> distinct_stats_p);
+	ColumnStatistics(BaseStatistics stats_p, unique_ptr<DistinctStatistics> distinct_stats_p,
+	                 unique_ptr<NumericMoments> numeric_moments_p);
 
 public:
 	static shared_ptr<ColumnStatistics> CreateEmptyStats(const LogicalType &type);
@@ -31,6 +32,10 @@ public:
 	bool HasDistinctStats();
 	DistinctStatistics &DistinctStats();
 	void SetDistinct(unique_ptr<DistinctStatistics> distinct_stats);
+	bool HasNumericMoments() const;
+	const NumericMoments &GetNumericMoments() const;
+	void SetNumericMoments(unique_ptr<NumericMoments> moments);
+	void ClearNumericMoments();
 
 	shared_ptr<ColumnStatistics> Copy() const;
 
@@ -41,6 +46,8 @@ private:
 	BaseStatistics stats;
 	//! The approximate count distinct stats of the column
 	unique_ptr<DistinctStatistics> distinct_stats;
+	//! Numeric moments collected by ANALYZE
+	unique_ptr<NumericMoments> numeric_moments;
 };
 
 } // namespace duckdb

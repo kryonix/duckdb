@@ -3,6 +3,7 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/statistics/distinct_statistics.hpp"
+#include "duckdb/storage/statistics/numeric_moments.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/type_catalog_entry.hpp"
 
@@ -25,10 +26,16 @@ public:
 			} else {
 				column_distinct_stats.push_back(nullptr);
 			}
+			if (NumericMoments::TypeIsSupported(column.GetType())) {
+				column_numeric_moments.push_back(make_uniq<NumericMoments>());
+			} else {
+				column_numeric_moments.push_back(nullptr);
+			}
 		}
 	};
 
 	vector<unique_ptr<DistinctStatistics>> column_distinct_stats;
+	vector<unique_ptr<NumericMoments>> column_numeric_moments;
 	Vector hashes;
 };
 
@@ -46,11 +53,17 @@ public:
 			} else {
 				column_distinct_stats.push_back(nullptr);
 			}
+			if (NumericMoments::TypeIsSupported(column.GetType())) {
+				column_numeric_moments.push_back(make_uniq<NumericMoments>());
+			} else {
+				column_numeric_moments.push_back(nullptr);
+			}
 		}
 	};
 
 	mutex stats_lock;
 	vector<unique_ptr<DistinctStatistics>> column_distinct_stats;
+	vector<unique_ptr<NumericMoments>> column_numeric_moments;
 };
 
 unique_ptr<GlobalSinkState> PhysicalVacuum::GetGlobalSinkState(ClientContext &context) const {
@@ -62,10 +75,12 @@ SinkResultType PhysicalVacuum::Sink(ExecutionContext &context, DataChunk &chunk,
 	D_ASSERT(lstate.column_distinct_stats.size() == column_id_map.size());
 
 	for (idx_t col_idx = 0; col_idx < chunk.data.size(); col_idx++) {
-		if (!DistinctStatistics::TypeIsSupported(chunk.data[col_idx].GetType())) {
-			continue;
+		if (lstate.column_distinct_stats[col_idx]) {
+			lstate.column_distinct_stats[col_idx]->Update(chunk.data[col_idx], chunk.size(), lstate.hashes);
 		}
-		lstate.column_distinct_stats[col_idx]->Update(chunk.data[col_idx], chunk.size(), lstate.hashes);
+		if (lstate.column_numeric_moments[col_idx]) {
+			lstate.column_numeric_moments[col_idx]->Update(chunk.data[col_idx], chunk.size());
+		}
 	}
 
 	return SinkResultType::NEED_MORE_INPUT;
@@ -77,11 +92,16 @@ SinkCombineResultType PhysicalVacuum::Combine(ExecutionContext &context, Operato
 
 	lock_guard<mutex> lock(g_state.stats_lock);
 	D_ASSERT(g_state.column_distinct_stats.size() == l_state.column_distinct_stats.size());
+	D_ASSERT(g_state.column_numeric_moments.size() == l_state.column_numeric_moments.size());
 
 	for (idx_t col_idx = 0; col_idx < g_state.column_distinct_stats.size(); col_idx++) {
 		if (g_state.column_distinct_stats[col_idx]) {
 			D_ASSERT(l_state.column_distinct_stats[col_idx]);
 			g_state.column_distinct_stats[col_idx]->Merge(*l_state.column_distinct_stats[col_idx]);
+		}
+		if (g_state.column_numeric_moments[col_idx]) {
+			D_ASSERT(l_state.column_numeric_moments[col_idx]);
+			g_state.column_numeric_moments[col_idx]->Merge(*l_state.column_numeric_moments[col_idx]);
 		}
 	}
 
@@ -98,6 +118,7 @@ SinkFinalizeType PhysicalVacuum::Finalize(Pipeline &pipeline, Event &event, Clie
 	auto tbl = table;
 	for (idx_t col_idx = 0; col_idx < sink.column_distinct_stats.size(); col_idx++) {
 		tbl->GetStorage().SetDistinct(column_id_map.at(col_idx), std::move(sink.column_distinct_stats[col_idx]));
+		tbl->GetStorage().SetNumericMoments(column_id_map.at(col_idx), std::move(sink.column_numeric_moments[col_idx]));
 	}
 	if (tbl) {
 		tbl->GetStorage().VacuumIndexes();

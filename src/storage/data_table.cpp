@@ -1631,6 +1631,9 @@ idx_t DataTable::Delete(TableDeleteState &state, ClientContext &context, DuckTab
 		}
 		delete_count += row_groups->Delete(transaction, table_entry, ids + current_offset, current_count);
 	}
+	if (delete_count > 0) {
+		row_groups->ClearNumericMoments();
+	}
 	return delete_count;
 }
 
@@ -1782,6 +1785,9 @@ void DataTable::Update(TableUpdateState &state, ClientContext &context, DuckTabl
 		row_groups->Update(transaction, table_entry, FlatVector::GetDataMutable<row_t>(row_ids_slice), column_ids,
 		                   updates_slice);
 	}
+	for (auto &column_id : column_ids) {
+		row_groups->ClearNumericMoments(column_id.index);
+	}
 }
 
 void DataTable::UpdateColumn(DuckTableEntry &table, ClientContext &context, Vector &row_ids,
@@ -1805,6 +1811,7 @@ void DataTable::UpdateColumn(DuckTableEntry &table, ClientContext &context, Vect
 	updates.Flatten();
 	row_ids.Flatten();
 	row_groups->UpdateColumn(transaction, table, row_ids, column_path, updates);
+	row_groups->ClearNumericMoments(column_path[0]);
 }
 
 //===--------------------------------------------------------------------===//
@@ -1820,6 +1827,13 @@ unique_ptr<BaseStatistics> DataTable::GetStatistics(ClientContext &context, cons
 void DataTable::SetDistinct(column_t column_id, unique_ptr<DistinctStatistics> distinct_stats) {
 	D_ASSERT(column_id != COLUMN_IDENTIFIER_ROW_ID);
 	row_groups->SetDistinct(column_id, std::move(distinct_stats));
+	GetAttached().GetStorageManager().MarkStatisticsChanged();
+}
+
+void DataTable::SetNumericMoments(column_t column_id, unique_ptr<NumericMoments> numeric_moments) {
+	D_ASSERT(column_id != COLUMN_IDENTIFIER_ROW_ID);
+	row_groups->SetNumericMoments(column_id, std::move(numeric_moments));
+	GetAttached().GetStorageManager().MarkStatisticsChanged();
 }
 
 unique_ptr<BlockingSample> DataTable::GetSample() {

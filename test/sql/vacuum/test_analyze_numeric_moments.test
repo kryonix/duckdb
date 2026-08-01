@@ -1,0 +1,147 @@
+# name: test/sql/vacuum/test_analyze_numeric_moments.test
+# description: Test numeric moments collected by ANALYZE.
+# group: [vacuum]
+
+load {TEST_DIR}/analyze_numeric_moments.db readwrite latest
+
+statement ok
+SET experimental_metadata_reuse=true;
+
+statement ok
+CREATE TABLE moments(i INTEGER, d DECIMAL(8,2), f DOUBLE, label VARCHAR);
+
+statement ok
+INSERT INTO moments VALUES (1, 1.25, 1.0, 'a'), (2, 2.25, 2.0, 'b'), (3, 3.25, NULL, 'c');
+
+query I
+SELECT contains(stats(i)::VARCHAR, 'numeric_moments') FROM moments LIMIT 1;
+----
+false
+
+statement ok
+PRAGMA verify_parallelism;
+
+statement ok
+ANALYZE moments;
+
+statement ok
+PRAGMA disable_verify_parallelism;
+
+query IIIII
+SELECT s.numeric_moments.count::UBIGINT,
+	   round(s.numeric_moments.mean::DOUBLE * 1000000)::BIGINT,
+	   round(s.numeric_moments.variance::DOUBLE * 1000000)::BIGINT,
+	   round(s.numeric_moments.skewness::DOUBLE * 1000000)::BIGINT,
+	   s.numeric_moments.valid::BOOLEAN
+FROM (SELECT stats(i) s FROM moments LIMIT 1);
+----
+3	2000000	666667	0	true
+
+query IIII
+SELECT s.numeric_moments.count::UBIGINT,
+	   round(s.numeric_moments.mean::DOUBLE * 1000000)::BIGINT,
+	   round(s.numeric_moments.variance::DOUBLE * 1000000)::BIGINT,
+	   s.numeric_moments.valid::BOOLEAN
+FROM (SELECT stats(d) s FROM moments LIMIT 1);
+----
+3	2250000	666667	true
+
+query IIII
+SELECT s.numeric_moments.count::UBIGINT,
+	   round(s.numeric_moments.mean::DOUBLE * 1000000)::BIGINT,
+	   round(s.numeric_moments.variance::DOUBLE * 1000000)::BIGINT,
+	   s.numeric_moments.valid::BOOLEAN
+FROM (SELECT stats(f) s FROM moments LIMIT 1);
+----
+2	1500000	250000	true
+
+query I
+SELECT contains(stats(label)::VARCHAR, 'numeric_moments') FROM moments LIMIT 1;
+----
+false
+
+statement ok
+CHECKPOINT;
+
+restart
+
+statement ok
+SET experimental_metadata_reuse=true;
+
+query II
+SELECT s.numeric_moments.count::UBIGINT, round(s.numeric_moments.mean::DOUBLE * 1000000)::BIGINT
+FROM (SELECT stats(d) s FROM moments LIMIT 1);
+----
+3	2250000
+
+# ANALYZE after a clean checkpoint must still dirty storage and defeat metadata reuse.
+statement ok
+UPDATE moments SET d = d + 1;
+
+statement ok
+CHECKPOINT;
+
+statement ok
+ANALYZE moments;
+
+statement ok
+CHECKPOINT;
+
+restart
+
+query II
+SELECT s.numeric_moments.count::UBIGINT, round(s.numeric_moments.mean::DOUBLE * 1000000)::BIGINT
+FROM (SELECT stats(d) s FROM moments LIMIT 1);
+----
+3	3250000
+
+# Updating one column invalidates only that column's moments.
+statement ok
+UPDATE moments SET i = i + 10 WHERE i = 1;
+
+query II
+SELECT contains(stats(i)::VARCHAR, 'numeric_moments'), contains(stats(d)::VARCHAR, 'numeric_moments')
+FROM moments LIMIT 1;
+----
+false	true
+
+# Deletes change every column distribution.
+statement ok
+ANALYZE moments;
+
+statement ok
+DELETE FROM moments WHERE i = 2;
+
+query II
+SELECT contains(stats(i)::VARCHAR, 'numeric_moments'), contains(stats(d)::VARCHAR, 'numeric_moments')
+FROM moments LIMIT 1;
+----
+false	false
+
+# Appends also invalidate all previously analyzed moments.
+statement ok
+ANALYZE moments;
+
+statement ok
+INSERT INTO moments VALUES (4, 4.25, 4.0, 'd');
+
+query II
+SELECT contains(stats(i)::VARCHAR, 'numeric_moments'), contains(stats(d)::VARCHAR, 'numeric_moments')
+FROM moments LIMIT 1;
+----
+false	false
+
+# Non-finite floating-point values make moment-based estimates unavailable.
+statement ok
+CREATE TABLE non_finite(v DOUBLE);
+
+statement ok
+INSERT INTO non_finite VALUES (1), ('NaN'), (3);
+
+statement ok
+ANALYZE non_finite;
+
+query I
+SELECT s.numeric_moments.valid::BOOLEAN FROM (SELECT stats(v) s FROM non_finite LIMIT 1);
+----
+false

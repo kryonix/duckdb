@@ -4,6 +4,10 @@
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/operator/add.hpp"
@@ -14,7 +18,7 @@
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/statistics/numeric_stats.hpp"
 
-#include <math.h>
+#include <cmath>
 
 namespace duckdb {
 
@@ -34,6 +38,11 @@ RelationStats::RelationStats() : cardinality(1), filter_strength(1), stats_initi
 
 DistinctCount::DistinctCount(idx_t distinct_count, DistinctCountSource source)
     : distinct_count(distinct_count), source(source) {
+}
+
+NumericDistributionStats::NumericDistributionStats(idx_t count_p, double mean_p, double variance_p,
+                                                   NumericDistributionSource source_p)
+    : count(count_p), mean(mean_p), variance(MaxValue<double>(variance_p, 0)), source(source_p) {
 }
 
 static idx_t CapMinMaxDistinctCount(uint64_t distinct_count, idx_t base_table_cardinality) {
@@ -193,15 +202,6 @@ unique_ptr<BaseStatistics> RelationStatisticsHelper::GetColumnStatistics(Logical
 	return get.function.statistics(context, get.bind_data.get(), column_id.GetPrimaryIndex());
 }
 
-DistinctCount RelationStatisticsHelper::GetDistinctCount(LogicalGet &get, ClientContext &context,
-                                                         const ColumnIndex &column_id, idx_t base_table_cardinality) {
-	auto column_statistics = GetColumnStatistics(get, context, column_id);
-	if (!column_statistics) {
-		return DistinctCount(0, DistinctCountSource::CARDINALITY);
-	}
-	return GetDistinctCountFromStats(*column_statistics, base_table_cardinality);
-}
-
 RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientContext &context) {
 	auto return_stats = RelationStats();
 
@@ -219,7 +219,9 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 	auto &column_ids = get.GetColumnIds();
 	for (idx_t i = 0; i < column_ids.size(); i++) {
 		auto column_id = column_ids[i].GetPrimaryIndex();
-		auto distinct_count = GetDistinctCount(get, context, column_ids[i], base_table_cardinality);
+		auto column_statistics = GetColumnStatistics(get, context, column_ids[i]);
+		auto distinct_count = column_statistics ? GetDistinctCountFromStats(*column_statistics, base_table_cardinality)
+		                                        : DistinctCount(0, DistinctCountSource::CARDINALITY);
 		if (distinct_count.distinct_count > 0) {
 			return_stats.column_distinct_count.emplace_back(distinct_count.distinct_count, distinct_count.source);
 			return_stats.column_names.push_back(Identifier(name + "." + get.names.at(column_id)));
@@ -235,6 +237,16 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 			}
 			return_stats.column_names.push_back(Identifier(get.GetName() + "." + column_name));
 		}
+		if (column_statistics && column_statistics->HasNumericMoments()) {
+			auto &moments = column_statistics->GetNumericMoments();
+			if (moments.IsValid() && moments.Count() > 0) {
+				return_stats.column_numeric_distribution.push_back(make_shared_ptr<NumericDistributionStats>(
+				    moments.Count(), moments.Mean(), moments.PopulationVariance(),
+				    NumericDistributionSource::BASE_COLUMN));
+				continue;
+			}
+		}
+		return_stats.column_numeric_distribution.push_back(nullptr);
 	}
 
 	if (get.table_filters.HasFilters()) {
@@ -251,6 +263,10 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 
 			if (!ExpressionFilter::IsOptionalFilter(entry.Filter())) {
 				has_non_optional_filters = true;
+			}
+			auto filtered_column = entry.GetIndex().GetIndex();
+			if (filtered_column < return_stats.column_numeric_distribution.size()) {
+				return_stats.column_numeric_distribution[filtered_column] = nullptr;
 			}
 		}
 		// if the above code didn't find an equality filter (i.e country_code = "[us]")
@@ -284,9 +300,109 @@ RelationStats RelationStatisticsHelper::ExtractDelimGetStats(LogicalDelimGet &de
 	stats.stats_initialized = true;
 	for (auto &binding : delim_get.GetColumnBindings()) {
 		stats.column_distinct_count.emplace_back(1, DistinctCountSource::CARDINALITY);
+		stats.column_numeric_distribution.push_back(nullptr);
 		stats.column_names.push_back(Identifier("column" + to_string(binding.column_index)));
 	}
 	return stats;
+}
+
+static shared_ptr<NumericDistributionStats> GetExpressionDistribution(const Expression &expr,
+                                                                      const RelationStats &child_stats);
+
+static bool TryGetConstantDouble(const Expression &expr, double &result) {
+	if (expr.GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
+		auto &constant = expr.Cast<BoundConstantExpression>().GetValue();
+		if (constant.IsNull() || !constant.type().IsNumeric()) {
+			return false;
+		}
+		result = constant.DefaultCastAs(LogicalType::DOUBLE).GetValue<double>();
+		return std::isfinite(result);
+	}
+	if (BoundCastExpression::IsCast(expr)) {
+		return TryGetConstantDouble(BoundCastExpression::Child(expr.Cast<BoundFunctionExpression>()), result);
+	}
+	return false;
+}
+
+static shared_ptr<NumericDistributionStats> ScaleDistribution(const NumericDistributionStats &input, double scale,
+                                                              double offset = 0) {
+	auto result = make_shared_ptr<NumericDistributionStats>(
+	    input.count, input.mean * scale + offset, input.variance * scale * scale, NumericDistributionSource::DERIVED);
+	result->is_aggregate = input.is_aggregate;
+	return result;
+}
+
+static shared_ptr<NumericDistributionStats> GetFunctionDistribution(const BoundFunctionExpression &function,
+                                                                    const RelationStats &child_stats) {
+	if (BoundCastExpression::IsCast(function)) {
+		return GetExpressionDistribution(BoundCastExpression::Child(function), child_stats);
+	}
+	auto &children = function.GetChildren();
+	if (children.size() != 2) {
+		return nullptr;
+	}
+	auto &name = function.Function().GetName();
+	auto left = GetExpressionDistribution(*children[0], child_stats);
+	auto right = GetExpressionDistribution(*children[1], child_stats);
+	auto count_matches_sum = left && right && left->source == NumericDistributionSource::SUM &&
+	                         right->source == NumericDistributionSource::COUNT &&
+	                         ((left->lineage != 0 && left->lineage == right->lineage) ||
+	                          (right->lineage == 0 && std::abs(left->mean_group_size - right->mean_group_size) < 1e-9));
+	if (name == "/" && count_matches_sum) {
+		auto result = make_shared_ptr<NumericDistributionStats>(
+		    MinValue(left->count, right->count), left->input_mean,
+		    left->input_variance / MaxValue(left->mean_group_size, 1.0), NumericDistributionSource::AVERAGE);
+		result->lineage = left->lineage;
+		result->is_aggregate = true;
+		result->input_mean = left->input_mean;
+		result->input_variance = left->input_variance;
+		result->mean_group_size = left->mean_group_size;
+		return result;
+	}
+
+	double constant;
+	if (left && TryGetConstantDouble(*children[1], constant)) {
+		if (name == "+") {
+			return ScaleDistribution(*left, 1, constant);
+		}
+		if (name == "-") {
+			return ScaleDistribution(*left, 1, -constant);
+		}
+		if (name == "*") {
+			return ScaleDistribution(*left, constant);
+		}
+		if (name == "/" && constant != 0) {
+			return ScaleDistribution(*left, 1.0 / constant);
+		}
+	}
+	if (right && TryGetConstantDouble(*children[0], constant)) {
+		if (name == "+") {
+			return ScaleDistribution(*right, 1, constant);
+		}
+		if (name == "-") {
+			return ScaleDistribution(*right, -1, constant);
+		}
+		if (name == "*") {
+			return ScaleDistribution(*right, constant);
+		}
+	}
+	return nullptr;
+}
+
+static shared_ptr<NumericDistributionStats> GetExpressionDistribution(const Expression &expr,
+                                                                      const RelationStats &child_stats) {
+	if (expr.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+		auto &column_ref = expr.Cast<BoundColumnRefExpression>();
+		auto column_index = column_ref.Binding().column_index;
+		if (column_index < child_stats.column_numeric_distribution.size()) {
+			return child_stats.column_numeric_distribution[column_index];
+		}
+		return nullptr;
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+		return GetFunctionDistribution(expr.Cast<BoundFunctionExpression>(), child_stats);
+	}
+	return nullptr;
 }
 
 RelationStats RelationStatisticsHelper::ExtractProjectionStats(LogicalProjection &proj, RelationStats &child_stats) {
@@ -315,6 +431,7 @@ RelationStats RelationStatisticsHelper::ExtractProjectionStats(LogicalProjection
 				}
 			}
 		}
+		proj_stats.column_numeric_distribution.push_back(GetExpressionDistribution(*expr, child_stats));
 	}
 	proj_stats.stats_initialized = true;
 	return proj_stats;
@@ -326,6 +443,7 @@ RelationStats RelationStatisticsHelper::ExtractDummyScanStats(LogicalDummyScan &
 	stats.cardinality = card;
 	for (idx_t i = 0; i < dummy_scan.GetColumnBindings().size(); i++) {
 		stats.column_distinct_count.emplace_back(card, DistinctCountSource::CARDINALITY);
+		stats.column_numeric_distribution.push_back(nullptr);
 		stats.column_names.push_back("dummy_scan_column");
 	}
 	stats.stats_initialized = true;
@@ -335,6 +453,7 @@ RelationStats RelationStatisticsHelper::ExtractDummyScanStats(LogicalDummyScan &
 
 void RelationStatisticsHelper::CopyRelationStats(RelationStats &to, const RelationStats &from) {
 	to.column_distinct_count = from.column_distinct_count;
+	to.column_numeric_distribution = from.column_numeric_distribution;
 	to.column_names = from.column_names;
 	to.cardinality = from.cardinality;
 	to.table_name = from.table_name;
@@ -346,8 +465,10 @@ RelationStats RelationStatisticsHelper::CombineStatsOfReorderableOperator(vector
 	RelationStats stats;
 	idx_t max_card = 0;
 	for (auto &child_stats : relation_stats) {
+		D_ASSERT(child_stats.column_distinct_count.size() == child_stats.column_numeric_distribution.size());
 		for (idx_t i = 0; i < child_stats.column_distinct_count.size(); i++) {
 			stats.column_distinct_count.push_back(child_stats.column_distinct_count.at(i));
+			stats.column_numeric_distribution.push_back(child_stats.column_numeric_distribution.at(i));
 			stats.column_names.push_back(child_stats.column_names.at(i));
 		}
 		stats.table_name = Identifier(stats.table_name + "joined with " + child_stats.table_name);
@@ -443,8 +564,12 @@ RelationStats RelationStatisticsHelper::CombineStatsOfNonReorderableOperator(Log
 		if (!stats.stats_initialized) {
 			continue;
 		}
+		D_ASSERT(stats.column_distinct_count.size() == stats.column_numeric_distribution.size());
 		for (auto &distinct_count : stats.column_distinct_count) {
 			ret.column_distinct_count.push_back(distinct_count);
+		}
+		for (auto &distribution : stats.column_numeric_distribution) {
+			ret.column_numeric_distribution.push_back(distribution);
 		}
 		for (auto &column_name : stats.column_names) {
 			ret.column_names.push_back(column_name);
@@ -460,6 +585,7 @@ RelationStats RelationStatisticsHelper::ExtractExpressionGetStats(LogicalExpress
 	stats.cardinality = card;
 	for (idx_t i = 0; i < expression_get.GetColumnBindings().size(); i++) {
 		stats.column_distinct_count.emplace_back(card, DistinctCountSource::CARDINALITY);
+		stats.column_numeric_distribution.push_back(nullptr);
 		stats.column_names.push_back("expression_get_column");
 	}
 	stats.stats_initialized = true;
@@ -471,6 +597,7 @@ RelationStats RelationStatisticsHelper::ExtractWindowStats(LogicalWindow &window
 	RelationStats stats;
 	stats.cardinality = child_stats.cardinality;
 	stats.column_distinct_count = child_stats.column_distinct_count;
+	stats.column_numeric_distribution = child_stats.column_numeric_distribution;
 	stats.column_names = child_stats.column_names;
 	stats.stats_initialized = true;
 	auto num_child_columns = window.GetColumnBindings().size();
@@ -478,6 +605,7 @@ RelationStats RelationStatisticsHelper::ExtractWindowStats(LogicalWindow &window
 	for (idx_t column_index = child_stats.column_distinct_count.size(); column_index < num_child_columns;
 	     column_index++) {
 		stats.column_distinct_count.emplace_back(child_stats.cardinality, DistinctCountSource::CARDINALITY);
+		stats.column_numeric_distribution.push_back(nullptr);
 		stats.column_names.push_back("window");
 	}
 	return stats;
@@ -560,6 +688,85 @@ RelationStats RelationStatisticsHelper::ExtractAggregationStats(LogicalAggregate
 		}
 		stats.column_names.push_back("aggregate");
 	}
+
+	// Aggregate and group bindings use separate table indexes but overlapping column indexes. The join-order
+	// estimator currently addresses relation statistics by column index, so aggregate distributions take precedence
+	// while distinct counts continue to describe grouping keys.
+	stats.column_numeric_distribution.resize(stats.column_distinct_count.size());
+	for (idx_t group_idx = 0; group_idx < aggr.groups.size() && group_idx < stats.column_numeric_distribution.size();
+	     group_idx++) {
+		stats.column_numeric_distribution[group_idx] = GetExpressionDistribution(*aggr.groups[group_idx], child_stats);
+	}
+
+	auto mean_group_size =
+	    static_cast<double>(child_stats.cardinality) / static_cast<double>(MaxValue<idx_t>(stats.cardinality, 1));
+	for (idx_t aggregate_idx = 0;
+	     aggregate_idx < aggr.expressions.size() && aggregate_idx < stats.column_numeric_distribution.size();
+	     aggregate_idx++) {
+		// Aggregate bindings overlap group bindings by column index. Never let a group-column distribution describe an
+		// unsupported aggregate result in a HAVING predicate.
+		stats.column_numeric_distribution[aggregate_idx] = nullptr;
+		auto &expression = *aggr.expressions[aggregate_idx];
+		if (expression.GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+			continue;
+		}
+		auto &aggregate = expression.Cast<BoundAggregateExpression>();
+		if (aggregate.IsDistinct() || aggregate.GetFilter() || aggregate.GetChildren().size() > 1) {
+			continue;
+		}
+		auto &name = aggregate.Function().GetName();
+		shared_ptr<NumericDistributionStats> input_distribution;
+		if (!aggregate.GetChildren().empty()) {
+			input_distribution = GetExpressionDistribution(*aggregate.GetChildren()[0], child_stats);
+		}
+
+		if (name == "count_star") {
+			auto distribution = make_shared_ptr<NumericDistributionStats>(
+			    stats.cardinality, mean_group_size, mean_group_size, NumericDistributionSource::COUNT);
+			distribution->mean_group_size = mean_group_size;
+			distribution->is_aggregate = true;
+			stats.column_numeric_distribution[aggregate_idx] = std::move(distribution);
+			continue;
+		}
+		if (!input_distribution) {
+			continue;
+		}
+		auto non_null_fraction = static_cast<double>(input_distribution->count) /
+		                         static_cast<double>(MaxValue<idx_t>(child_stats.cardinality, 1));
+		auto non_null_group_size = mean_group_size * MinValue(MaxValue(non_null_fraction, 0.0), 1.0);
+		auto lineage = aggregate.GetChildren()[0]->Hash();
+		if (name == "count") {
+			auto distribution = make_shared_ptr<NumericDistributionStats>(
+			    stats.cardinality, non_null_group_size, non_null_group_size, NumericDistributionSource::COUNT);
+			distribution->lineage = lineage;
+			distribution->is_aggregate = true;
+			distribution->input_mean = input_distribution->mean;
+			distribution->input_variance = input_distribution->variance;
+			distribution->mean_group_size = non_null_group_size;
+			stats.column_numeric_distribution[aggregate_idx] = std::move(distribution);
+		} else if (name == "sum" || name == "sum_no_overflow") {
+			auto second_raw_moment = input_distribution->variance + input_distribution->mean * input_distribution->mean;
+			auto distribution = make_shared_ptr<NumericDistributionStats>(
+			    stats.cardinality, non_null_group_size * input_distribution->mean,
+			    non_null_group_size * second_raw_moment, NumericDistributionSource::SUM);
+			distribution->lineage = lineage;
+			distribution->is_aggregate = true;
+			distribution->input_mean = input_distribution->mean;
+			distribution->input_variance = input_distribution->variance;
+			distribution->mean_group_size = non_null_group_size;
+			stats.column_numeric_distribution[aggregate_idx] = std::move(distribution);
+		} else if (name == "avg" || name == "decimal_average") {
+			auto distribution = make_shared_ptr<NumericDistributionStats>(
+			    stats.cardinality, input_distribution->mean,
+			    input_distribution->variance / MaxValue(non_null_group_size, 1.0), NumericDistributionSource::AVERAGE);
+			distribution->lineage = lineage;
+			distribution->is_aggregate = true;
+			distribution->input_mean = input_distribution->mean;
+			distribution->input_variance = input_distribution->variance;
+			distribution->mean_group_size = non_null_group_size;
+			stats.column_numeric_distribution[aggregate_idx] = std::move(distribution);
+		}
+	}
 	return stats;
 }
 
@@ -567,10 +774,75 @@ RelationStats RelationStatisticsHelper::ExtractEmptyResultStats(LogicalEmptyResu
 	RelationStats stats;
 	for (idx_t i = 0; i < empty.GetColumnBindings().size(); i++) {
 		stats.column_distinct_count.emplace_back(0, DistinctCountSource::CARDINALITY);
+		stats.column_numeric_distribution.push_back(nullptr);
 		stats.column_names.push_back("empty_result_column");
 	}
 	stats.stats_initialized = true;
 	return stats;
+}
+
+static double NormalCDF(double value, double mean, double variance) {
+	if (variance <= 0) {
+		return value < mean ? 0.0 : 1.0;
+	}
+	auto z = (value - mean) / std::sqrt(2.0 * variance);
+	return 0.5 * std::erfc(-z);
+}
+
+bool RelationStatisticsHelper::EstimateFilterCardinality(const Expression &filter, const RelationStats &stats,
+                                                         idx_t &cardinality) {
+	if (filter.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+		auto &conjunction = filter.Cast<BoundConjunctionExpression>();
+		auto result = cardinality;
+		for (auto &child : conjunction.GetChildren()) {
+			if (!EstimateFilterCardinality(*child, stats, result)) {
+				return false;
+			}
+		}
+		cardinality = result;
+		return true;
+	}
+	if (!BoundComparisonExpression::IsComparison(filter)) {
+		return false;
+	}
+	auto &comparison = filter.Cast<BoundFunctionExpression>();
+	auto comparison_type = comparison.GetExpressionType();
+	auto &left = BoundComparisonExpression::Left(comparison);
+	auto &right = BoundComparisonExpression::Right(comparison);
+	shared_ptr<NumericDistributionStats> distribution;
+	double constant;
+	distribution = GetExpressionDistribution(left, stats);
+	if (distribution && TryGetConstantDouble(right, constant)) {
+		// comparison already has the distribution on the left
+	} else if ((distribution = GetExpressionDistribution(right, stats)) && TryGetConstantDouble(left, constant)) {
+		comparison_type = FlipComparisonExpression(comparison_type);
+	} else {
+		return false;
+	}
+	if (!distribution->is_aggregate) {
+		return false;
+	}
+
+	double selectivity;
+	switch (comparison_type) {
+	case ExpressionType::COMPARE_LESSTHAN:
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		selectivity = NormalCDF(constant, distribution->mean, distribution->variance);
+		break;
+	case ExpressionType::COMPARE_GREATERTHAN:
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		selectivity = 1.0 - NormalCDF(constant, distribution->mean, distribution->variance);
+		break;
+	default:
+		return false;
+	}
+	selectivity = MinValue(MaxValue(selectivity, 0.0), 1.0);
+	if (cardinality == 0) {
+		return true;
+	}
+	cardinality =
+	    MaxValue<idx_t>(LossyNumericCast<idx_t>(std::round(static_cast<double>(cardinality) * selectivity)), 1);
+	return true;
 }
 
 idx_t RelationStatisticsHelper::InspectTableFilter(idx_t cardinality, const TableFilter &filter,

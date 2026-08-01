@@ -1,0 +1,56 @@
+# name: test/sql/optimizer/test_aggregate_numeric_statistics.test
+# description: Test ANALYZE moment propagation through numeric aggregates and HAVING filters.
+# group: [optimizer]
+
+statement ok
+CREATE TABLE fact AS SELECT i % 100 k, hash(i) % 10 v FROM range(100000) t(i);
+
+query I
+SELECT count(*) FROM (SELECT k FROM fact GROUP BY k HAVING sum(v) > 4800);
+----
+0
+
+statement ok
+PRAGMA disable_verification;
+
+statement ok
+PRAGMA explain_output='optimized_only';
+
+# Without ANALYZE, HAVING retains the existing 20% fallback.
+query II
+EXPLAIN (FORMAT JSON) SELECT k, sum(v) FROM fact GROUP BY k HAVING sum(v) > 4800;
+----
+logical_opt	<REGEX>:.*"name":\s*"FILTER".*"Estimated Cardinality":\s*"19".*
+
+statement ok
+ANALYZE fact;
+
+# Base-column filters keep the existing scan estimator; moments are limited to computed aggregate results.
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM (SELECT v + 1 x FROM fact) q WHERE x > 5;
+----
+logical_opt	<REGEX>:.*"name":\s*"SEQ_SCAN".*"Estimated Cardinality":\s*"20000".*
+
+# SUM uses the base-column moments and estimated mean group size.
+query II
+EXPLAIN (FORMAT JSON) SELECT k, sum(v) FROM fact GROUP BY k HAVING sum(v) > 4800;
+----
+logical_opt	<REGEX>:.*"name":\s*"FILTER".*"Estimated Cardinality":\s*"12".*
+
+# Affine expressions preserve the aggregate distribution.
+query II
+EXPLAIN (FORMAT JSON) SELECT k, sum(v) * 2 FROM fact GROUP BY k HAVING sum(v) * 2 > 9600;
+----
+logical_opt	<REGEX>:.*"name":\s*"FILTER".*"Estimated Cardinality":\s*"12".*
+
+# AVG is represented by SUM/COUNT after aggregate rewriting.
+query II
+EXPLAIN (FORMAT JSON) SELECT k, avg(v) FROM fact GROUP BY k HAVING avg(v) > 4.8;
+----
+logical_opt	<REGEX>:.*"name":\s*"FILTER".*"Estimated Cardinality":\s*"1".*
+
+# Unsupported nonlinear aggregate inputs must not inherit the overlapping group-column distribution.
+query II
+EXPLAIN (FORMAT JSON) SELECT k, sum(v * v) FROM fact GROUP BY k HAVING sum(v * v) > 30000;
+----
+logical_opt	<REGEX>:.*"name":\s*"FILTER".*"Estimated Cardinality":\s*"19".*

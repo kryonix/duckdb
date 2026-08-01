@@ -217,6 +217,7 @@ void RowGroupCollection::FinalizeCheckpoint(MetaBlockPointer pointer,
                                             const vector<MetaBlockPointer> &existing_pointers) {
 	metadata_pointer = pointer;
 	metadata_pointers = existing_pointers;
+	checkpointed_statistics_version = pending_checkpoint_statistics_version;
 }
 
 void RowGroupCollection::Initialize(PersistentCollectionData &data) {
@@ -1897,6 +1898,7 @@ unique_ptr<CheckpointTask> RowGroupCollection::GetCheckpointTask(CollectionCheck
 }
 
 void RowGroupCollection::Checkpoint(TableDataWriter &writer, TableStatistics &global_stats) {
+	pending_checkpoint_statistics_version = statistics_version.load();
 	auto row_groups = GetRowGroups();
 
 	CollectionCheckpointState checkpoint_state(*this, writer, global_stats, *row_groups);
@@ -1952,16 +1954,18 @@ void RowGroupCollection::Checkpoint(TableDataWriter &writer, TableStatistics &gl
 	// no errors - finalize the row groups
 	// if the table already exists on disk - check if all row groups have stayed the same
 	if (Settings::Get<ExperimentalMetadataReuseSetting>(writer.GetDatabase()) && metadata_pointer.IsValid()) {
-		bool table_has_changes = false;
-		for (idx_t segment_idx = 0; segment_idx < checkpoint_state.SegmentCount(); segment_idx++) {
-			if (checkpoint_state.SegmentIsDropped(segment_idx)) {
-				table_has_changes = true;
-				break;
-			}
-			auto &write_state = checkpoint_state.write_data[segment_idx];
-			if (write_state.write_action != RowGroupWriteAction::REUSE_EXISTING_ROW_GROUP_METADATA) {
-				table_has_changes = true;
-				break;
+		bool table_has_changes = pending_checkpoint_statistics_version != checkpointed_statistics_version.load();
+		if (!table_has_changes) {
+			for (idx_t segment_idx = 0; segment_idx < checkpoint_state.SegmentCount(); segment_idx++) {
+				if (checkpoint_state.SegmentIsDropped(segment_idx)) {
+					table_has_changes = true;
+					break;
+				}
+				auto &write_state = checkpoint_state.write_data[segment_idx];
+				if (write_state.write_action != RowGroupWriteAction::REUSE_EXISTING_ROW_GROUP_METADATA) {
+					table_has_changes = true;
+					break;
+				}
 			}
 		}
 		if (!table_has_changes) {
@@ -2541,6 +2545,25 @@ void RowGroupCollection::SetDistinct(column_t column_id, unique_ptr<DistinctStat
 	D_ASSERT(column_id != COLUMN_IDENTIFIER_ROW_ID);
 	auto stats_lock = stats.GetLock();
 	stats.GetStats(*stats_lock, column_id).SetDistinct(std::move(distinct_stats));
+	statistics_version++;
+}
+
+void RowGroupCollection::SetNumericMoments(column_t column_id, unique_ptr<NumericMoments> numeric_moments) {
+	D_ASSERT(column_id != COLUMN_IDENTIFIER_ROW_ID);
+	auto stats_lock = stats.GetLock();
+	stats.GetStats(*stats_lock, column_id).SetNumericMoments(std::move(numeric_moments));
+	statistics_version++;
+}
+
+void RowGroupCollection::ClearNumericMoments() {
+	stats.ClearNumericMoments();
+	statistics_version++;
+}
+
+void RowGroupCollection::ClearNumericMoments(column_t column_id) {
+	D_ASSERT(column_id != COLUMN_IDENTIFIER_ROW_ID);
+	stats.ClearNumericMoments(column_id);
+	statistics_version++;
 }
 
 } // namespace duckdb

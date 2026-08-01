@@ -34,6 +34,24 @@ public:
 	bool expression_is_constant = false;
 };
 
+enum class NumericDistributionSource : uint8_t { BASE_COLUMN, SUM, COUNT, AVERAGE, DERIVED };
+
+//! Approximate distribution of a numeric relation column used only for cardinality estimation.
+struct NumericDistributionStats {
+	NumericDistributionStats(idx_t count, double mean, double variance, NumericDistributionSource source);
+
+	idx_t count;
+	double mean;
+	double variance;
+	NumericDistributionSource source;
+	bool is_aggregate = false;
+	//! Identifies SUM/COUNT results derived from the same aggregate input.
+	hash_t lineage = 0;
+	double input_mean = 0;
+	double input_variance = 0;
+	double mean_group_size = 0;
+};
+
 struct RelationStats {
 public:
 	RelationStats();
@@ -41,6 +59,8 @@ public:
 public:
 	//! column_id -> estimated distinct count for column
 	vector<DistinctCount> column_distinct_count;
+	//! column_id -> estimated numeric distribution, or nullptr if unavailable
+	vector<shared_ptr<NumericDistributionStats>> column_numeric_distribution;
 	idx_t cardinality;
 	double filter_strength = 1;
 	bool stats_initialized = false;
@@ -68,6 +88,8 @@ public:
 	static RelationStats ExtractAggregationStats(LogicalAggregate &aggr, RelationStats &child_stats);
 	static RelationStats ExtractWindowStats(LogicalWindow &window, RelationStats &child_stats);
 	static RelationStats ExtractEmptyResultStats(LogicalEmptyResult &empty);
+	//! Estimate a filter over a numeric computed column. Returns false when no distribution is available.
+	static bool EstimateFilterCardinality(const Expression &filter, const RelationStats &stats, idx_t &cardinality);
 	//! Called after reordering a query plan with potentially 2+ relations.
 	static RelationStats CombineStatsOfReorderableOperator(vector<ColumnBinding> &bindings,
 	                                                       vector<RelationStats> relation_stats);
@@ -79,8 +101,6 @@ public:
 private:
 	static unique_ptr<BaseStatistics> GetColumnStatistics(LogicalGet &get, ClientContext &context,
 	                                                      const ColumnIndex &column_id);
-	static DistinctCount GetDistinctCount(LogicalGet &get, ClientContext &context, const ColumnIndex &column_id,
-	                                      idx_t base_table_cardinality);
 };
 
 } // namespace duckdb

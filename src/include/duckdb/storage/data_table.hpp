@@ -235,6 +235,7 @@ public:
 	unique_ptr<BlockingSample> GetSample();
 	//! Sets statistics of a physical column within the table
 	void SetDistinct(column_t column_id, unique_ptr<DistinctStatistics> distinct_stats);
+	void SetNumericMoments(column_t column_id, unique_ptr<NumericMoments> numeric_moments);
 
 	//! Obtains a lock during a checkpoint operation that prevents other threads from reading this table
 	unique_ptr<StorageLockKey> GetCheckpointLock();

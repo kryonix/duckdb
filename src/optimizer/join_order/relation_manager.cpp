@@ -257,6 +257,27 @@ static void ModifyStatsIfLimit(optional_ptr<LogicalOperator> limit_op, RelationS
 	}
 }
 
+static void ApplyDatasourceFilterStats(const vector<reference<LogicalOperator>> &filters, RelationStats &stats) {
+	if (filters.empty()) {
+		return;
+	}
+	auto estimated_cardinality = stats.cardinality;
+	for (auto &filter_op : filters) {
+		auto &filter = filter_op.get().Cast<LogicalFilter>();
+		for (auto &expression : filter.expressions) {
+			if (!RelationStatisticsHelper::EstimateFilterCardinality(*expression, stats, estimated_cardinality)) {
+				estimated_cardinality =
+				    MaxValue<idx_t>(LossyNumericCast<idx_t>(static_cast<double>(stats.cardinality) *
+				                                            RelationStatisticsHelper::DEFAULT_SELECTIVITY),
+				                    1);
+				stats.cardinality = estimated_cardinality;
+				return;
+			}
+		}
+	}
+	stats.cardinality = estimated_cardinality;
+}
+
 void RelationManager::AddRelationWithChildren(JoinOrderOptimizer &optimizer, LogicalOperator &op,
                                               LogicalOperator &input_op, optional_ptr<LogicalOperator> parent,
                                               RelationStats &child_stats, optional_ptr<LogicalOperator> limit_op,
@@ -264,10 +285,7 @@ void RelationManager::AddRelationWithChildren(JoinOrderOptimizer &optimizer, Log
 	D_ASSERT(!op.children.empty());
 	auto child_optimizer = optimizer.CreateChildOptimizer();
 	op.children[0] = child_optimizer.Optimize(std::move(op.children[0]), &child_stats);
-	if (!datasource_filters.empty()) {
-		child_stats.cardinality = LossyNumericCast<idx_t>(static_cast<double>(child_stats.cardinality) *
-		                                                  RelationStatisticsHelper::DEFAULT_SELECTIVITY);
-	}
+	ApplyDatasourceFilterStats(datasource_filters, child_stats);
 	ModifyStatsIfLimit(limit_op.get(), child_stats);
 	AddRelation(input_op, parent, child_stats);
 }
@@ -324,10 +342,7 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 
 		auto combined_stats = RelationStatisticsHelper::CombineStatsOfNonReorderableOperator(*op, children_stats);
 		op->SetEstimatedCardinality(combined_stats.cardinality);
-		if (!datasource_filters.empty()) {
-			combined_stats.cardinality = (idx_t)MaxValue(
-			    double(combined_stats.cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY, (double)1);
-		}
+		ApplyDatasourceFilterStats(datasource_filters, combined_stats);
 		AddRelation(input_op, parent, combined_stats);
 		return true;
 	}
@@ -342,10 +357,7 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 		auto operator_stats = RelationStatisticsHelper::ExtractAggregationStats(aggr, child_stats);
 		// the extracted cardinality should be set for aggregate
 		aggr.SetEstimatedCardinality(operator_stats.cardinality);
-		if (!datasource_filters.empty()) {
-			operator_stats.cardinality = LossyNumericCast<idx_t>(static_cast<double>(operator_stats.cardinality) *
-			                                                     RelationStatisticsHelper::DEFAULT_SELECTIVITY);
-		}
+		ApplyDatasourceFilterStats(datasource_filters, operator_stats);
 		ModifyStatsIfLimit(limit_op.get(), child_stats);
 		AddAggregateOrWindowRelation(input_op, parent, operator_stats, op->type);
 		return true;
@@ -359,10 +371,7 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 		auto operator_stats = RelationStatisticsHelper::ExtractWindowStats(window, child_stats);
 		// the extracted cardinality should be set for window
 		window.SetEstimatedCardinality(operator_stats.cardinality);
-		if (!datasource_filters.empty()) {
-			operator_stats.cardinality = LossyNumericCast<idx_t>(static_cast<double>(operator_stats.cardinality) *
-			                                                     RelationStatisticsHelper::DEFAULT_SELECTIVITY);
-		}
+		ApplyDatasourceFilterStats(datasource_filters, operator_stats);
 		ModifyStatsIfLimit(limit_op.get(), child_stats);
 		AddAggregateOrWindowRelation(input_op, parent, operator_stats, op->type);
 		return true;
@@ -437,10 +446,7 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 		// if there is another logical filter that could not be pushed down into the
 		// table scan, apply another selectivity.
 		get.SetEstimatedCardinality(stats.cardinality);
-		if (!datasource_filters.empty()) {
-			stats.cardinality =
-			    (idx_t)MaxValue(double(stats.cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY, (double)1);
-		}
+		ApplyDatasourceFilterStats(datasource_filters, stats);
 		ModifyStatsIfLimit(limit_op.get(), stats);
 		AddRelation(input_op, parent, stats);
 		return true;
@@ -454,6 +460,7 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 		// Projection can create columns so we need to add them here
 		auto proj_stats = RelationStatisticsHelper::ExtractProjectionStats(proj, child_stats);
 		proj.SetEstimatedCardinality(proj_stats.cardinality);
+		ApplyDatasourceFilterStats(datasource_filters, proj_stats);
 		ModifyStatsIfLimit(limit_op.get(), proj_stats);
 		AddRelation(input_op, parent, proj_stats);
 		return true;
