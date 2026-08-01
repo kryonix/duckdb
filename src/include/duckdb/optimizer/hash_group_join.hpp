@@ -10,7 +10,6 @@
 #include "duckdb/common/optional.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/execution/group_join_strategy.hpp"
-#include "duckdb/optimizer/key_properties.hpp"
 
 namespace duckdb {
 
@@ -28,7 +27,7 @@ struct HashGroupJoinCandidate {
 	vector<idx_t> probe_key_indices;
 	vector<idx_t> owner_payload_indices;
 	vector<HashGroupJoinOutputColumn> output_groups;
-	optional<UniqueKeyProof> owner_key_proof;
+	bool unique_owner;
 	HashGroupJoinUnmatchedPolicy unmatched_policy;
 	bool routed;
 	bool single_match;
@@ -54,6 +53,9 @@ TrySelectHashGroupJoinCandidate(LogicalAggregate &aggregate, LogicalComparisonJo
 optional<HashGroupJoinCandidate>
 TryGetPlannedHashGroupJoinCandidate(LogicalAggregate &aggregate, LogicalComparisonJoin &join, ClientContext &context,
                                     HashGroupJoinCandidateMode mode = HashGroupJoinCandidateMode::STRICT);
+
+//! Replaces selected aggregate-over-join patterns with first-class logical GroupJoin operators.
+void PlanHashGroupJoins(unique_ptr<LogicalOperator> &root, ClientContext &context);
 
 optional<StaticHashGroupJoinCandidate>
 TryGetStaticHashGroupJoinCandidate(LogicalComparisonJoin &join, ClientContext &context,

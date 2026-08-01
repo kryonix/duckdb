@@ -35,6 +35,13 @@ struct TableIndexAccessor<LogicalAggregate> {
 };
 
 template <>
+struct TableIndexAccessor<LogicalGroupJoin> {
+	static vector<reference<TableIndex>> Get(LogicalGroupJoin &plan) {
+		return {std::ref(plan.group_index), std::ref(plan.aggregate_index), std::ref(plan.groupings_index)};
+	}
+};
+
+template <>
 struct TableIndexAccessor<LogicalWindow> {
 	static TableIndex &Get(LogicalWindow &plan) {
 		return plan.window_index;
@@ -98,6 +105,9 @@ void LogicalOperatorDeepCopy::VisitOperator(LogicalOperator &op) {
 
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
 		ReplaceTableIndexMulti<LogicalAggregate>(op);
+		break;
+	case LogicalOperatorType::LOGICAL_GROUP_JOIN:
+		ReplaceTableIndexMulti<LogicalGroupJoin>(op);
 		break;
 
 	case LogicalOperatorType::LOGICAL_WINDOW:

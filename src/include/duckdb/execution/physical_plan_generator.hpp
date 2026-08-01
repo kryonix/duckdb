@@ -127,6 +127,7 @@ public:
 
 protected:
 	PhysicalOperator &CreatePlan(LogicalAggregate &op);
+	PhysicalOperator &CreatePlan(LogicalGroupJoin &op);
 	PhysicalOperator &CreatePlan(LogicalAnyJoin &op);
 	PhysicalOperator &CreatePlan(LogicalColumnDataGet &op);
 	PhysicalOperator &CreatePlan(LogicalComparisonJoin &op);

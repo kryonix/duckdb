@@ -273,6 +273,25 @@ ARTHandlingResult EnumUtil::FromString<ARTHandlingResult>(const char *value) {
 	return static_cast<ARTHandlingResult>(StringUtil::StringToEnum(GetARTHandlingResultValues(), 4, "ARTHandlingResult", value));
 }
 
+const StringUtil::EnumStringLiteral *GetARTLookupResultValues() {
+	static constexpr StringUtil::EnumStringLiteral values[] {
+		{ static_cast<uint32_t>(ARTLookupResult::INDEX_NOT_FOUND), "INDEX_NOT_FOUND" },
+		{ static_cast<uint32_t>(ARTLookupResult::COMPLETE), "COMPLETE" },
+		{ static_cast<uint32_t>(ARTLookupResult::EXCEEDED_LIMIT), "EXCEEDED_LIMIT" }
+	};
+	return values;
+}
+
+template<>
+const char* EnumUtil::ToChars<ARTLookupResult>(ARTLookupResult value) {
+	return StringUtil::EnumToString(GetARTLookupResultValues(), 3, "ARTLookupResult", static_cast<uint32_t>(value));
+}
+
+template<>
+ARTLookupResult EnumUtil::FromString<ARTLookupResult>(const char *value) {
+	return static_cast<ARTLookupResult>(StringUtil::StringToEnum(GetARTLookupResultValues(), 3, "ARTLookupResult", value));
+}
+
 const StringUtil::EnumStringLiteral *GetARTScanHandlingValues() {
 	static constexpr StringUtil::EnumStringLiteral values[] {
 		{ static_cast<uint32_t>(ARTScanHandling::EMPLACE), "EMPLACE" },
@@ -3404,6 +3423,7 @@ const StringUtil::EnumStringLiteral *GetLogicalOperatorTypeValues() {
 		{ static_cast<uint32_t>(LogicalOperatorType::LOGICAL_POSITIONAL_JOIN), "LOGICAL_POSITIONAL_JOIN" },
 		{ static_cast<uint32_t>(LogicalOperatorType::LOGICAL_ASOF_JOIN), "LOGICAL_ASOF_JOIN" },
 		{ static_cast<uint32_t>(LogicalOperatorType::LOGICAL_DEPENDENT_JOIN), "LOGICAL_DEPENDENT_JOIN" },
+		{ static_cast<uint32_t>(LogicalOperatorType::LOGICAL_GROUP_JOIN), "LOGICAL_GROUP_JOIN" },
 		{ static_cast<uint32_t>(LogicalOperatorType::LOGICAL_UNION), "LOGICAL_UNION" },
 		{ static_cast<uint32_t>(LogicalOperatorType::LOGICAL_EXCEPT), "LOGICAL_EXCEPT" },
 		{ static_cast<uint32_t>(LogicalOperatorType::LOGICAL_INTERSECT), "LOGICAL_INTERSECT" },
@@ -3448,12 +3468,12 @@ const StringUtil::EnumStringLiteral *GetLogicalOperatorTypeValues() {
 
 template<>
 const char* EnumUtil::ToChars<LogicalOperatorType>(LogicalOperatorType value) {
-	return StringUtil::EnumToString(GetLogicalOperatorTypeValues(), 67, "LogicalOperatorType", static_cast<uint32_t>(value));
+	return StringUtil::EnumToString(GetLogicalOperatorTypeValues(), 68, "LogicalOperatorType", static_cast<uint32_t>(value));
 }
 
 template<>
 LogicalOperatorType EnumUtil::FromString<LogicalOperatorType>(const char *value) {
-	return static_cast<LogicalOperatorType>(StringUtil::StringToEnum(GetLogicalOperatorTypeValues(), 67, "LogicalOperatorType", value));
+	return static_cast<LogicalOperatorType>(StringUtil::StringToEnum(GetLogicalOperatorTypeValues(), 68, "LogicalOperatorType", value));
 }
 
 const StringUtil::EnumStringLiteral *GetLogicalTypeIdValues() {
@@ -4020,19 +4040,20 @@ const StringUtil::EnumStringLiteral *GetOptimizerTypeValues() {
 		{ static_cast<uint32_t>(OptimizerType::GROUPING_SETS), "GROUPING_SETS" },
 		{ static_cast<uint32_t>(OptimizerType::TYPE_PUSHDOWN), "TYPE_PUSHDOWN" },
 		{ static_cast<uint32_t>(OptimizerType::SCALAR_FN_PUSHDOWN), "SCALAR_FN_PUSHDOWN" },
-		{ static_cast<uint32_t>(OptimizerType::DISTINCT_AGGREGATE_REWRITE), "DISTINCT_AGGREGATE_REWRITE" }
+		{ static_cast<uint32_t>(OptimizerType::DISTINCT_AGGREGATE_REWRITE), "DISTINCT_AGGREGATE_REWRITE" },
+		{ static_cast<uint32_t>(OptimizerType::GROUP_JOIN), "GROUP_JOIN" }
 	};
 	return values;
 }
 
 template<>
 const char* EnumUtil::ToChars<OptimizerType>(OptimizerType value) {
-	return StringUtil::EnumToString(GetOptimizerTypeValues(), 44, "OptimizerType", static_cast<uint32_t>(value));
+	return StringUtil::EnumToString(GetOptimizerTypeValues(), 45, "OptimizerType", static_cast<uint32_t>(value));
 }
 
 template<>
 OptimizerType EnumUtil::FromString<OptimizerType>(const char *value) {
-	return static_cast<OptimizerType>(StringUtil::StringToEnum(GetOptimizerTypeValues(), 44, "OptimizerType", value));
+	return static_cast<OptimizerType>(StringUtil::StringToEnum(GetOptimizerTypeValues(), 45, "OptimizerType", value));
 }
 
 const StringUtil::EnumStringLiteral *GetOrderByColumnTypeValues() {

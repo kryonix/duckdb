@@ -25,6 +25,7 @@
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_group_join.hpp"
 
 namespace duckdb {
 
@@ -415,114 +416,121 @@ static bool CanUsePerfectHashAggregate(ClientContext &context, LogicalAggregate 
 	return true;
 }
 
-PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalAggregate &op) {
-	D_ASSERT(op.children.size() == 1);
-	if (op.children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		auto &join = op.children[0]->Cast<LogicalComparisonJoin>();
-		auto candidate =
-		    TryGetPlannedHashGroupJoinCandidate(op, join, context, HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER);
-		if (candidate) {
-			for (auto &expression : op.expressions) {
-				auto &aggregate = expression->Cast<BoundAggregateExpression>();
-				if (aggregate.GetOrderBys()) {
-					FunctionBinder::BindSortedAggregate(context, aggregate, op.groups, op.grouping_sets);
-				}
-			}
-			const auto left_column_count = join.children[0]->GetColumnBindings().size();
-			reference<PhysicalOperator> probe = CreatePlan(*join.children[candidate->probe_child]);
-			reference<PhysicalOperator> owner = CreatePlan(*join.children[candidate->owner_child]);
+static HashGroupJoinCandidate GetHashGroupJoinCandidate(LogicalGroupJoin &op) {
+	D_ASSERT(op.output_group_sources.size() == op.output_group_indices.size());
+	vector<HashGroupJoinOutputColumn> output_groups;
+	for (idx_t group_idx = 0; group_idx < op.output_group_sources.size(); group_idx++) {
+		output_groups.push_back({op.output_group_sources[group_idx], op.output_group_indices[group_idx]});
+	}
+	return HashGroupJoinCandidate {op.owner_child,       op.probe_child,           op.owner_key_indices,
+	                               op.probe_key_indices, op.owner_payload_indices, std::move(output_groups),
+	                               op.unique_owner,      op.unmatched_policy,      op.routed,
+	                               op.single_match};
+}
 
-			vector<unique_ptr<Expression>> owner_expressions;
-			vector<LogicalType> owner_types;
-			vector<unique_ptr<Expression>> probe_expressions;
-			vector<LogicalType> probe_types;
-			vector<unique_ptr<Expression>> groups;
-			for (idx_t key_idx = 0; key_idx < candidate->owner_key_indices.size(); key_idx++) {
-				auto owner_idx = candidate->owner_key_indices[key_idx];
-				auto probe_idx = candidate->probe_key_indices[key_idx];
-				auto type = owner.get().GetTypes()[owner_idx];
-				owner_types.push_back(type);
-				owner_expressions.push_back(make_uniq<BoundReferenceExpression>(type, owner_idx));
-				probe_types.push_back(type);
-				probe_expressions.push_back(make_uniq<BoundReferenceExpression>(type, probe_idx));
-				groups.push_back(make_uniq<BoundReferenceExpression>(type, key_idx));
-			}
+PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalGroupJoin &op) {
+	D_ASSERT(op.children.size() == 2);
+	auto candidate = GetHashGroupJoinCandidate(op);
+	for (auto &expression : op.expressions) {
+		auto &aggregate = expression->Cast<BoundAggregateExpression>();
+		if (aggregate.GetOrderBys()) {
+			FunctionBinder::BindSortedAggregate(context, aggregate, op.groups, op.grouping_sets);
+		}
+	}
+	reference<PhysicalOperator> probe = CreatePlan(*op.children[candidate.probe_child]);
+	reference<PhysicalOperator> owner = CreatePlan(*op.children[candidate.owner_child]);
 
-			FunctionBinder function_binder(context);
-			vector<unique_ptr<Expression>> owner_payload_aggregates;
-			for (idx_t payload_idx = 0; payload_idx < candidate->owner_payload_indices.size(); payload_idx++) {
-				auto owner_idx = candidate->owner_payload_indices[payload_idx];
-				auto type = owner.get().GetTypes()[owner_idx];
-				owner_types.push_back(type);
-				owner_expressions.push_back(make_uniq<BoundReferenceExpression>(type, owner_idx));
-				vector<unique_ptr<Expression>> first_children;
-				first_children.push_back(make_uniq<BoundReferenceExpression>(type, payload_idx));
-				owner_payload_aggregates.push_back(function_binder.BindAggregateFunction(
-				    FirstFunctionGetter::GetFunction(type), std::move(first_children), nullptr,
-				    AggregateType::NON_DISTINCT));
-			}
+	vector<unique_ptr<Expression>> owner_expressions;
+	vector<LogicalType> owner_types;
+	vector<unique_ptr<Expression>> probe_expressions;
+	vector<LogicalType> probe_types;
+	vector<unique_ptr<Expression>> groups;
+	for (idx_t key_idx = 0; key_idx < candidate.owner_key_indices.size(); key_idx++) {
+		auto owner_idx = candidate.owner_key_indices[key_idx];
+		auto probe_idx = candidate.probe_key_indices[key_idx];
+		auto type = owner.get().GetTypes()[owner_idx];
+		owner_types.push_back(type);
+		owner_expressions.push_back(make_uniq<BoundReferenceExpression>(type, owner_idx));
+		probe_types.push_back(type);
+		probe_expressions.push_back(make_uniq<BoundReferenceExpression>(type, probe_idx));
+		groups.push_back(make_uniq<BoundReferenceExpression>(type, key_idx));
+	}
 
-			vector<unique_ptr<Expression>> aggregates;
-			aggregates.push_back(function_binder.BindAggregateFunction(CountStarFun::GetFunction(), {}, nullptr,
-			                                                           AggregateType::NON_DISTINCT));
-			for (auto &expression : op.expressions) {
-				auto &aggregate = expression->Cast<BoundAggregateExpression>();
-				for (auto &child : aggregate.GetChildrenMutable()) {
-					RewriteGroupJoinProbeReferences(child, candidate->probe_child, left_column_count);
-					auto type = child->GetReturnType();
-					auto projection_index = probe_expressions.size();
-					probe_types.push_back(type);
-					probe_expressions.push_back(std::move(child));
-					child = make_uniq<BoundReferenceExpression>(type, projection_index);
-				}
-			}
-			for (auto &expression : op.expressions) {
-				auto &aggregate = expression->Cast<BoundAggregateExpression>();
-				if (!aggregate.GetFilter()) {
-					continue;
-				}
-				auto &filter = aggregate.GetFilterMutable();
-				RewriteGroupJoinProbeReferences(filter, candidate->probe_child, left_column_count);
-				auto type = filter->GetReturnType();
-				auto payload_index = probe_expressions.size() - candidate->probe_key_indices.size();
-				probe_types.push_back(type);
-				probe_expressions.push_back(std::move(filter));
-				filter = make_uniq<BoundReferenceExpression>(type, payload_index);
-			}
-			for (auto &expression : op.expressions) {
-				aggregates.push_back(std::move(expression));
-			}
+	FunctionBinder function_binder(context);
+	vector<unique_ptr<Expression>> owner_payload_aggregates;
+	for (idx_t payload_idx = 0; payload_idx < candidate.owner_payload_indices.size(); payload_idx++) {
+		auto owner_idx = candidate.owner_payload_indices[payload_idx];
+		auto type = owner.get().GetTypes()[owner_idx];
+		owner_types.push_back(type);
+		owner_expressions.push_back(make_uniq<BoundReferenceExpression>(type, owner_idx));
+		vector<unique_ptr<Expression>> first_children;
+		first_children.push_back(make_uniq<BoundReferenceExpression>(type, payload_idx));
+		owner_payload_aggregates.push_back(function_binder.BindAggregateFunction(
+		    FirstFunctionGetter::GetFunction(type), std::move(first_children), nullptr, AggregateType::NON_DISTINCT));
+	}
 
-			auto &owner_projection = Make<PhysicalProjection>(std::move(owner_types), std::move(owner_expressions),
-			                                                  owner.get().estimated_cardinality);
-			owner_projection.children.push_back(owner);
-			auto execution_mode = Settings::Get<DebugGroupJoinExecutionSetting>(context);
-			if (execution_mode == GroupJoinExecutionMode::INDEX ||
-			    (execution_mode == GroupJoinExecutionMode::AUTO && op.group_join_auto_index)) {
-				auto index_info = TryGetIndexGroupJoinInfo(context, probe, *candidate);
-				if (index_info) {
-					auto &group_join = Make<PhysicalIndexGroupJoin>(
-					    op, owner_projection, *index_info->table, std::move(index_info->index_name),
-					    std::move(index_info->probe_column_ids), std::move(index_info->probe_scan_types),
-					    std::move(index_info->probe_projection_ids), probe.get().GetTypes(),
-					    std::move(index_info->probe_filters), std::move(index_info->probe_residual_filters),
-					    std::move(probe_expressions), std::move(index_info->index_key_map),
-					    std::move(index_info->index_key_types), std::move(aggregates),
-					    std::move(owner_payload_aggregates), std::move(groups), std::move(candidate->output_groups),
-					    candidate->unmatched_policy, op.estimated_cardinality);
-					return group_join;
-				}
-			}
-			auto &probe_projection = Make<PhysicalProjection>(std::move(probe_types), std::move(probe_expressions),
-			                                                  probe.get().estimated_cardinality);
-			probe_projection.children.push_back(probe);
-			auto &group_join = Make<PhysicalHashGroupJoin>(
-			    op, probe_projection, owner_projection, std::move(aggregates), std::move(owner_payload_aggregates),
-			    std::move(groups), std::move(candidate->output_groups), candidate->unmatched_policy, candidate->routed,
-			    candidate->owner_key_proof.has_value(), candidate->single_match, op.estimated_cardinality);
+	vector<unique_ptr<Expression>> aggregates;
+	aggregates.push_back(
+	    function_binder.BindAggregateFunction(CountStarFun::GetFunction(), {}, nullptr, AggregateType::NON_DISTINCT));
+	for (auto &expression : op.expressions) {
+		auto &aggregate = expression->Cast<BoundAggregateExpression>();
+		for (auto &child : aggregate.GetChildrenMutable()) {
+			RewriteGroupJoinProbeReferences(child, candidate.probe_child, op.left_column_count);
+			auto type = child->GetReturnType();
+			auto projection_index = probe_expressions.size();
+			probe_types.push_back(type);
+			probe_expressions.push_back(std::move(child));
+			child = make_uniq<BoundReferenceExpression>(type, projection_index);
+		}
+	}
+	for (auto &expression : op.expressions) {
+		auto &aggregate = expression->Cast<BoundAggregateExpression>();
+		if (!aggregate.GetFilter()) {
+			continue;
+		}
+		auto &filter = aggregate.GetFilterMutable();
+		RewriteGroupJoinProbeReferences(filter, candidate.probe_child, op.left_column_count);
+		auto type = filter->GetReturnType();
+		auto payload_index = probe_expressions.size() - candidate.probe_key_indices.size();
+		probe_types.push_back(type);
+		probe_expressions.push_back(std::move(filter));
+		filter = make_uniq<BoundReferenceExpression>(type, payload_index);
+	}
+	for (auto &expression : op.expressions) {
+		aggregates.push_back(std::move(expression));
+	}
+
+	auto &owner_projection = Make<PhysicalProjection>(std::move(owner_types), std::move(owner_expressions),
+	                                                  owner.get().estimated_cardinality);
+	owner_projection.children.push_back(owner);
+	auto execution_mode = Settings::Get<DebugGroupJoinExecutionSetting>(context);
+	if (execution_mode == GroupJoinExecutionMode::INDEX ||
+	    (execution_mode == GroupJoinExecutionMode::AUTO && op.use_index)) {
+		auto index_info = TryGetIndexGroupJoinInfo(context, probe, candidate);
+		if (index_info) {
+			auto &group_join = Make<PhysicalIndexGroupJoin>(
+			    op, owner_projection, *index_info->table, std::move(index_info->index_name),
+			    std::move(index_info->probe_column_ids), std::move(index_info->probe_scan_types),
+			    std::move(index_info->probe_projection_ids), probe.get().GetTypes(),
+			    std::move(index_info->probe_filters), std::move(index_info->probe_residual_filters),
+			    std::move(probe_expressions), std::move(index_info->index_key_map),
+			    std::move(index_info->index_key_types), std::move(aggregates), std::move(owner_payload_aggregates),
+			    std::move(groups), std::move(candidate.output_groups), candidate.unmatched_policy,
+			    op.estimated_cardinality);
 			return group_join;
 		}
 	}
+	auto &probe_projection = Make<PhysicalProjection>(std::move(probe_types), std::move(probe_expressions),
+	                                                  probe.get().estimated_cardinality);
+	probe_projection.children.push_back(probe);
+	return Make<PhysicalHashGroupJoin>(op, probe_projection, owner_projection, std::move(aggregates),
+	                                   std::move(owner_payload_aggregates), std::move(groups),
+	                                   std::move(candidate.output_groups), candidate.unmatched_policy, candidate.routed,
+	                                   candidate.unique_owner, candidate.single_match, op.estimated_cardinality);
+}
+
+PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalAggregate &op) {
+	D_ASSERT(op.children.size() == 1);
 
 	reference<PhysicalOperator> plan = CreatePlan(*op.children[0]);
 	plan = ExtractAggregateExpressions(plan, op.expressions, op.groups, op.grouping_sets);

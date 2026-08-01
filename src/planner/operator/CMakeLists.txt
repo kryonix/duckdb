@@ -24,6 +24,7 @@ add_library_unity(
   logical_extension_operator.cpp
   logical_filter.cpp
   logical_get.cpp
+  logical_group_join.cpp
   logical_insert.cpp
   logical_join.cpp
   logical_limit.cpp

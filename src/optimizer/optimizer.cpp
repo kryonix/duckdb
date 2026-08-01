@@ -19,6 +19,7 @@
 #include "duckdb/optimizer/filter_pullup.hpp"
 #include "duckdb/optimizer/filter_pushdown.hpp"
 #include "duckdb/optimizer/grouping_sets_optimizer.hpp"
+#include "duckdb/optimizer/hash_group_join.hpp"
 #include "duckdb/optimizer/in_clause_rewriter.hpp"
 #include "duckdb/optimizer/join_elimination.hpp"
 #include "duckdb/optimizer/join_filter_pushdown_optimizer.hpp"
@@ -496,6 +497,8 @@ unique_ptr<LogicalOperator> Optimizer::Optimize(unique_ptr<LogicalOperator> plan
 			}
 		});
 	}
+
+	RunOptimizer(OptimizerType::GROUP_JOIN, [&]() { PlanHashGroupJoins(plan, context); });
 
 	Planner::VerifyPlan(context, plan);
 

@@ -36,6 +36,8 @@ enum class ARTConflictType : uint8_t;
 
 enum class ARTHandlingResult : uint8_t;
 
+enum class ARTLookupResult : uint8_t;
+
 enum class ARTScanHandling : uint8_t;
 
 enum class ARTScanResult : uint8_t;
@@ -624,6 +626,9 @@ const char* EnumUtil::ToChars<ARTConflictType>(ARTConflictType value);
 
 template<>
 const char* EnumUtil::ToChars<ARTHandlingResult>(ARTHandlingResult value);
+
+template<>
+const char* EnumUtil::ToChars<ARTLookupResult>(ARTLookupResult value);
 
 template<>
 const char* EnumUtil::ToChars<ARTScanHandling>(ARTScanHandling value);
@@ -1504,6 +1509,9 @@ ARTConflictType EnumUtil::FromString<ARTConflictType>(const char *value);
 
 template<>
 ARTHandlingResult EnumUtil::FromString<ARTHandlingResult>(const char *value);
+
+template<>
+ARTLookupResult EnumUtil::FromString<ARTLookupResult>(const char *value);
 
 template<>
 ARTScanHandling EnumUtil::FromString<ARTScanHandling>(const char *value);

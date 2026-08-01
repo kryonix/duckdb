@@ -134,6 +134,9 @@ unique_ptr<LogicalOperator> LogicalOperator::Deserialize(Deserializer &deseriali
 	case LogicalOperatorType::LOGICAL_GET:
 		result = LogicalGet::Deserialize(deserializer);
 		break;
+	case LogicalOperatorType::LOGICAL_GROUP_JOIN:
+		result = LogicalGroupJoin::Deserialize(deserializer);
+		break;
 	case LogicalOperatorType::LOGICAL_INSERT:
 		result = LogicalInsert::Deserialize(deserializer);
 		break;
@@ -616,6 +619,57 @@ unique_ptr<LogicalOperator> LogicalFilter::Deserialize(Deserializer &deserialize
 	auto result = duckdb::unique_ptr<LogicalFilter>(new LogicalFilter());
 	deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(200, "expressions", result->expressions);
 	deserializer.ReadPropertyWithDefault<vector<ProjectionIndex>>(201, "projection_map", result->projection_map);
+	return std::move(result);
+}
+
+void LogicalGroupJoin::Serialize(Serializer &serializer) const {
+	LogicalOperator::Serialize(serializer);
+	serializer.WritePropertyWithDefault<vector<unique_ptr<Expression>>>(200, "expressions", expressions);
+	serializer.WritePropertyWithDefault<TableIndex>(201, "group_index", group_index);
+	serializer.WritePropertyWithDefault<TableIndex>(202, "aggregate_index", aggregate_index);
+	serializer.WritePropertyWithDefault<TableIndex>(203, "groupings_index", groupings_index);
+	serializer.WritePropertyWithDefault<vector<unique_ptr<Expression>>>(204, "groups", groups);
+	serializer.WritePropertyWithDefault<vector<GroupingSet>>(205, "grouping_sets", grouping_sets);
+	serializer.WritePropertyWithDefault<vector<unsafe_vector<ProjectionIndex>>>(206, "grouping_functions", grouping_functions);
+	serializer.WritePropertyWithDefault<TupleDataValidityType>(207, "distinct_validity", distinct_validity, TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+	serializer.WritePropertyWithDefault<idx_t>(208, "owner_child", owner_child);
+	serializer.WritePropertyWithDefault<idx_t>(209, "probe_child", probe_child);
+	serializer.WritePropertyWithDefault<idx_t>(210, "left_column_count", left_column_count);
+	serializer.WritePropertyWithDefault<vector<idx_t>>(211, "owner_key_indices", owner_key_indices);
+	serializer.WritePropertyWithDefault<vector<idx_t>>(212, "probe_key_indices", probe_key_indices);
+	serializer.WritePropertyWithDefault<vector<idx_t>>(213, "owner_payload_indices", owner_payload_indices);
+	serializer.WritePropertyWithDefault<vector<HashGroupJoinOutputSource>>(214, "output_group_sources", output_group_sources);
+	serializer.WritePropertyWithDefault<vector<idx_t>>(215, "output_group_indices", output_group_indices);
+	serializer.WriteProperty<HashGroupJoinUnmatchedPolicy>(216, "unmatched_policy", unmatched_policy);
+	serializer.WritePropertyWithDefault<bool>(217, "routed", routed, false);
+	serializer.WritePropertyWithDefault<bool>(218, "unique_owner", unique_owner, false);
+	serializer.WritePropertyWithDefault<bool>(219, "single_match", single_match, false);
+	serializer.WritePropertyWithDefault<bool>(220, "use_index", use_index, false);
+}
+
+unique_ptr<LogicalOperator> LogicalGroupJoin::Deserialize(Deserializer &deserializer) {
+	auto expressions = deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(200, "expressions");
+	auto group_index = deserializer.ReadPropertyWithDefault<TableIndex>(201, "group_index");
+	auto aggregate_index = deserializer.ReadPropertyWithDefault<TableIndex>(202, "aggregate_index");
+	auto result = duckdb::unique_ptr<LogicalGroupJoin>(new LogicalGroupJoin(group_index, aggregate_index, std::move(expressions)));
+	deserializer.ReadPropertyWithDefault<TableIndex>(203, "groupings_index", result->groupings_index);
+	deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(204, "groups", result->groups);
+	deserializer.ReadPropertyWithDefault<vector<GroupingSet>>(205, "grouping_sets", result->grouping_sets);
+	deserializer.ReadPropertyWithDefault<vector<unsafe_vector<ProjectionIndex>>>(206, "grouping_functions", result->grouping_functions);
+	deserializer.ReadPropertyWithExplicitDefault<TupleDataValidityType>(207, "distinct_validity", result->distinct_validity, TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+	deserializer.ReadPropertyWithDefault<idx_t>(208, "owner_child", result->owner_child);
+	deserializer.ReadPropertyWithDefault<idx_t>(209, "probe_child", result->probe_child);
+	deserializer.ReadPropertyWithDefault<idx_t>(210, "left_column_count", result->left_column_count);
+	deserializer.ReadPropertyWithDefault<vector<idx_t>>(211, "owner_key_indices", result->owner_key_indices);
+	deserializer.ReadPropertyWithDefault<vector<idx_t>>(212, "probe_key_indices", result->probe_key_indices);
+	deserializer.ReadPropertyWithDefault<vector<idx_t>>(213, "owner_payload_indices", result->owner_payload_indices);
+	deserializer.ReadPropertyWithDefault<vector<HashGroupJoinOutputSource>>(214, "output_group_sources", result->output_group_sources);
+	deserializer.ReadPropertyWithDefault<vector<idx_t>>(215, "output_group_indices", result->output_group_indices);
+	deserializer.ReadProperty<HashGroupJoinUnmatchedPolicy>(216, "unmatched_policy", result->unmatched_policy);
+	deserializer.ReadPropertyWithExplicitDefault<bool>(217, "routed", result->routed, false);
+	deserializer.ReadPropertyWithExplicitDefault<bool>(218, "unique_owner", result->unique_owner, false);
+	deserializer.ReadPropertyWithExplicitDefault<bool>(219, "single_match", result->single_match, false);
+	deserializer.ReadPropertyWithExplicitDefault<bool>(220, "use_index", result->use_index, false);
 	return std::move(result);
 }
 

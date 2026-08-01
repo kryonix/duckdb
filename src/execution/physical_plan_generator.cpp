@@ -93,6 +93,8 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlanInternal(LogicalOperator &op)
 		return CreatePlan(op.Cast<LogicalFilter>());
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
 		return CreatePlan(op.Cast<LogicalAggregate>());
+	case LogicalOperatorType::LOGICAL_GROUP_JOIN:
+		return CreatePlan(op.Cast<LogicalGroupJoin>());
 	case LogicalOperatorType::LOGICAL_WINDOW:
 		return CreatePlan(op.Cast<LogicalWindow>());
 	case LogicalOperatorType::LOGICAL_UNNEST:

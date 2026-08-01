@@ -1,5 +1,7 @@
 #include "duckdb/optimizer/hash_group_join.hpp"
 
+#include "duckdb/optimizer/key_properties.hpp"
+
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -10,6 +12,7 @@
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_group_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/main/settings.hpp"
@@ -203,17 +206,13 @@ optional<HashGroupJoinCandidate> TryGetHashGroupJoinCandidate(LogicalAggregate &
 			if (key_property.has_value() != require_unique) {
 				continue;
 			}
-			optional<UniqueKeyProof> key_proof;
-			if (key_property) {
-				key_proof = key_property->proof;
-			}
 			HashGroupJoinCandidate candidate {owner_child,
 			                                  probe_child,
 			                                  side_keys[owner_child],
 			                                  side_keys[probe_child],
 			                                  {},
 			                                  {},
-			                                  std::move(key_proof),
+			                                  key_property.has_value(),
 			                                  unmatched_policy,
 			                                  false,
 			                                  join.join_type == JoinType::SEMI};
@@ -278,8 +277,8 @@ optional<HashGroupJoinCandidate> TryGetHashGroupJoinCandidate(LogicalAggregate &
 			if (!valid) {
 				continue;
 			}
-			candidate.routed = !candidate.owner_key_proof || std::find(used_conditions.begin(), used_conditions.end(),
-			                                                           false) != used_conditions.end();
+			candidate.routed = !candidate.unique_owner || std::find(used_conditions.begin(), used_conditions.end(),
+			                                                        false) != used_conditions.end();
 			return candidate;
 		}
 	}
@@ -408,7 +407,7 @@ static bool HasAutoHashGroupJoinART(LogicalComparisonJoin &join, const HashGroup
 
 static bool PassesAutoIndexGroupJoinCostModel(LogicalAggregate &aggregate, LogicalComparisonJoin &join,
                                               const HashGroupJoinCandidate &candidate, ClientContext &context) {
-	if (join.join_type != JoinType::INNER || candidate.routed || !candidate.owner_key_proof ||
+	if (join.join_type != JoinType::INNER || candidate.routed || !candidate.unique_owner ||
 	    candidate.unmatched_policy != HashGroupJoinUnmatchedPolicy::DISCARD || !join.has_estimated_cardinality ||
 	    !join.children[candidate.owner_child]->has_estimated_cardinality ||
 	    !join.children[candidate.probe_child]->has_estimated_cardinality) {
@@ -433,7 +432,7 @@ static bool PassesAutoIndexGroupJoinCostModel(LogicalAggregate &aggregate, Logic
 
 static bool PassesAutoHashGroupJoinCostModel(LogicalAggregate &aggregate, LogicalComparisonJoin &join,
                                              const HashGroupJoinCandidate &candidate, ClientContext &context) {
-	if (join.join_type != JoinType::INNER || candidate.routed || !candidate.owner_key_proof ||
+	if (join.join_type != JoinType::INNER || candidate.routed || !candidate.unique_owner ||
 	    candidate.unmatched_policy != HashGroupJoinUnmatchedPolicy::DISCARD ||
 	    TaskScheduler::GetScheduler(context).NumberOfThreads() != 1 || !join.has_estimated_cardinality ||
 	    !join.children[candidate.owner_child]->has_estimated_cardinality ||
@@ -522,6 +521,53 @@ optional<HashGroupJoinCandidate> TryGetPlannedHashGroupJoinCandidate(LogicalAggr
 		return nullopt;
 	}
 	return TryGetHashGroupJoinCandidate(aggregate, join, context, mode);
+}
+
+void PlanHashGroupJoins(unique_ptr<LogicalOperator> &root, ClientContext &context) {
+	for (auto &child : root->children) {
+		PlanHashGroupJoins(child, context);
+	}
+	if (root->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY || root->children.size() != 1 ||
+	    root->children[0]->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		return;
+	}
+	auto &aggregate = root->Cast<LogicalAggregate>();
+	auto &join = root->children[0]->Cast<LogicalComparisonJoin>();
+	auto candidate = TryGetPlannedHashGroupJoinCandidate(aggregate, join, context,
+	                                                     HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER);
+	if (!candidate) {
+		return;
+	}
+
+	auto result =
+	    make_uniq<LogicalGroupJoin>(aggregate.group_index, aggregate.aggregate_index, std::move(aggregate.expressions));
+	result->groupings_index = aggregate.groupings_index;
+	result->groups = std::move(aggregate.groups);
+	result->grouping_sets = std::move(aggregate.grouping_sets);
+	result->grouping_functions = std::move(aggregate.grouping_functions);
+	result->group_stats = std::move(aggregate.group_stats);
+	result->distinct_validity = aggregate.distinct_validity;
+	result->types = std::move(aggregate.types);
+	result->estimated_cardinality = aggregate.estimated_cardinality;
+	result->has_estimated_cardinality = aggregate.has_estimated_cardinality;
+
+	result->owner_child = candidate->owner_child;
+	result->probe_child = candidate->probe_child;
+	result->left_column_count = join.children[0]->GetColumnBindings().size();
+	result->owner_key_indices = std::move(candidate->owner_key_indices);
+	result->probe_key_indices = std::move(candidate->probe_key_indices);
+	result->owner_payload_indices = std::move(candidate->owner_payload_indices);
+	for (auto &output_group : candidate->output_groups) {
+		result->output_group_sources.push_back(output_group.source);
+		result->output_group_indices.push_back(output_group.index);
+	}
+	result->unmatched_policy = candidate->unmatched_policy;
+	result->routed = candidate->routed;
+	result->unique_owner = candidate->unique_owner;
+	result->single_match = candidate->single_match;
+	result->use_index = aggregate.group_join_auto_index;
+	result->children = std::move(join.children);
+	root = std::move(result);
 }
 
 static vector<idx_t> GetProjectedColumns(LogicalOperator &child, const vector<ProjectionIndex> &projection_map) {

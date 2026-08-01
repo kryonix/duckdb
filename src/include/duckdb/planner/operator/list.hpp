@@ -24,6 +24,7 @@
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_group_join.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"

@@ -8,6 +8,7 @@
 #include "duckdb/planner/operator/logical_create_index.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_group_join.hpp"
 #include "duckdb/planner/operator/logical_recursive_cte.hpp"
 #include "duckdb/main/settings.hpp"
 
@@ -130,6 +131,21 @@ void ColumnBindingResolver::VisitOperator(LogicalOperator &op) {
 			throw InternalException("RIGHT SEMI/ANTI any join not supported yet");
 		}
 		VisitOperatorExpressions(op);
+		return;
+	}
+	case LogicalOperatorType::LOGICAL_GROUP_JOIN: {
+		D_ASSERT(op.children.size() == 2);
+		VisitOperator(*op.children[0]);
+		auto combined_bindings = bindings;
+		auto combined_types = types;
+		VisitOperator(*op.children[1]);
+		combined_bindings.insert(combined_bindings.end(), bindings.begin(), bindings.end());
+		combined_types.insert(combined_types.end(), types.begin(), types.end());
+		bindings = std::move(combined_bindings);
+		types = std::move(combined_types);
+		VisitOperatorExpressions(op);
+		bindings = op.GetColumnBindings();
+		types = op.types;
 		return;
 	}
 	case LogicalOperatorType::LOGICAL_CREATE_INDEX: {

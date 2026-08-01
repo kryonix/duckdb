@@ -130,6 +130,128 @@
     ]
   },
   {
+    "class": "LogicalGroupJoin",
+    "base": "LogicalOperator",
+    "enum": "LOGICAL_GROUP_JOIN",
+    "members": [
+      {
+        "id": 200,
+        "name": "expressions",
+        "type": "vector<Expression*>"
+      },
+      {
+        "id": 201,
+        "name": "group_index",
+        "type": "TableIndex"
+      },
+      {
+        "id": 202,
+        "name": "aggregate_index",
+        "type": "TableIndex"
+      },
+      {
+        "id": 203,
+        "name": "groupings_index",
+        "type": "TableIndex"
+      },
+      {
+        "id": 204,
+        "name": "groups",
+        "type": "vector<Expression*>"
+      },
+      {
+        "id": 205,
+        "name": "grouping_sets",
+        "type": "vector<GroupingSet>"
+      },
+      {
+        "id": 206,
+        "name": "grouping_functions",
+        "type": "vector<unsafe_vector<ProjectionIndex>>"
+      },
+      {
+        "id": 207,
+        "name": "distinct_validity",
+        "type": "TupleDataValidityType",
+        "default": "TupleDataValidityType::CAN_HAVE_NULL_VALUES"
+      },
+      {
+        "id": 208,
+        "name": "owner_child",
+        "type": "idx_t"
+      },
+      {
+        "id": 209,
+        "name": "probe_child",
+        "type": "idx_t"
+      },
+      {
+        "id": 210,
+        "name": "left_column_count",
+        "type": "idx_t"
+      },
+      {
+        "id": 211,
+        "name": "owner_key_indices",
+        "type": "vector<idx_t>"
+      },
+      {
+        "id": 212,
+        "name": "probe_key_indices",
+        "type": "vector<idx_t>"
+      },
+      {
+        "id": 213,
+        "name": "owner_payload_indices",
+        "type": "vector<idx_t>"
+      },
+      {
+        "id": 214,
+        "name": "output_group_sources",
+        "type": "vector<HashGroupJoinOutputSource>"
+      },
+      {
+        "id": 215,
+        "name": "output_group_indices",
+        "type": "vector<idx_t>"
+      },
+      {
+        "id": 216,
+        "name": "unmatched_policy",
+        "type": "HashGroupJoinUnmatchedPolicy"
+      },
+      {
+        "id": 217,
+        "name": "routed",
+        "type": "bool",
+        "default": "false"
+      },
+      {
+        "id": 218,
+        "name": "unique_owner",
+        "type": "bool",
+        "default": "false"
+      },
+      {
+        "id": 219,
+        "name": "single_match",
+        "type": "bool",
+        "default": "false"
+      },
+      {
+        "id": 220,
+        "name": "use_index",
+        "type": "bool",
+        "default": "false"
+      }
+    ],
+    "constructor": [
+      "group_index",
+      "aggregate_index",
+      "expressions"
+    ]
+  },
+  {
     "class": "LogicalWindow",
     "base": "LogicalOperator",
     "enum": "LOGICAL_WINDOW",

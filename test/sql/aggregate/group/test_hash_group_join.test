@@ -42,7 +42,49 @@ PRAGMA enable_optimizer
 statement ok
 SET debug_group_join_strategy = 'force'
 
-# Force protects an eligible candidate from partial aggregate pushdown and selects the physical specialization.
+# Force protects an eligible candidate from partial aggregate pushdown and produces a first-class logical GroupJoin.
+statement ok
+PRAGMA explain_output = 'optimized_only'
+
+query II
+EXPLAIN SELECT o.id, count(*), sum(p.value)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+logical_opt	<REGEX>:.*Group Join.*
+
+statement ok
+SET debug_verify_serializer = true
+
+query III rowsort
+SELECT o.id, count(*), sum(p.value)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+1	3	20
+2	3	10
+
+statement ok
+SET debug_verify_serializer = false
+
+# The conversion is an independently controllable optimizer stage.
+statement ok
+SET disabled_optimizers = 'group_join'
+
+query II
+EXPLAIN SELECT o.id, count(*), sum(p.value)
+FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
+GROUP BY o.id
+----
+logical_opt	<!REGEX>:.*Group Join.*
+
+statement ok
+SET disabled_optimizers = ''
+
+statement ok
+PRAGMA explain_output = 'physical_only'
+
+# The first-class logical operator selects the physical specialization.
 query II
 EXPLAIN SELECT o.id, count(*), sum(p.value)
 FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id

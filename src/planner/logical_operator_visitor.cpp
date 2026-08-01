@@ -189,6 +189,13 @@ static void EnumerateOperatorExpressions(OPERATOR &op, const FUNC &callback) {
 		}
 		break;
 	}
+	case LogicalOperatorType::LOGICAL_GROUP_JOIN: {
+		auto &group_join = op.template Cast<LogicalGroupJoin>();
+		for (auto &group : group_join.groups) {
+			callback(&group);
+		}
+		break;
+	}
 	case LogicalOperatorType::LOGICAL_MERGE_INTO: {
 		auto &merge_into = op.template Cast<LogicalMergeInto>();
 		for (auto &entry : merge_into.actions) {

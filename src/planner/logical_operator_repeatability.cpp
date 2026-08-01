@@ -37,6 +37,7 @@ static LogicalOperatorRepeatability ClassifyOperatorType(LogicalOperator &op) {
 	case LogicalOperatorType::LOGICAL_PROJECTION:
 	case LogicalOperatorType::LOGICAL_FILTER:
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+	case LogicalOperatorType::LOGICAL_GROUP_JOIN:
 	case LogicalOperatorType::LOGICAL_UNNEST:
 	case LogicalOperatorType::LOGICAL_ORDER_BY:
 	case LogicalOperatorType::LOGICAL_DISTINCT:
