@@ -566,6 +566,9 @@ void PlanHashGroupJoins(unique_ptr<LogicalOperator> &root, ClientContext &contex
 	result->unique_owner = candidate->unique_owner;
 	result->single_match = candidate->single_match;
 	result->use_index = aggregate.group_join_auto_index;
+	if (candidate->owner_child == 1) {
+		result->filter_pushdown = std::move(join.filter_pushdown);
+	}
 	result->children = std::move(join.children);
 	root = std::move(result);
 }

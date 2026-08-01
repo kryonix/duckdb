@@ -612,7 +612,7 @@ struct DebugGroupJoinStrategySetting {
 	static constexpr const char *Name = "debug_group_join_strategy";
 	static constexpr const char *Description = "DEBUG SETTING: choose the physical GroupJoin strategy";
 	static constexpr const char *InputType = "VARCHAR";
-	static constexpr const char *DefaultValue = "DISABLED";
+	static constexpr const char *DefaultValue = "AUTO";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
 	static void OnSet(SettingCallbackInfo &info, Value &input);

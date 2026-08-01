@@ -51,6 +51,9 @@ SELECT count(*), sum(n), sum(s) FROM (
 ----
 100000	4000000	9949998000000
 
+statement ok
+PRAGMA profiling_output = '{TEST_DIR}/hash_group_join_external_distinct.json'
+
 query I
 SELECT count(DISTINCT p.v)
 FROM external_owner o
@@ -59,6 +62,24 @@ GROUP BY o.id
 ----
 5000000
 
+# A hot non-unique lookup key exercises routed external execution without materializing the owner partition as Values.
+statement ok
+CREATE TABLE external_general_owner AS
+SELECT 0::INTEGER id, (i % 13)::INTEGER payload FROM range(500000) t(i)
+
+statement ok
+PRAGMA profiling_output = '{TEST_DIR}/hash_group_join_external_general.json'
+
+query III
+SELECT count(*), sum(n), sum(s) FROM (
+	SELECT o.payload, count(*) n, sum(p.v) s
+	FROM external_general_owner o
+	JOIN (VALUES (0, 7::BIGINT)) p(id, v) USING (id)
+	GROUP BY o.payload
+)
+----
+13	500000	3500000
+
 statement ok
 PRAGMA disable_profiling
 
@@ -66,10 +87,15 @@ statement ok
 RESET memory_limit
 
 statement ok
-CREATE TEMP TABLE external_metrics AS SELECT * FROM '{TEST_DIR}/hash_group_join_external.json'
+CREATE TEMP TABLE external_metrics AS
+SELECT * FROM '{TEST_DIR}/hash_group_join_external.json'
+UNION ALL
+SELECT * FROM '{TEST_DIR}/hash_group_join_external_distinct.json'
+UNION ALL
+SELECT * FROM '{TEST_DIR}/hash_group_join_external_general.json'
 
-query II
-SELECT system.peak_buffer_memory <= 30000000, system.peak_temp_dir_size > 0
+query III
+SELECT count(*), min(system.peak_buffer_memory <= 30000000), min(system.peak_temp_dir_size > 0)
 FROM external_metrics
 ----
-true	true
+3	true	true

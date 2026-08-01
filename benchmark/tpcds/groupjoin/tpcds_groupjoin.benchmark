@@ -1,0 +1,23 @@
+# name: benchmark/tpcds/groupjoin/tpcds_groupjoin.benchmark
+# description: Parameterized TPC-DS GroupJoin comparison
+# group: [groupjoin]
+
+name TPC-DS Q${query_number_padded} ${strategy}
+group tpcds
+subgroup groupjoin
+
+argument query_number_padded 41
+argument strategy disabled
+argument execution auto
+argument sf 0.01
+
+require tpcds
+
+load
+SET debug_group_join_strategy TO '${strategy}';
+SET debug_group_join_execution TO '${execution}';
+CALL dsdgen(sf = ${sf});
+
+run extension/tpcds/dsdgen/queries/${query_number_padded}.sql
+
+result extension/tpcds/dsdgen/answers/sf${sf}/${query_number_padded}.csv

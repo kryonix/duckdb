@@ -21,6 +21,8 @@ class DataChunk;
 class DynamicTableFilterSet;
 class LogicalGet;
 class JoinHashTable;
+class BloomFilter;
+class PrefixRangeFilter;
 class PhysicalOperator;
 class PhysicalComparisonJoin;
 struct GlobalUngroupedAggregateState;
@@ -127,6 +129,11 @@ public:
 	                                      unique_ptr<DataChunk> final_min_max, optional_ptr<JoinHashTable> ht = nullptr,
 	                                      bool allow_bloom_filters = true, bool allow_prefix_range_filters = true,
 	                                      optional_ptr<JoinFilterGlobalState> gstate = nullptr) const;
+	void FinalizeGroupJoinFilters(ClientContext &context, const PhysicalOperator &op,
+	                              const vector<LogicalType> &key_types, const vector<string> &key_names,
+	                              const vector<unique_ptr<BloomFilter>> &bloom_filters,
+	                              const vector<unique_ptr<PrefixRangeFilter>> &prefix_range_filters,
+	                              unique_ptr<DataChunk> final_min_max) const;
 
 private:
 	bool PushInFilter(ClientContext &context, const JoinFilterPushdownFilter &info,

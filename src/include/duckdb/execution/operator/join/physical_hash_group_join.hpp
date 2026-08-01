@@ -9,6 +9,7 @@
 
 #include "duckdb/execution/group_join_strategy.hpp"
 #include "duckdb/execution/operator/aggregate/grouped_aggregate_data.hpp"
+#include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/execution/operator/join/physical_join.hpp"
 
 namespace duckdb {
@@ -32,7 +33,8 @@ public:
 	                      vector<unique_ptr<Expression>> owner_payload_aggregates,
 	                      vector<unique_ptr<Expression>> groups, vector<HashGroupJoinOutputColumn> output_groups,
 	                      HashGroupJoinUnmatchedPolicy unmatched_policy, bool routed, bool unique_owner,
-	                      bool single_match, idx_t estimated_cardinality);
+	                      bool single_match, unique_ptr<JoinFilterPushdownInfo> filter_pushdown,
+	                      idx_t estimated_cardinality);
 	PhysicalHashGroupJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op, PhysicalOperator &probe,
 	                      PhysicalOperator &owner, vector<unique_ptr<Expression>> aggregates,
 	                      vector<unique_ptr<Expression>> owner_payload_aggregates,
@@ -55,6 +57,7 @@ public:
 	bool null_equal;
 	bool static_mode;
 	vector<LogicalType> output_group_types;
+	unique_ptr<JoinFilterPushdownInfo> filter_pushdown;
 
 public:
 	unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) const override;

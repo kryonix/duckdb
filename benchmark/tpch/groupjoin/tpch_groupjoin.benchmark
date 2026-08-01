@@ -1,0 +1,22 @@
+# name: benchmark/tpch/groupjoin/tpch_groupjoin.benchmark
+# description: Parameterized TPC-H GroupJoin comparison at SF1
+# group: [groupjoin]
+
+name TPC-H Q${query_number_padded} ${strategy}
+group tpch
+subgroup groupjoin
+
+argument query_number_padded 13
+argument strategy disabled
+argument execution auto
+
+require tpch
+
+load
+SET debug_group_join_strategy TO '${strategy}';
+SET debug_group_join_execution TO '${execution}';
+CALL dbgen(sf = 1);
+
+run extension/tpch/dbgen/queries/q${query_number_padded}.sql
+
+result extension/tpch/dbgen/answers/sf1/q${query_number_padded}.csv

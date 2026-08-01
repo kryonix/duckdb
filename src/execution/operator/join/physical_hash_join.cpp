@@ -1614,7 +1614,7 @@ static void PublishDeferredRuntimeFilters(ClientContext &context, JoinHashTable 
 	gstate.deferred_runtime_filters.clear();
 }
 
-static void CreateDynamicMinMaxFilter(const PhysicalComparisonJoin &op, const JoinFilterPushdownFilter &info,
+static void CreateDynamicMinMaxFilter(const PhysicalOperator &op, const JoinFilterPushdownFilter &info,
                                       const ProjectionIndex &filter_col_idx, unique_ptr<Expression> filter_expr,
                                       const LogicalType &column_type, bool selectivity_optional) {
 	if (!filter_expr) {
@@ -1721,7 +1721,7 @@ bool JoinFilterPushdownInfo::PushInFilter(ClientContext &context, const JoinFilt
 	return true;
 }
 
-static void CreateDynamicMinMaxFilters(const PhysicalComparisonJoin &op, const JoinFilterPushdownFilter &info,
+static void CreateDynamicMinMaxFilters(const PhysicalOperator &op, const JoinFilterPushdownFilter &info,
                                        ClientContext &context, const JoinFilterPushdownColumn &column,
                                        ProjectionIndex filter_col_idx, ExpressionType cmp, const Value &min_val,
                                        const Value &max_val, const LogicalType &condition_type,
@@ -1754,6 +1754,97 @@ static void CreateDynamicMinMaxFilters(const PhysicalComparisonJoin &op, const J
 	}
 	default:
 		break;
+	}
+}
+
+void JoinFilterPushdownInfo::FinalizeGroupJoinFilters(ClientContext &context, const PhysicalOperator &op,
+                                                      const vector<LogicalType> &key_types,
+                                                      const vector<string> &key_names,
+                                                      const vector<unique_ptr<BloomFilter>> &bloom_filters,
+                                                      const vector<unique_ptr<PrefixRangeFilter>> &prefix_range_filters,
+                                                      unique_ptr<DataChunk> final_min_max) const {
+	if (probe_info.empty()) {
+		return;
+	}
+	for (auto &info : probe_info) {
+		for (auto &column : info.columns) {
+			auto filter_idx = column.join_filter_idx;
+			D_ASSERT(filter_idx < join_condition.size());
+			auto key_idx = join_condition[filter_idx];
+			D_ASSERT(key_idx < key_types.size());
+			auto &filter_col_idx = column.probe_column_index.column_index;
+			auto min_val_before_cast = final_min_max->data[filter_idx * 2].GetValue(0);
+			auto max_val_before_cast = final_min_max->data[filter_idx * 2 + 1].GetValue(0);
+			if (min_val_before_cast.IsNull() || max_val_before_cast.IsNull()) {
+				continue;
+			}
+
+			auto min_val = min_val_before_cast;
+			auto max_val = max_val_before_cast;
+			const bool reconstruct_expression =
+			    RequiresRuntimeFilterExpressionReconstruction(column, min_val_before_cast.type());
+			if (column.storage_type.IsValid() && !reconstruct_expression) {
+				if (!min_val.DefaultTryCastAs(column.storage_type) || !max_val.DefaultTryCastAs(column.storage_type)) {
+					continue;
+				}
+			}
+			auto condition_type = min_val.type();
+			if (Value::NotDistinctFrom(min_val, max_val)) {
+				auto filter_expr = CreateJoinFilterComparisonExpression(
+				    context, column, ExpressionType::COMPARE_EQUAL, min_val, condition_type, reconstruct_expression);
+				if (filter_expr) {
+					info.dynamic_filters->PushFilter(op, filter_col_idx,
+					                                 make_uniq<ExpressionFilter>(std::move(filter_expr)));
+				}
+				continue;
+			}
+
+			if (column.mode == JoinFilterPushdownMode::RECONSTRUCT_EXPRESSION &&
+			    key_idx < prefix_range_filters.size() && prefix_range_filters[key_idx]) {
+				auto input = CreateRuntimeFilterInputExpression(context, column, key_types[key_idx]);
+				auto input_type = input.expression->GetReturnType();
+				vector<unique_ptr<Expression>> children;
+				children.push_back(std::move(input.expression));
+				float selectivity_threshold;
+				idx_t n_vectors_to_check;
+				GetThresholdAndVectorsToCheck(SelectivityOptionalFilterType::PRF, selectivity_threshold,
+				                              n_vectors_to_check);
+				auto key_name = key_idx < key_names.size() ? key_names[key_idx] : string();
+				auto filter_expr = make_uniq<BoundFunctionExpression>(
+				    BoundScalarFunction(PrefixRangeScalarFun::GetFunction(input_type)), std::move(children),
+				    make_uniq<PrefixRangeFunctionData>(prefix_range_filters[key_idx].get(),
+				                                       !input.preserves_cast_errors, key_name, key_types[key_idx],
+				                                       selectivity_threshold, n_vectors_to_check));
+				info.dynamic_filters->PushFilter(
+				    op, filter_col_idx,
+				    CreateSelectivityOptionalExpressionFilter(std::move(filter_expr), column.storage_type,
+				                                              SelectivityOptionalFilterType::PRF));
+				continue;
+			}
+
+			CreateDynamicMinMaxFilters(op, info, context, column, filter_col_idx, ExpressionType::COMPARE_EQUAL,
+			                           min_val, max_val, condition_type, reconstruct_expression, false);
+			if (column.mode != JoinFilterPushdownMode::RECONSTRUCT_EXPRESSION || key_idx >= bloom_filters.size() ||
+			    !bloom_filters[key_idx]) {
+				continue;
+			}
+			auto input = CreateRuntimeFilterInputExpression(context, column, key_types[key_idx]);
+			auto input_type = input.expression->GetReturnType();
+			vector<unique_ptr<Expression>> children;
+			children.push_back(std::move(input.expression));
+			float selectivity_threshold;
+			idx_t n_vectors_to_check;
+			GetThresholdAndVectorsToCheck(SelectivityOptionalFilterType::BF, selectivity_threshold, n_vectors_to_check);
+			auto key_name = key_idx < key_names.size() ? key_names[key_idx] : string();
+			auto filter_expr = make_uniq<BoundFunctionExpression>(
+			    BoundScalarFunction(BloomFilterScalarFun::GetFunction(input_type)), std::move(children),
+			    make_uniq<BloomFilterFunctionData>(bloom_filters[key_idx].get(), !input.preserves_cast_errors, key_name,
+			                                       key_types[key_idx], selectivity_threshold, n_vectors_to_check));
+			info.dynamic_filters->PushFilter(
+			    op, filter_col_idx,
+			    CreateSelectivityOptionalExpressionFilter(std::move(filter_expr), column.storage_type,
+			                                              SelectivityOptionalFilterType::BF));
+		}
 	}
 }
 

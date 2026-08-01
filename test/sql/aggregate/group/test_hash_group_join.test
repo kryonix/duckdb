@@ -17,7 +17,7 @@ INSERT INTO gj_probe VALUES
 	(2, NULL, true), (2, 5, false), (2, 5, true),
 	(NULL, 99, true), (5, 100, true)
 
-# The strategy is inert by default.
+# The default cost gate retains the mature plan for an unprofitable candidate.
 query II
 EXPLAIN SELECT o.id, count(*), sum(p.value)
 FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id
@@ -266,6 +266,56 @@ SELECT count(*), sum(c) FROM (
 )
 ----
 4097	13194
+
+# The owner build retains the comparison join's runtime-filter contract and publishes an exact prefix-range filter.
+statement ok
+CREATE TABLE gj_runtime_filter_owner(id INTEGER)
+
+statement ok
+INSERT INTO gj_runtime_filter_owner VALUES (1), (3)
+
+statement ok
+CREATE TABLE gj_runtime_filter_probe AS SELECT i::INTEGER id FROM range(10000) t(i)
+
+query II
+EXPLAIN ANALYZE SELECT o.id, count(*)
+FROM gj_runtime_filter_probe p JOIN gj_runtime_filter_owner o USING (id)
+GROUP BY o.id
+----
+analyzed_plan	<REGEX>:(?s).*Hash Group Join.*IN.*PRF.*
+
+query II rowsort
+SELECT o.id, count(*)
+FROM gj_runtime_filter_probe p JOIN gj_runtime_filter_owner o USING (id)
+GROUP BY o.id
+----
+1	1
+3	1
+
+# Unsupported prefix-range types fall back to a Bloom filter with the same lifetime contract.
+statement ok
+CREATE TABLE gj_runtime_bloom_owner(id HUGEINT)
+
+statement ok
+INSERT INTO gj_runtime_bloom_owner VALUES (1), (3)
+
+statement ok
+CREATE TABLE gj_runtime_bloom_probe AS SELECT i::HUGEINT id FROM range(10000) t(i)
+
+query II
+EXPLAIN ANALYZE SELECT o.id, count(*)
+FROM gj_runtime_bloom_probe p JOIN gj_runtime_bloom_owner o USING (id)
+GROUP BY o.id
+----
+analyzed_plan	<REGEX>:(?s).*Hash Group Join.*IN.*BF.*
+
+query II rowsort
+SELECT o.id, count(*)
+FROM gj_runtime_bloom_probe p JOIN gj_runtime_bloom_owner o USING (id)
+GROUP BY o.id
+----
+1	1
+3	1
 
 # Force genuinely parallel probe scheduling and compare every memoization mode on the same data.
 statement ok
@@ -1382,19 +1432,18 @@ RESET debug_group_join_strategy
 statement ok
 RESET threads
 
-# The default remains disabled after reset.
+# Reset restores AUTO: it retains the mature hash plan for this shape and selects the measured selective ART case.
 query II
 EXPLAIN SELECT o.id, count(*) FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id GROUP BY o.id
 ----
 physical_plan	<!REGEX>:.*Hash Group Join.*
 
-statement ok
-SET debug_group_join_strategy = 'auto'
-
 query II
-EXPLAIN SELECT o.id, count(*) FROM gj_owner o JOIN gj_probe p ON o.id = p.owner_id GROUP BY o.id
+EXPLAIN SELECT o.id, count(*), sum(p.value)
+FROM gj_auto_index_owner o JOIN gj_auto_index_probe p USING (id)
+GROUP BY o.id
 ----
-physical_plan	<!REGEX>:.*Hash Group Join.*
+physical_plan	<REGEX>:.*Index Group Join.*gj_auto_probe_art.*
 
 statement ok
 RESET debug_group_join_strategy

@@ -12,6 +12,9 @@
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 
 namespace duckdb {
@@ -110,16 +113,16 @@ static void StoreGroupJoinId(const TupleDataLayout &layout, data_ptr_t row, idx_
 	state.value = NumericCast<uint64_t>(group_id) + 1;
 }
 
-PhysicalHashGroupJoin::PhysicalHashGroupJoin(PhysicalPlan &physical_plan, LogicalAggregate &op, PhysicalOperator &probe,
-                                             PhysicalOperator &owner, vector<unique_ptr<Expression>> aggregates,
-                                             vector<unique_ptr<Expression>> owner_payload_aggregates,
-                                             vector<unique_ptr<Expression>> groups,
-                                             vector<HashGroupJoinOutputColumn> output_groups_p,
-                                             HashGroupJoinUnmatchedPolicy unmatched_policy_p, bool routed_p,
-                                             bool unique_owner_p, bool single_match_p, idx_t estimated_cardinality)
+PhysicalHashGroupJoin::PhysicalHashGroupJoin(
+    PhysicalPlan &physical_plan, LogicalAggregate &op, PhysicalOperator &probe, PhysicalOperator &owner,
+    vector<unique_ptr<Expression>> aggregates, vector<unique_ptr<Expression>> owner_payload_aggregates,
+    vector<unique_ptr<Expression>> groups, vector<HashGroupJoinOutputColumn> output_groups_p,
+    HashGroupJoinUnmatchedPolicy unmatched_policy_p, bool routed_p, bool unique_owner_p, bool single_match_p,
+    unique_ptr<JoinFilterPushdownInfo> filter_pushdown_p, idx_t estimated_cardinality)
     : PhysicalJoin(physical_plan, op, PhysicalOperatorType::HASH_GROUP_JOIN, JoinType::INNER, estimated_cardinality),
       output_groups(std::move(output_groups_p)), unmatched_policy(unmatched_policy_p), routed(routed_p),
-      unique_owner(unique_owner_p), single_match(single_match_p), null_equal(false), static_mode(false) {
+      unique_owner(unique_owner_p), single_match(single_match_p), null_equal(false), static_mode(false),
+      filter_pushdown(std::move(filter_pushdown_p)) {
 	for (auto &group : op.groups) {
 		output_group_types.push_back(group->GetReturnType());
 	}
@@ -200,6 +203,15 @@ class HashGroupJoinGlobalSinkState : public GlobalSinkState {
 public:
 	HashGroupJoinGlobalSinkState(const PhysicalHashGroupJoin &op, ClientContext &context)
 	    : external(UseExternalHashGroupJoin(op, context)) {
+		if (op.filter_pushdown) {
+			global_filter_state = op.filter_pushdown->GetGlobalState(context, op);
+			local_filter_state = op.filter_pushdown->GetLocalState(*global_filter_state);
+			const auto owner_rows = op.children[1].get().estimated_cardinality;
+			const auto probe_rows = op.children[0].get().estimated_cardinality;
+			if (op.filter_pushdown->join_condition.size() == 1 && owner_rows <= probe_rows) {
+				filter_keys = make_uniq<ColumnDataCollection>(context, op.grouped_aggregate_data.group_types);
+			}
+		}
 		if (external) {
 			auto owner_types = op.children[1].get().GetTypes();
 			owner_types.push_back(LogicalType::HASH);
@@ -244,6 +256,11 @@ public:
 	unique_ptr<atomic<bool>[]> route_matches;
 	unique_ptr<atomic<idx_t>[]> owners;
 	unique_ptr<ColumnDataCollection> static_owner_rows;
+	unique_ptr<JoinFilterGlobalState> global_filter_state;
+	unique_ptr<JoinFilterLocalState> local_filter_state;
+	vector<unique_ptr<BloomFilter>> bloom_filters;
+	vector<unique_ptr<PrefixRangeFilter>> prefix_range_filters;
+	unique_ptr<ColumnDataCollection> filter_keys;
 	bool external;
 	unique_ptr<RadixPartitionedColumnData> owner_partitions;
 	unique_ptr<PartitionedColumnData> owner_local_partitions;
@@ -319,6 +336,13 @@ SinkResultType PhysicalHashGroupJoin::Sink(ExecutionContext &context, DataChunk 
 		local_state.owner_keys.data[key_idx].Reference(chunk.data[key_idx]);
 	}
 	local_state.owner_keys.CheckCardinality(chunk.size());
+	if (filter_pushdown) {
+		D_ASSERT(global_state.local_filter_state);
+		filter_pushdown->Sink(local_state.owner_keys, *global_state.local_filter_state);
+		if (global_state.filter_keys) {
+			global_state.filter_keys->Append(local_state.owner_keys);
+		}
+	}
 	if (unique_owner && !null_equal && PhysicalJoin::HasNullValues(local_state.owner_keys)) {
 		throw InternalException("HASH_GROUP_JOIN owner key unexpectedly contained NULL");
 	}
@@ -411,10 +435,92 @@ SinkResultType PhysicalHashGroupJoin::Sink(ExecutionContext &context, DataChunk 
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
+static void BuildGroupJoinRuntimeFilters(const PhysicalHashGroupJoin &op, ClientContext &context,
+                                         HashGroupJoinGlobalSinkState &state, const DataChunk &final_min_max) {
+	const auto key_count = op.grouped_aggregate_data.group_types.size();
+	state.bloom_filters.resize(key_count);
+	state.prefix_range_filters.resize(key_count);
+	if (!state.filter_keys || state.filter_keys->Count() == 0) {
+		return;
+	}
+	D_ASSERT(op.filter_pushdown->join_condition.size() == 1);
+	const auto filter_idx = idx_t(0);
+	const auto key_idx = op.filter_pushdown->join_condition[filter_idx];
+	D_ASSERT(key_idx < key_count);
+	const auto probe_rows = op.children[0].get().estimated_cardinality;
+	const auto ratio =
+	    static_cast<double>(state.owner_rows) / static_cast<double>(MaxValue<idx_t>(probe_rows, idx_t(1)));
+	const bool build_filter = state.owner_rows <= probe_rows && (op.filter_pushdown->build_side_has_filter ||
+	                                                             ratio <= 0.1 || state.owner_rows <= 4194304);
+	if (!build_filter) {
+		state.filter_keys.reset();
+		return;
+	}
+
+	unique_ptr<PrefixRangeFilter::BuildState> prefix_build_state;
+	auto &key_type = op.grouped_aggregate_data.group_types[key_idx];
+	auto min_value = final_min_max.data[filter_idx * 2].GetValue(0);
+	auto max_value = final_min_max.data[filter_idx * 2 + 1].GetValue(0);
+	if (min_value.IsNull() || max_value.IsNull() || Value::NotDistinctFrom(min_value, max_value)) {
+		state.filter_keys.reset();
+		return;
+	}
+	if (PrefixRangeFilter::SupportedType(key_type)) {
+		uhugeint_t span;
+		if (PrefixRangeFilter::TryComputeSpan(min_value, max_value, span)) {
+			static constexpr idx_t MAX_EXACT_BITS = 1ULL << 26;
+			const auto bloom_bits = BloomFilter::GetNumberOfSectors(MaxValue<idx_t>(state.owner_rows, idx_t(1))) * 64;
+			idx_t max_bits = 0;
+			if (span < MAX_EXACT_BITS) {
+				max_bits = MAX_EXACT_BITS;
+			} else if (span <= bloom_bits) {
+				max_bits = bloom_bits;
+			}
+			if (max_bits > 0) {
+				state.prefix_range_filters[key_idx] = PrefixRangeFilter::CreatePrefixRangeFilter(key_type);
+				state.prefix_range_filters[key_idx]->Initialize(context, state.owner_rows, min_value, max_value,
+				                                                max_bits);
+				prefix_build_state = state.prefix_range_filters[key_idx]->InitializeBuildState(context);
+			}
+		}
+	}
+	if (!state.prefix_range_filters[key_idx]) {
+		state.bloom_filters[key_idx] = make_uniq<BloomFilter>();
+		state.bloom_filters[key_idx]->Initialize(context, state.owner_rows);
+	}
+	Vector hashes(LogicalType::HASH);
+	for (auto &chunk : state.filter_keys->Chunks()) {
+		if (state.prefix_range_filters[key_idx]) {
+			state.prefix_range_filters[key_idx]->InsertKeys(chunk.data[key_idx], *prefix_build_state);
+		} else {
+			VectorOperations::Hash(chunk.data[key_idx], hashes, chunk.size());
+			hashes.Flatten();
+			state.bloom_filters[key_idx]->InsertHashes(hashes);
+		}
+	}
+	if (state.prefix_range_filters[key_idx]) {
+		state.prefix_range_filters[key_idx]->MergeBuildState(*prefix_build_state);
+	}
+	state.filter_keys.reset();
+}
+
 SinkFinalizeType PhysicalHashGroupJoin::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                                  OperatorSinkFinalizeInput &input) const {
 	auto &state = input.global_state.Cast<HashGroupJoinGlobalSinkState>();
 	state.build_finalized = true;
+	if (filter_pushdown) {
+		D_ASSERT(state.global_filter_state && state.local_filter_state);
+		filter_pushdown->Combine(*state.global_filter_state, *state.local_filter_state);
+		vector<string> key_names;
+		for (auto &group : grouped_aggregate_data.groups) {
+			key_names.push_back(group->GetName().GetIdentifierName());
+		}
+		auto final_min_max = filter_pushdown->FinalizeMinMax(*state.global_filter_state);
+		BuildGroupJoinRuntimeFilters(*this, context, state, *final_min_max);
+		filter_pushdown->FinalizeGroupJoinFilters(context, *this, grouped_aggregate_data.group_types, key_names,
+		                                          state.bloom_filters, state.prefix_range_filters,
+		                                          std::move(final_min_max));
+	}
 	if (state.external) {
 		state.owner_local_partitions->FlushAppendState(state.owner_partition_append);
 		state.owner_partitions->Combine(*state.owner_local_partitions);
@@ -1627,21 +1733,28 @@ static void ProcessExternalRoutedLookupPartition(const PhysicalHashGroupJoin &op
 	}
 	route_offsets.push_back(route_owner_rows.size());
 	route_build_rows.clear();
-	auto materialized_owner_rows = owner_partition.GetRows();
-	D_ASSERT(materialized_owner_rows.size() == owner_row_count);
+	D_ASSERT(owner_partition.Count() == owner_row_count);
 	vector<bool> matched(owner_row_count, false);
 	DataChunk final_groups;
 	final_groups.Initialize(Allocator::Get(context), op.output_group_types);
 	DataChunk routed_payload;
 	routed_payload.InitializeEmpty(op.grouped_aggregate_data.payload_types);
 	SelectionVector route_input(STANDARD_VECTOR_SIZE);
+	DataChunk owner_lookup_rows;
+	owner_partition.InitializeScanChunk(Allocator::Get(context), owner_lookup_rows);
+	ColumnDataScanState owner_lookup_scan;
+	owner_partition.InitializeScan(owner_lookup_scan);
 	auto set_owner_groups = [&](idx_t output_row, idx_t owner_row) {
+		if (!owner_partition.Seek(owner_row, owner_lookup_scan, owner_lookup_rows)) {
+			throw InternalException("HASH_GROUP_JOIN external owner row is out of range");
+		}
+		auto chunk_row = owner_row - owner_lookup_scan.current_row_index;
 		for (idx_t group_idx = 0; group_idx < op.output_groups.size(); group_idx++) {
 			auto &output_group = op.output_groups[group_idx];
 			auto owner_column = output_group.source == HashGroupJoinOutputSource::KEY ? output_group.index
 			                                                                          : key_count + output_group.index;
-			final_groups.data[group_idx].SetValue(output_row,
-			                                      materialized_owner_rows.GetValue(owner_column, owner_row));
+			VectorOperations::Copy(owner_lookup_rows.data[owner_column], final_groups.data[group_idx], chunk_row + 1,
+			                       chunk_row, output_row);
 		}
 	};
 	if (probe_partition) {
@@ -1657,6 +1770,9 @@ static void ProcessExternalRoutedLookupPartition(const PhysicalHashGroupJoin &op
 		SelectionVector found(STANDARD_VECTOR_SIZE);
 		SelectionVector matched_input(STANDARD_VECTOR_SIZE);
 		Vector matched_addresses(LogicalType::POINTER);
+		vector<idx_t> route_owner_buffer(STANDARD_VECTOR_SIZE);
+		vector<idx_t> route_match_buffer(STANDARD_VECTOR_SIZE);
+		vector<idx_t> route_order(STANDARD_VECTOR_SIZE);
 		while (probe_partition->Scan(probe_scan, probe_rows)) {
 			probe_keys.Reset();
 			for (idx_t key_idx = 0; key_idx < key_count; key_idx++) {
@@ -1696,6 +1812,19 @@ static void ProcessExternalRoutedLookupPartition(const PhysicalHashGroupJoin &op
 				if (routed_count == 0) {
 					return;
 				}
+				for (idx_t route_idx = 0; route_idx < routed_count; route_idx++) {
+					route_order[route_idx] = route_idx;
+				}
+				std::sort(route_order.begin(), route_order.begin() + routed_count, [&](idx_t left, idx_t right) {
+					return route_owner_buffer[left] < route_owner_buffer[right];
+				});
+				for (idx_t output_idx = 0; output_idx < routed_count; output_idx++) {
+					auto route_idx = route_order[output_idx];
+					auto owner_row = route_owner_buffer[route_idx];
+					matched[owner_row] = true;
+					set_owner_groups(output_idx, owner_row);
+					route_input.set_index(output_idx, route_match_buffer[route_idx]);
+				}
 				final_groups.SetChildCardinality(routed_count);
 				routed_payload.Reset();
 				routed_payload.Slice(matched_payload, route_input, routed_count);
@@ -1713,9 +1842,8 @@ static void ProcessExternalRoutedLookupPartition(const PhysicalHashGroupJoin &op
 				}
 				for (idx_t route_idx = route_offsets[route_id]; route_idx < route_offsets[route_id + 1]; route_idx++) {
 					auto owner_row = route_owner_rows[route_idx];
-					matched[owner_row] = true;
-					set_owner_groups(routed_count, owner_row);
-					route_input.set_index(routed_count++, match_idx);
+					route_owner_buffer[routed_count] = owner_row;
+					route_match_buffer[routed_count++] = match_idx;
 					if (routed_count == STANDARD_VECTOR_SIZE) {
 						flush_routes();
 					}

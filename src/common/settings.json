@@ -367,7 +367,7 @@
         "description": "DEBUG SETTING: choose the physical GroupJoin strategy",
         "type": "ENUM<GroupJoinStrategy>",
         "default_scope": "local",
-        "default_value": "DISABLED"
+        "default_value": "AUTO"
     },
     {
         "name": "debug_order_verification",

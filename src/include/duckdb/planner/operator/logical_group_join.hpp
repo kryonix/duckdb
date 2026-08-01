@@ -8,6 +8,7 @@
 #pragma once
 
 #include "duckdb/execution/group_join_strategy.hpp"
+#include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 
 namespace duckdb {
@@ -31,6 +32,8 @@ public:
 	bool unique_owner = false;
 	bool single_match = false;
 	bool use_index = false;
+	//! Runtime filters generated for the probe subtree when the owner is the original join build side
+	unique_ptr<JoinFilterPushdownInfo> filter_pushdown;
 
 public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
