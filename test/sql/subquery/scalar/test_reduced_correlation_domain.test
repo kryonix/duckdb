@@ -1,0 +1,126 @@
+# name: test/sql/subquery/scalar/test_reduced_correlation_domain.test
+# description: Factor selective correlation domains out of decorrelated outer plans
+# group: [scalar]
+
+statement ok
+CREATE TABLE domain_dim(k INTEGER PRIMARY KEY, active BOOLEAN);
+
+statement ok
+INSERT INTO domain_dim VALUES (1, true), (2, false), (3, true), (4, true);
+
+statement ok
+CREATE TABLE outer_fact(k INTEGER, x INTEGER);
+
+statement ok
+INSERT INTO outer_fact VALUES (1, 5), (1, 15), (2, 1), (3, 2), (3, 20), (4, 7);
+
+statement ok
+CREATE TABLE inner_fact(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO inner_fact VALUES (1, 10), (1, 20), (3, 4), (3, 8);
+
+statement ok
+SET delim_join_as_cte = true;
+
+statement ok
+SET debug_group_join_strategy = 'disabled';
+
+# The mature plan provides a differential correctness baseline.
+query I
+SELECT sum(x)
+FROM outer_fact f
+JOIN domain_dim d ON f.k = d.k
+WHERE d.active
+  AND x < (SELECT avg(v) FROM inner_fact i WHERE i.k = d.k);
+----
+7
+
+statement ok
+PRAGMA disable_verification;
+
+statement ok
+PRAGMA explain_output = 'optimized_only';
+
+# The correlation key comes entirely from domain_dim, so the deduplicated domain can rescan that
+# repeatable subtree instead of materializing the complete outer_fact/domain_dim result.
+query II
+EXPLAIN (FORMAT JSON)
+SELECT sum(x)
+FROM outer_fact f
+JOIN domain_dim d ON f.k = d.k
+WHERE d.active
+  AND x < (SELECT avg(v) FROM inner_fact i WHERE i.k = d.k);
+----
+logical_opt	<!REGEX>:.*"name":\s*"CTE".*
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT sum(x)
+FROM outer_fact f
+JOIN domain_dim d ON f.k = d.k
+WHERE d.active
+  AND x < (SELECT avg(v) FROM inner_fact i WHERE i.k = d.k);
+----
+logical_opt	<REGEX>:.*"Table":\s*"memory.main.inner_fact".*"Table":\s*"memory.main.domain_dim".*"Join Type":\s*"SEMI".*
+
+statement ok
+SET debug_group_join_strategy = 'force';
+
+# GroupJoin sees the reduced owner domain after decorrelation.
+query II
+EXPLAIN (FORMAT JSON)
+SELECT sum(x)
+FROM outer_fact f
+JOIN domain_dim d ON f.k = d.k
+WHERE d.active
+  AND x < (SELECT avg(v) FROM inner_fact i WHERE i.k = d.k);
+----
+logical_opt	<REGEX>:.*"name":\s*"GROUP_JOIN".*"Table":\s*"memory.main.domain_dim".*
+
+query I
+SELECT sum(x)
+FROM outer_fact f
+JOIN domain_dim d ON f.k = d.k
+WHERE d.active
+  AND x < (SELECT avg(v) FROM inner_fact i WHERE i.k = d.k);
+----
+7
+
+# A volatile source cannot be evaluated independently without changing observable semantics.
+# Retain the materialized outer relation in that case.
+query II
+EXPLAIN (FORMAT JSON)
+SELECT sum(x)
+FROM outer_fact f
+JOIN (SELECT k, active, random() AS r FROM domain_dim) d ON f.k = d.k
+WHERE d.active
+  AND x < (SELECT avg(v) FROM inner_fact i WHERE i.k = d.k);
+----
+logical_opt	<REGEX>:.*"name":\s*"CTE".*
+
+query I
+SELECT sum(x)
+FROM outer_fact f
+JOIN (SELECT k, active, random() AS r FROM domain_dim) d ON f.k = d.k
+WHERE d.active
+  AND x < (SELECT avg(v) FROM inner_fact i WHERE i.k = d.k);
+----
+7
+
+# A volatile correlated subtree must likewise retain the exact materialized correlation domain.
+query II
+EXPLAIN (FORMAT JSON)
+SELECT sum(x)
+FROM outer_fact f
+JOIN domain_dim d ON f.k = d.k
+WHERE d.active
+  AND x < (SELECT avg(v + random()) FROM inner_fact i WHERE i.k = d.k);
+----
+logical_opt	<REGEX>:.*"name":\s*"CTE".*
+
+statement ok
+RESET debug_group_join_strategy;
+
+statement ok
+RESET delim_join_as_cte;

@@ -21,6 +21,8 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
+#include "duckdb/planner/logical_operator_deep_copy.hpp"
+#include "duckdb/planner/logical_operator_repeatability.hpp"
 #include "duckdb/planner/operator/list.hpp"
 
 #include <algorithm>
@@ -108,6 +110,61 @@ static optional_idx FindBindingIndex(const vector<ColumnBinding> &bindings, cons
 		return optional_idx();
 	}
 	return NumericCast<idx_t>(entry - bindings.begin());
+}
+
+static bool ContainsAllBindings(LogicalOperator &op, const vector<ColumnBinding> &bindings,
+                                optional_ptr<vector<idx_t>> binding_indices = nullptr) {
+	auto output_bindings = op.GetColumnBindings();
+	vector<idx_t> result;
+	result.reserve(bindings.size());
+	for (auto &binding : bindings) {
+		auto index = FindBindingIndex(output_bindings, binding);
+		if (!index.IsValid()) {
+			return false;
+		}
+		result.push_back(index.GetIndex());
+	}
+	if (binding_indices) {
+		*binding_indices = std::move(result);
+	}
+	return true;
+}
+
+static optional_ptr<LogicalOperator> FindReducedDomainSource(LogicalOperator &op, const vector<ColumnBinding> &bindings,
+                                                             vector<reference<Expression>> &filter_candidates) {
+	if (!ContainsAllBindings(op, bindings)) {
+		return nullptr;
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_FILTER && !op.HasProjectionMap() && op.children.size() == 1 &&
+	    ContainsAllBindings(*op.children[0], bindings)) {
+		for (auto &expression : op.expressions) {
+			filter_candidates.push_back(*expression);
+		}
+		return FindReducedDomainSource(*op.children[0], bindings, filter_candidates);
+	}
+	if (op.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+	    op.type != LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
+		return op;
+	}
+	if (op.children.size() != 2) {
+		return op;
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+	    op.Cast<LogicalComparisonJoin>().join_type != JoinType::INNER) {
+		return op;
+	}
+
+	optional_ptr<LogicalOperator> result;
+	for (auto &child : op.children) {
+		if (!ContainsAllBindings(*child, bindings)) {
+			continue;
+		}
+		if (result) {
+			return op;
+		}
+		result = FindReducedDomainSource(*child, bindings, filter_candidates);
+	}
+	return result ? result : optional_ptr<LogicalOperator>(op);
 }
 
 static void AddFilterToOperator(unique_ptr<LogicalOperator> &child, unique_ptr<Expression> filter) {
@@ -2200,6 +2257,56 @@ BindingReplacementGraph DelimJoinCTERewriter::MaterializeDelimJoinAsCTE(unique_p
 		dedup_names.push_back(expr->GetName());
 	}
 
+	unique_ptr<LogicalOperator> reduced_domain_source;
+	vector<idx_t> reduced_domain_column_indices;
+	if (extra_left_expressions.empty()) {
+		vector<ColumnBinding> dedup_bindings;
+		dedup_bindings.reserve(dedup_column_indices.size());
+		for (auto column_index : dedup_column_indices) {
+			dedup_bindings.push_back(left_bindings[column_index]);
+		}
+		vector<reference<Expression>> filter_candidates;
+		auto reduced_source = FindReducedDomainSource(*plan->children[0], dedup_bindings, filter_candidates);
+		if (reduced_source && reduced_source.get() != plan->children[0].get() &&
+		    LogicalSubtreeIsRepeatable(*reduced_source) && LogicalSubtreeIsRepeatable(*plan->children[1]) &&
+		    ContainsAllBindings(*reduced_source, dedup_bindings, reduced_domain_column_indices)) {
+			auto source_bindings = reduced_source->GetColumnBindings();
+			LogicalOperatorDeepCopy deep_copy(binder, nullptr);
+			try {
+				reduced_domain_source = deep_copy.DeepCopy(*reduced_source);
+			} catch (NotImplementedException &) {
+				reduced_domain_column_indices.clear();
+			}
+			if (reduced_domain_source) {
+				reduced_domain_source->ResolveOperatorTypes();
+				auto copied_bindings = reduced_domain_source->GetColumnBindings();
+				D_ASSERT(source_bindings.size() == copied_bindings.size());
+				vector<unique_ptr<Expression>> copied_expressions;
+				copied_expressions.reserve(copied_bindings.size());
+				for (idx_t i = 0; i < copied_bindings.size(); i++) {
+					copied_expressions.push_back(
+					    make_uniq<BoundColumnRefExpression>(reduced_domain_source->types[i], copied_bindings[i]));
+				}
+				for (auto &filter_candidate : filter_candidates) {
+					bool references_only_source = !filter_candidate.get().IsVolatile();
+					ExpressionIterator::VisitExpression<BoundColumnRefExpression>(
+					    filter_candidate.get(), [&](const BoundColumnRefExpression &column_ref) {
+						    if (column_ref.Depth() != 0 ||
+						        !FindBindingIndex(source_bindings, column_ref.Binding()).IsValid()) {
+							    references_only_source = false;
+						    }
+					    });
+					if (!references_only_source) {
+						continue;
+					}
+					auto filter = filter_candidate.get().Copy();
+					ReplaceExpressionBindings(filter, source_bindings, copied_expressions);
+					AddFilterToOperator(reduced_domain_source, std::move(filter));
+				}
+			}
+		}
+	}
+
 	if (!extra_left_expressions.empty()) {
 		auto old_left_bindings = left_bindings;
 		vector<unique_ptr<Expression>> expressions;
@@ -2267,13 +2374,20 @@ BindingReplacementGraph DelimJoinCTERewriter::MaterializeDelimJoinAsCTE(unique_p
 	auto dedup_aggregate_index = binder.GenerateTableIndex();
 	vector<unique_ptr<Expression>> dedup_aggrs;
 	auto dedup = make_uniq<LogicalAggregate>(dedup_group_index, dedup_aggregate_index, std::move(dedup_aggrs));
-	auto dedup_child_index = binder.GenerateTableIndex();
-	auto dedup_child = make_uniq<LogicalCTERef>(dedup_child_index, cte_index, left_types,
-	                                            GenerateCTEColumnNames(left_column_count, "__duckdb_delim_col_"));
+	unique_ptr<LogicalOperator> dedup_child;
+	if (reduced_domain_source) {
+		dedup_child = std::move(reduced_domain_source);
+	} else {
+		auto dedup_child_index = binder.GenerateTableIndex();
+		dedup_child = make_uniq<LogicalCTERef>(dedup_child_index, cte_index, left_types,
+		                                       GenerateCTEColumnNames(left_column_count, "__duckdb_delim_col_"));
+	}
 	auto dedup_child_bindings = dedup_child->GetColumnBindings();
 	for (idx_t i = 0; i < dedup_column_indices.size(); i++) {
-		auto colref = make_uniq<BoundColumnRefExpression>(dedup_names[i], dedup_types[i],
-		                                                  dedup_child_bindings[dedup_column_indices[i]]);
+		auto column_index =
+		    reduced_domain_column_indices.empty() ? dedup_column_indices[i] : reduced_domain_column_indices[i];
+		auto colref =
+		    make_uniq<BoundColumnRefExpression>(dedup_names[i], dedup_types[i], dedup_child_bindings[column_index]);
 		auto new_group_index = ColumnBinding::PushExpression(dedup->groups, std::move(colref));
 		for (auto &set : dedup->grouping_sets) {
 			set.insert(new_group_index);

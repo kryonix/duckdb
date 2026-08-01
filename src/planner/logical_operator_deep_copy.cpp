@@ -11,7 +11,11 @@ LogicalOperatorDeepCopy::LogicalOperatorDeepCopy(Binder &binder, optional_ptr<bo
 }
 
 unique_ptr<LogicalOperator> LogicalOperatorDeepCopy::DeepCopy(unique_ptr<duckdb::LogicalOperator> &op) {
-	auto copy = op->Copy(binder.context);
+	return DeepCopy(*op);
+}
+
+unique_ptr<LogicalOperator> LogicalOperatorDeepCopy::DeepCopy(const LogicalOperator &op) {
+	auto copy = op.Copy(binder.context);
 	VisitOperator(*copy);
 	TableBindingReplacer replacer(table_idx_replacements, parameter_data);
 	replacer.VisitOperator(*copy);
