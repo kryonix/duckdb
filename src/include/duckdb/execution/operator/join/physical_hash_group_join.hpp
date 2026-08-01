@@ -31,7 +31,8 @@ public:
 	                      PhysicalOperator &owner, vector<unique_ptr<Expression>> aggregates,
 	                      vector<unique_ptr<Expression>> owner_payload_aggregates,
 	                      vector<unique_ptr<Expression>> groups, vector<HashGroupJoinOutputColumn> output_groups,
-	                      HashGroupJoinUnmatchedPolicy unmatched_policy, bool routed, idx_t estimated_cardinality);
+	                      HashGroupJoinUnmatchedPolicy unmatched_policy, bool routed, bool unique_owner,
+	                      bool single_match, idx_t estimated_cardinality);
 	PhysicalHashGroupJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op, PhysicalOperator &probe,
 	                      PhysicalOperator &owner, vector<unique_ptr<Expression>> aggregates,
 	                      vector<unique_ptr<Expression>> owner_payload_aggregates,
@@ -49,6 +50,8 @@ public:
 	vector<LogicalType> unmatched_probe_types;
 	vector<unique_ptr<Expression>> unmatched_payload_expressions;
 	bool routed;
+	bool unique_owner;
+	bool single_match;
 	bool null_equal;
 	bool static_mode;
 	vector<LogicalType> output_group_types;

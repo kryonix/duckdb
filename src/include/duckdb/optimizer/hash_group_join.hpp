@@ -28,9 +28,10 @@ struct HashGroupJoinCandidate {
 	vector<idx_t> probe_key_indices;
 	vector<idx_t> owner_payload_indices;
 	vector<HashGroupJoinOutputColumn> output_groups;
-	UniqueKeyProof owner_key_proof;
+	optional<UniqueKeyProof> owner_key_proof;
 	HashGroupJoinUnmatchedPolicy unmatched_policy;
 	bool routed;
+	bool single_match;
 };
 
 struct StaticHashGroupJoinCandidate {

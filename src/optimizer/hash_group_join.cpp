@@ -150,7 +150,8 @@ static optional_idx GetJoinOutputReference(const Expression &expression, Logical
 optional<HashGroupJoinCandidate> TryGetHashGroupJoinCandidate(LogicalAggregate &aggregate, LogicalComparisonJoin &join,
                                                               ClientContext &context, HashGroupJoinCandidateMode mode) {
 	(void)context;
-	if ((join.join_type != JoinType::INNER && join.join_type != JoinType::LEFT && join.join_type != JoinType::RIGHT) ||
+	if ((join.join_type != JoinType::INNER && join.join_type != JoinType::LEFT && join.join_type != JoinType::RIGHT &&
+	     join.join_type != JoinType::SEMI) ||
 	    join.HasProjectionMap() || join.children.size() != 2 || join.conditions.empty() ||
 	    join.HasArbitraryConditions() || !aggregate.grouping_functions.empty() || aggregate.grouping_sets.size() > 1 ||
 	    aggregate.groups.empty()) {
@@ -183,81 +184,106 @@ optional<HashGroupJoinCandidate> TryGetHashGroupJoinCandidate(LogicalAggregate &
 		side_keys[1].push_back(right.GetIndex());
 	}
 
-	optional<HashGroupJoinCandidate> candidate;
-	optional<UniqueKeyProperty> owner_key_property;
-	for (idx_t owner_child : {idx_t(1), idx_t(0)}) {
-		HashGroupJoinUnmatchedPolicy unmatched_policy;
-		if (join.join_type == JoinType::INNER) {
-			unmatched_policy = HashGroupJoinUnmatchedPolicy::DISCARD;
-		} else if ((join.join_type == JoinType::LEFT && owner_child == 0) ||
-		           (join.join_type == JoinType::RIGHT && owner_child == 1)) {
-			unmatched_policy = HashGroupJoinUnmatchedPolicy::NULL_EXTENDED_ROW;
-		} else {
-			continue;
-		}
-		auto key_property = GetUniqueKeyProperty(*join.children[owner_child], side_keys[owner_child]);
-		const auto probe_child = 1 - owner_child;
-		if (key_property && AggregatesUseProbe(aggregate, join, probe_child, mode)) {
-			candidate =
-			    HashGroupJoinCandidate {owner_child, probe_child, side_keys[owner_child], side_keys[probe_child],
-			                            {},          {},          key_property->proof,    unmatched_policy,
-			                            false};
-			owner_key_property = std::move(key_property);
-			break;
-		}
-	}
-	if (!candidate) {
-		return nullopt;
-	}
+	for (bool require_unique : {true, false}) {
+		for (idx_t owner_child : {idx_t(1), idx_t(0)}) {
+			HashGroupJoinUnmatchedPolicy unmatched_policy;
+			if (join.join_type == JoinType::INNER || (join.join_type == JoinType::SEMI && owner_child == 1)) {
+				unmatched_policy = HashGroupJoinUnmatchedPolicy::DISCARD;
+			} else if ((join.join_type == JoinType::LEFT && owner_child == 0) ||
+			           (join.join_type == JoinType::RIGHT && owner_child == 1)) {
+				unmatched_policy = HashGroupJoinUnmatchedPolicy::NULL_EXTENDED_ROW;
+			} else {
+				continue;
+			}
+			const auto probe_child = 1 - owner_child;
+			if (!AggregatesUseProbe(aggregate, join, probe_child, mode)) {
+				continue;
+			}
+			auto key_property = GetUniqueKeyProperty(*join.children[owner_child], side_keys[owner_child]);
+			if (key_property.has_value() != require_unique) {
+				continue;
+			}
+			optional<UniqueKeyProof> key_proof;
+			if (key_property) {
+				key_proof = key_property->proof;
+			}
+			HashGroupJoinCandidate candidate {owner_child,
+			                                  probe_child,
+			                                  side_keys[owner_child],
+			                                  side_keys[probe_child],
+			                                  {},
+			                                  {},
+			                                  std::move(key_proof),
+			                                  unmatched_policy,
+			                                  false,
+			                                  join.join_type == JoinType::SEMI};
 
-	vector<bool> used_conditions(join.conditions.size(), false);
-	for (auto &group : aggregate.groups) {
-		if (group->IsVolatile()) {
-			return nullopt;
-		}
-		idx_t group_child;
-		auto group_index = GetJoinOutputReference(*group, join, group_child);
-		if (!group_index.IsValid()) {
-			return nullopt;
-		}
-		optional_idx condition_index;
-		for (idx_t index = 0; index < join.conditions.size(); index++) {
-			if (side_keys[group_child][index] == group_index.GetIndex()) {
-				if (condition_index.IsValid()) {
-					return nullopt;
+			vector<bool> used_conditions(join.conditions.size(), false);
+			bool valid = true;
+			for (auto &group : aggregate.groups) {
+				if (group->IsVolatile()) {
+					valid = false;
+					break;
 				}
-				condition_index = optional_idx(index);
+				idx_t group_child;
+				auto group_index = GetJoinOutputReference(*group, join, group_child);
+				if (!group_index.IsValid()) {
+					valid = false;
+					break;
+				}
+				optional_idx condition_index;
+				for (idx_t index = 0; index < join.conditions.size(); index++) {
+					if (side_keys[group_child][index] == group_index.GetIndex()) {
+						if (condition_index.IsValid()) {
+							valid = false;
+							break;
+						}
+						condition_index = optional_idx(index);
+					}
+				}
+				if (!valid) {
+					break;
+				}
+				if (condition_index.IsValid()) {
+					auto index = condition_index.GetIndex();
+					if (candidate.unmatched_policy != HashGroupJoinUnmatchedPolicy::DISCARD &&
+					    group_child != candidate.owner_child) {
+						valid = false;
+						break;
+					}
+					if (used_conditions[index]) {
+						valid = false;
+						break;
+					}
+					used_conditions[index] = true;
+					candidate.output_groups.push_back({HashGroupJoinOutputSource::KEY, index});
+					continue;
+				}
+				if (group_child != candidate.owner_child ||
+				    (key_property && !key_property->FunctionallyDetermines(*join.children[candidate.owner_child],
+				                                                           group_index.GetIndex()))) {
+					valid = false;
+					break;
+				}
+				auto payload_entry = std::find(candidate.owner_payload_indices.begin(),
+				                               candidate.owner_payload_indices.end(), group_index.GetIndex());
+				if (payload_entry != candidate.owner_payload_indices.end()) {
+					valid = false;
+					break;
+				}
+				auto payload_index = candidate.owner_payload_indices.size();
+				candidate.owner_payload_indices.push_back(group_index.GetIndex());
+				candidate.output_groups.push_back({HashGroupJoinOutputSource::OWNER_PAYLOAD, payload_index});
 			}
-		}
-		if (condition_index.IsValid()) {
-			auto index = condition_index.GetIndex();
-			if (candidate->unmatched_policy != HashGroupJoinUnmatchedPolicy::DISCARD &&
-			    group_child != candidate->owner_child) {
-				return nullopt;
+			if (!valid) {
+				continue;
 			}
-			if (used_conditions[index]) {
-				return nullopt;
-			}
-			used_conditions[index] = true;
-			candidate->output_groups.push_back({HashGroupJoinOutputSource::KEY, index});
-			continue;
+			candidate.routed = !candidate.owner_key_proof || std::find(used_conditions.begin(), used_conditions.end(),
+			                                                           false) != used_conditions.end();
+			return candidate;
 		}
-		if (group_child != candidate->owner_child ||
-		    !owner_key_property->FunctionallyDetermines(*join.children[candidate->owner_child],
-		                                                group_index.GetIndex())) {
-			return nullopt;
-		}
-		auto payload_entry = std::find(candidate->owner_payload_indices.begin(), candidate->owner_payload_indices.end(),
-		                               group_index.GetIndex());
-		if (payload_entry != candidate->owner_payload_indices.end()) {
-			return nullopt;
-		}
-		auto payload_index = candidate->owner_payload_indices.size();
-		candidate->owner_payload_indices.push_back(group_index.GetIndex());
-		candidate->output_groups.push_back({HashGroupJoinOutputSource::OWNER_PAYLOAD, payload_index});
 	}
-	candidate->routed = std::find(used_conditions.begin(), used_conditions.end(), false) != used_conditions.end();
-	return candidate;
+	return nullopt;
 }
 
 static bool AutoHashGroupJoinAggregatesSupported(const LogicalAggregate &aggregate, idx_t &state_size) {
@@ -382,7 +408,7 @@ static bool HasAutoHashGroupJoinART(LogicalComparisonJoin &join, const HashGroup
 
 static bool PassesAutoIndexGroupJoinCostModel(LogicalAggregate &aggregate, LogicalComparisonJoin &join,
                                               const HashGroupJoinCandidate &candidate, ClientContext &context) {
-	if (join.join_type != JoinType::INNER || candidate.routed ||
+	if (join.join_type != JoinType::INNER || candidate.routed || !candidate.owner_key_proof ||
 	    candidate.unmatched_policy != HashGroupJoinUnmatchedPolicy::DISCARD || !join.has_estimated_cardinality ||
 	    !join.children[candidate.owner_child]->has_estimated_cardinality ||
 	    !join.children[candidate.probe_child]->has_estimated_cardinality) {
@@ -407,7 +433,7 @@ static bool PassesAutoIndexGroupJoinCostModel(LogicalAggregate &aggregate, Logic
 
 static bool PassesAutoHashGroupJoinCostModel(LogicalAggregate &aggregate, LogicalComparisonJoin &join,
                                              const HashGroupJoinCandidate &candidate, ClientContext &context) {
-	if (join.join_type != JoinType::INNER || candidate.routed ||
+	if (join.join_type != JoinType::INNER || candidate.routed || !candidate.owner_key_proof ||
 	    candidate.unmatched_policy != HashGroupJoinUnmatchedPolicy::DISCARD ||
 	    TaskScheduler::GetScheduler(context).NumberOfThreads() != 1 || !join.has_estimated_cardinality ||
 	    !join.children[candidate.owner_child]->has_estimated_cardinality ||

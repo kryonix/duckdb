@@ -92,16 +92,6 @@ static vector<AggregateObject> CreateRoutingGroupJoinAggregates() {
 	return result;
 }
 
-static vector<AggregateObject> CreateExternalRoutingGroupJoinAggregates(const PhysicalHashGroupJoin &op) {
-	vector<AggregateObject> result;
-	result.reserve(op.owner_payload_data.bindings.size() + 1);
-	result.push_back(CreateGroupJoinIdAggregate());
-	for (auto binding : op.owner_payload_data.bindings) {
-		result.emplace_back(binding);
-	}
-	return result;
-}
-
 static vector<LogicalType> CreateGlobalGroupJoinPayloadTypes(const PhysicalHashGroupJoin &op) {
 	return op.grouped_aggregate_data.payload_types;
 }
@@ -126,10 +116,10 @@ PhysicalHashGroupJoin::PhysicalHashGroupJoin(PhysicalPlan &physical_plan, Logica
                                              vector<unique_ptr<Expression>> groups,
                                              vector<HashGroupJoinOutputColumn> output_groups_p,
                                              HashGroupJoinUnmatchedPolicy unmatched_policy_p, bool routed_p,
-                                             idx_t estimated_cardinality)
+                                             bool unique_owner_p, bool single_match_p, idx_t estimated_cardinality)
     : PhysicalJoin(physical_plan, op, PhysicalOperatorType::HASH_GROUP_JOIN, JoinType::INNER, estimated_cardinality),
       output_groups(std::move(output_groups_p)), unmatched_policy(unmatched_policy_p), routed(routed_p),
-      null_equal(false), static_mode(false) {
+      unique_owner(unique_owner_p), single_match(single_match_p), null_equal(false), static_mode(false) {
 	for (auto &group : op.groups) {
 		output_group_types.push_back(group->GetReturnType());
 	}
@@ -174,7 +164,7 @@ PhysicalHashGroupJoin::PhysicalHashGroupJoin(PhysicalPlan &physical_plan, Logica
                                              idx_t estimated_cardinality)
     : PhysicalJoin(physical_plan, op, PhysicalOperatorType::HASH_GROUP_JOIN, JoinType::INNER, estimated_cardinality),
       output_columns(std::move(output_columns_p)), unmatched_policy(HashGroupJoinUnmatchedPolicy::EMPTY_AGGREGATE),
-      routed(false), null_equal(true), static_mode(true) {
+      routed(false), unique_owner(false), single_match(false), null_equal(true), static_mode(true) {
 	for (auto &group : groups) {
 		output_group_types.push_back(group->GetReturnType());
 		output_group_names.push_back(group->GetName().GetIdentifierName());
@@ -229,8 +219,8 @@ public:
 			hash_table = make_uniq<GroupedAggregateHashTable>(
 			    context, BufferAllocator::Get(context), op.grouped_aggregate_data.group_types, vector<LogicalType> {},
 			    CreateRoutingGroupJoinAggregates(), GroupedAggregateHashTable::InitialCapacity(), idx_t(0),
-			    op.null_equal ? TupleDataValidityType::CAN_HAVE_NULL_VALUES
-			                  : TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
+			    op.null_equal || !op.unique_owner ? TupleDataValidityType::CAN_HAVE_NULL_VALUES
+			                                      : TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 			final_hash_table = make_uniq<GroupedAggregateHashTable>(
 			    context, BufferAllocator::Get(context), op.output_group_types, op.grouped_aggregate_data.payload_types,
 			    CreateRoutedGroupJoinAggregates(op), GroupedAggregateHashTable::InitialCapacity(), idx_t(0),
@@ -248,6 +238,8 @@ public:
 	unique_ptr<GroupedAggregateHashTable> hash_table;
 	unique_ptr<GroupedAggregateHashTable> final_hash_table;
 	vector<data_ptr_t> group_addresses;
+	vector<vector<idx_t>> route_build_groups;
+	vector<idx_t> route_offsets;
 	vector<idx_t> route_group_ids;
 	unique_ptr<atomic<bool>[]> route_matches;
 	unique_ptr<atomic<idx_t>[]> owners;
@@ -327,7 +319,7 @@ SinkResultType PhysicalHashGroupJoin::Sink(ExecutionContext &context, DataChunk 
 		local_state.owner_keys.data[key_idx].Reference(chunk.data[key_idx]);
 	}
 	local_state.owner_keys.CheckCardinality(chunk.size());
-	if (!null_equal && PhysicalJoin::HasNullValues(local_state.owner_keys)) {
+	if (unique_owner && !null_equal && PhysicalJoin::HasNullValues(local_state.owner_keys)) {
 		throw InternalException("HASH_GROUP_JOIN owner key unexpectedly contained NULL");
 	}
 	if (global_state.external) {
@@ -344,16 +336,18 @@ SinkResultType PhysicalHashGroupJoin::Sink(ExecutionContext &context, DataChunk 
 	}
 	const auto new_group_count = global_state.hash_table->FindOrCreateGroups(
 	    local_state.owner_keys, local_state.addresses, local_state.new_groups);
-	if (!static_mode && new_group_count != chunk.size()) {
+	if (unique_owner && new_group_count != chunk.size()) {
 		throw InternalException("HASH_GROUP_JOIN owner key uniqueness proof was violated at execution time");
 	}
 	auto addresses = FlatVector::GetData<data_ptr_t>(local_state.addresses);
 	auto &layout = global_state.hash_table->GetLayout();
 	for (idx_t new_idx = 0; new_idx < new_group_count; new_idx++) {
 		auto row_idx = local_state.new_groups.get_index_unsafe(new_idx);
-		const auto group_id = routed ? global_state.owner_rows + row_idx : global_state.group_addresses.size();
+		const auto group_id = routed ? global_state.route_build_groups.size() : global_state.group_addresses.size();
 		StoreGroupJoinId(layout, addresses[row_idx], group_id);
-		if (!routed) {
+		if (routed) {
+			global_state.route_build_groups.emplace_back();
+		} else {
 			global_state.group_addresses.push_back(addresses[row_idx]);
 		}
 	}
@@ -395,7 +389,12 @@ SinkResultType PhysicalHashGroupJoin::Sink(ExecutionContext &context, DataChunk 
 			global_state.group_addresses.push_back(final_addresses[input_idx]);
 		}
 		for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
-			global_state.route_group_ids.push_back(LoadGroupJoinId(target.GetLayout(), final_addresses[row_idx]));
+			auto route_id = LoadGroupJoinId(layout, addresses[row_idx]);
+			D_ASSERT(route_id < global_state.route_build_groups.size());
+			auto &routes = global_state.route_build_groups[route_id];
+			if (!single_match || routes.empty()) {
+				routes.push_back(LoadGroupJoinId(target.GetLayout(), final_addresses[row_idx]));
+			}
 		}
 	}
 	if (!routed && !owner_payload_data.aggregates.empty()) {
@@ -423,7 +422,15 @@ SinkFinalizeType PhysicalHashGroupJoin::Finalize(Pipeline &pipeline, Event &even
 		return state.owner_rows == 0 ? SinkFinalizeType::NO_OUTPUT_POSSIBLE : SinkFinalizeType::READY;
 	}
 	if (routed) {
-		D_ASSERT(state.route_group_ids.size() == state.hash_table->Count());
+		D_ASSERT(state.route_build_groups.size() == state.hash_table->Count());
+		state.route_offsets.reserve(state.route_build_groups.size() + 1);
+		for (auto &routes : state.route_build_groups) {
+			D_ASSERT(!routes.empty());
+			state.route_offsets.push_back(state.route_group_ids.size());
+			state.route_group_ids.insert(state.route_group_ids.end(), routes.begin(), routes.end());
+		}
+		state.route_offsets.push_back(state.route_group_ids.size());
+		state.route_build_groups.clear();
 		D_ASSERT(state.group_addresses.size() == state.final_hash_table->Count());
 	} else {
 		D_ASSERT(state.group_addresses.size() == state.hash_table->Count());
@@ -505,7 +512,8 @@ class HashGroupJoinOperatorState : public CachingOperatorState {
 public:
 	HashGroupJoinOperatorState(ExecutionContext &context, const PhysicalHashGroupJoin &op)
 	    : non_null_sel(STANDARD_VECTOR_SIZE), found_sel(STANDARD_VECTOR_SIZE), matched_input_sel(STANDARD_VECTOR_SIZE),
-	      owner_sel(STANDARD_VECTOR_SIZE), local_sel(STANDARD_VECTOR_SIZE), matched_addresses(LogicalType::POINTER),
+	      route_input_sel(STANDARD_VECTOR_SIZE), owner_sel(STANDARD_VECTOR_SIZE), local_sel(STANDARD_VECTOR_SIZE),
+	      matched_addresses(LogicalType::POINTER), routed_addresses(LogicalType::POINTER),
 	      owner_addresses(LogicalType::POINTER), key_formats(op.grouped_aggregate_data.group_types.size()) {
 		auto &global_state = op.op_state->Cast<HashGroupJoinGlobalOperatorState>();
 		auto &sink = op.sink_state->Cast<HashGroupJoinGlobalSinkState>();
@@ -527,6 +535,7 @@ public:
 		auto &target = GetHashGroupJoinTarget(sink);
 		lookup_keys.InitializeEmpty(op.grouped_aggregate_data.group_types);
 		payload.InitializeEmpty(op.grouped_aggregate_data.payload_types);
+		routed_payload.InitializeEmpty(op.grouped_aggregate_data.payload_types);
 		selected_payload.InitializeEmpty(op.grouped_aggregate_data.payload_types);
 		group_ids.Initialize(Allocator::Get(context.client), {LogicalType::UBIGINT});
 		selected_group_ids.InitializeEmpty({LogicalType::UBIGINT});
@@ -576,15 +585,18 @@ public:
 	DataChunk probe_keys;
 	DataChunk lookup_keys;
 	DataChunk payload;
+	DataChunk routed_payload;
 	DataChunk selected_payload;
 	DataChunk group_ids;
 	DataChunk selected_group_ids;
 	SelectionVector non_null_sel;
 	SelectionVector found_sel;
 	SelectionVector matched_input_sel;
+	SelectionVector route_input_sel;
 	SelectionVector owner_sel;
 	SelectionVector local_sel;
 	Vector matched_addresses;
+	Vector routed_addresses;
 	Vector owner_addresses;
 	AggregateHTLookupState lookup_state;
 	vector<UnifiedVectorFormat> key_formats;
@@ -607,7 +619,8 @@ unique_ptr<OperatorState> PhysicalHashGroupJoin::GetOperatorState(ExecutionConte
 	return make_uniq<HashGroupJoinOperatorState>(context, *this);
 }
 
-static void SinkHashGroupJoinDistinct(const PhysicalHashGroupJoin &op, HashGroupJoinOperatorState &state) {
+static void SinkHashGroupJoinDistinct(const PhysicalHashGroupJoin &op, HashGroupJoinOperatorState &state,
+                                      DataChunk &payload, DataChunk &group_ids) {
 	for (idx_t distinct_idx = 0; distinct_idx < op.distinct_aggregates.size(); distinct_idx++) {
 		auto &distinct = op.distinct_aggregates[distinct_idx];
 		auto &aggregate =
@@ -618,16 +631,16 @@ static void SinkHashGroupJoinDistinct(const PhysicalHashGroupJoin &op, HashGroup
 		optional_ptr<DataChunk> argument_payload;
 		if (distinct.has_filter) {
 			auto &filter_data = state.distinct_filter_set.GetFilterData(distinct.aggregate_index);
-			count = filter_data.ApplyFilter(state.payload);
+			count = filter_data.ApplyFilter(payload);
 			if (count == 0) {
 				continue;
 			}
-			groups.data[0].Slice(state.group_ids.data[0], filter_data.true_sel, count);
+			groups.data[0].Slice(group_ids.data[0], filter_data.true_sel, count);
 			argument_payload = filter_data.filtered_payload;
 		} else {
-			count = state.payload.size();
-			groups.data[0].Reference(state.group_ids.data[0]);
-			argument_payload = state.payload;
+			count = payload.size();
+			groups.data[0].Reference(group_ids.data[0]);
+			argument_payload = payload;
 		}
 		for (idx_t child_idx = 0; child_idx < aggregate.GetChildren().size(); child_idx++) {
 			groups.data[child_idx + 1].Reference(argument_payload->data[distinct.payload_index + child_idx]);
@@ -635,6 +648,78 @@ static void SinkHashGroupJoinDistinct(const PhysicalHashGroupJoin &op, HashGroup
 		groups.SetChildCardinality(count);
 		state.distinct_tables[distinct_idx]->FindOrCreateGroups(groups, state.distinct_addresses);
 	}
+}
+
+static void SinkHashGroupJoinMatches(const PhysicalHashGroupJoin &op, HashGroupJoinGlobalSinkState &sink,
+                                     HashGroupJoinOperatorState &state, GroupedAggregateHashTable &target,
+                                     Vector &matched_addresses, DataChunk &payload, idx_t match_count) {
+	state.group_ids.Reset();
+	state.group_ids.SetChildCardinality(match_count);
+	state.group_ids.data[0].SetVectorType(VectorType::FLAT_VECTOR);
+	auto ids = FlatVector::GetDataMutable<uint64_t>(state.group_ids.data[0]);
+	auto addresses = FlatVector::GetData<data_ptr_t>(matched_addresses);
+	auto &global_layout = target.GetLayout();
+	for (idx_t match_idx = 0; match_idx < match_count; match_idx++) {
+		ids[match_idx] = LoadGroupJoinId(global_layout, addresses[match_idx]);
+	}
+	FlatVector::SetSize(state.group_ids.data[0], match_count);
+	if (!op.distinct_aggregates.empty()) {
+		SinkHashGroupJoinDistinct(op, state, payload, state.group_ids);
+	}
+
+	if (state.execution_mode == GroupJoinExecutionMode::SERIAL) {
+		target.UpdateAggregatesAtAddressesRange(*state.update_state, matched_addresses, payload,
+		                                        GetHashGroupJoinAggregateOffset(op),
+		                                        op.grouped_aggregate_data.aggregates.size(), op.non_distinct_filter);
+		sink.matched_rows.fetch_add(match_count, std::memory_order_relaxed);
+		return;
+	}
+
+	if (state.execution_mode == GroupJoinExecutionMode::LOCAL) {
+		state.local_hash_table->AddChunk(state.group_ids, payload, op.non_distinct_filter);
+		sink.matched_rows.fetch_add(match_count, std::memory_order_relaxed);
+		return;
+	}
+
+	D_ASSERT(state.execution_mode == GroupJoinExecutionMode::OWNERSHIP);
+	idx_t owner_count = 0;
+	idx_t local_count = 0;
+	for (idx_t match_idx = 0; match_idx < match_count; match_idx++) {
+		auto &owner = sink.owners[NumericCast<idx_t>(ids[match_idx])];
+		auto current_owner = owner.load(std::memory_order_relaxed);
+		if (current_owner == 0) {
+			auto expected = idx_t(0);
+			if (owner.compare_exchange_strong(expected, state.token, std::memory_order_relaxed,
+			                                  std::memory_order_relaxed)) {
+				current_owner = state.token;
+			} else {
+				current_owner = expected;
+			}
+		}
+		if (current_owner == state.token) {
+			state.owner_sel.set_index(owner_count++, match_idx);
+		} else {
+			state.local_sel.set_index(local_count++, match_idx);
+		}
+	}
+
+	if (owner_count != 0) {
+		state.owner_addresses.Slice(matched_addresses, state.owner_sel, owner_count);
+		state.owner_addresses.Flatten();
+		state.selected_payload.Reset();
+		state.selected_payload.Slice(payload, state.owner_sel, owner_count);
+		target.UpdateAggregatesAtAddressesRange(*state.update_state, state.owner_addresses, state.selected_payload,
+		                                        GetHashGroupJoinAggregateOffset(op),
+		                                        op.grouped_aggregate_data.aggregates.size(), op.non_distinct_filter);
+	}
+	if (local_count != 0) {
+		state.selected_group_ids.Reset();
+		state.selected_group_ids.Slice(state.group_ids, state.local_sel, local_count);
+		state.selected_payload.Reset();
+		state.selected_payload.Slice(payload, state.local_sel, local_count);
+		state.local_hash_table->AddChunk(state.selected_group_ids, state.selected_payload, op.non_distinct_filter);
+	}
+	sink.matched_rows.fetch_add(match_count, std::memory_order_relaxed);
 }
 
 OperatorResultType PhysicalHashGroupJoin::ExecuteInternal(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
@@ -726,88 +811,47 @@ OperatorResultType PhysicalHashGroupJoin::ExecuteInternal(ExecutionContext &cont
 	}
 	if (routed) {
 		state.matched_addresses.Flatten();
-		auto routing_addresses = FlatVector::GetDataMutable<data_ptr_t>(state.matched_addresses);
+		auto routing_addresses = FlatVector::GetData<data_ptr_t>(state.matched_addresses);
 		auto &routing_layout = sink.hash_table->GetLayout();
+		state.routed_addresses.SetVectorType(VectorType::FLAT_VECTOR);
+		auto routed_addresses = FlatVector::GetDataMutable<data_ptr_t>(state.routed_addresses);
+		idx_t routed_count = 0;
+		auto flush_routes = [&]() {
+			if (routed_count == 0) {
+				return;
+			}
+			FlatVector::SetSize(state.routed_addresses, routed_count);
+			state.routed_payload.Reset();
+			state.routed_payload.Slice(state.payload, state.route_input_sel, routed_count);
+			if (state.routed_payload.ColumnCount() == 0) {
+				state.routed_payload.SetChildCardinality(routed_count);
+			}
+			SinkHashGroupJoinMatches(*this, sink, state, target, state.routed_addresses, state.routed_payload,
+			                         routed_count);
+			routed_count = 0;
+		};
 		for (idx_t match_idx = 0; match_idx < match_count; match_idx++) {
-			auto owner_id = LoadGroupJoinId(routing_layout, routing_addresses[match_idx]);
-			if (owner_id >= sink.route_group_ids.size()) {
-				throw InternalException("HASH_GROUP_JOIN routing identifier exceeds owner count");
+			auto route_id = LoadGroupJoinId(routing_layout, routing_addresses[match_idx]);
+			if (route_id + 1 >= sink.route_offsets.size()) {
+				throw InternalException("HASH_GROUP_JOIN routing identifier exceeds route count");
 			}
-			auto group_id = sink.route_group_ids[owner_id];
-			if (sink.route_matches) {
-				sink.route_matches[owner_id].store(true, std::memory_order_relaxed);
+			for (idx_t route_idx = sink.route_offsets[route_id]; route_idx < sink.route_offsets[route_id + 1];
+			     route_idx++) {
+				auto group_id = sink.route_group_ids[route_idx];
+				if (sink.route_matches) {
+					sink.route_matches[route_idx].store(true, std::memory_order_relaxed);
+				}
+				routed_addresses[routed_count] = sink.group_addresses[group_id];
+				state.route_input_sel.set_index(routed_count++, match_idx);
+				if (routed_count == STANDARD_VECTOR_SIZE) {
+					flush_routes();
+				}
 			}
-			routing_addresses[match_idx] = sink.group_addresses[group_id];
 		}
-	}
-
-	state.group_ids.Reset();
-	state.group_ids.SetChildCardinality(match_count);
-	state.group_ids.data[0].SetVectorType(VectorType::FLAT_VECTOR);
-	auto ids = FlatVector::GetDataMutable<uint64_t>(state.group_ids.data[0]);
-	auto addresses = FlatVector::GetData<data_ptr_t>(state.matched_addresses);
-	auto &global_layout = target.GetLayout();
-	for (idx_t match_idx = 0; match_idx < match_count; match_idx++) {
-		ids[match_idx] = LoadGroupJoinId(global_layout, addresses[match_idx]);
-	}
-	FlatVector::SetSize(state.group_ids.data[0], match_count);
-	if (!distinct_aggregates.empty()) {
-		SinkHashGroupJoinDistinct(*this, state);
-	}
-
-	if (state.execution_mode == GroupJoinExecutionMode::SERIAL) {
-		target.UpdateAggregatesAtAddressesRange(*state.update_state, state.matched_addresses, state.payload,
-		                                        GetHashGroupJoinAggregateOffset(*this),
-		                                        grouped_aggregate_data.aggregates.size(), non_distinct_filter);
-		sink.matched_rows.fetch_add(match_count, std::memory_order_relaxed);
+		flush_routes();
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
-
-	if (state.execution_mode == GroupJoinExecutionMode::LOCAL) {
-		state.local_hash_table->AddChunk(state.group_ids, state.payload, non_distinct_filter);
-		sink.matched_rows.fetch_add(match_count, std::memory_order_relaxed);
-		return OperatorResultType::NEED_MORE_INPUT;
-	}
-
-	D_ASSERT(state.execution_mode == GroupJoinExecutionMode::OWNERSHIP);
-	idx_t owner_count = 0;
-	idx_t local_count = 0;
-	for (idx_t match_idx = 0; match_idx < match_count; match_idx++) {
-		auto &owner = sink.owners[NumericCast<idx_t>(ids[match_idx])];
-		auto current_owner = owner.load(std::memory_order_relaxed);
-		if (current_owner == 0) {
-			auto expected = idx_t(0);
-			if (owner.compare_exchange_strong(expected, state.token, std::memory_order_relaxed,
-			                                  std::memory_order_relaxed)) {
-				current_owner = state.token;
-			} else {
-				current_owner = expected;
-			}
-		}
-		if (current_owner == state.token) {
-			state.owner_sel.set_index(owner_count++, match_idx);
-		} else {
-			state.local_sel.set_index(local_count++, match_idx);
-		}
-	}
-
-	if (owner_count != 0) {
-		state.owner_addresses.Slice(state.matched_addresses, state.owner_sel, owner_count);
-		state.owner_addresses.Flatten();
-		state.selected_payload.Reset();
-		state.selected_payload.Slice(state.payload, state.owner_sel, owner_count);
-		target.UpdateAggregatesAtAddressesRange(*state.update_state, state.owner_addresses, state.selected_payload,
-		                                        GetHashGroupJoinAggregateOffset(*this),
-		                                        grouped_aggregate_data.aggregates.size(), non_distinct_filter);
-	}
-	if (local_count != 0) {
-		state.selected_group_ids.Reset();
-		state.selected_group_ids.Slice(state.group_ids, state.local_sel, local_count);
-		state.selected_payload.Reset();
-		state.selected_payload.Slice(state.payload, state.local_sel, local_count);
-		state.local_hash_table->AddChunk(state.selected_group_ids, state.selected_payload, non_distinct_filter);
-	}
-	sink.matched_rows.fetch_add(match_count, std::memory_order_relaxed);
+	SinkHashGroupJoinMatches(*this, sink, state, target, state.matched_addresses, state.payload, match_count);
 	return OperatorResultType::NEED_MORE_INPUT;
 }
 
@@ -1525,54 +1569,24 @@ public:
 	Vector hashes;
 };
 
-static void AppendExternalRoutedRows(const PhysicalHashGroupJoin &op, ClientContext &context,
-                                     GroupedAggregateHashTable &routing_target, Vector &addresses, idx_t count,
-                                     DataChunk &payload, ExternalRoutedHashGroupJoinState &routed_state) {
-	if (count == 0) {
-		return;
-	}
-	DataChunk owner_keys;
-	owner_keys.Initialize(Allocator::Get(context), op.grouped_aggregate_data.group_types);
-	AggregateHTLookupState gather_state;
-	routing_target.GatherGroups(gather_state, addresses, *FlatVector::IncrementalSelectionVector(), count, owner_keys);
-	DataChunk final_groups;
-	final_groups.Initialize(Allocator::Get(context), op.output_group_types);
-	final_groups.SetChildCardinality(count);
-	ArenaAllocator arena(Allocator::Get(context));
-	RowOperationsState row_state(arena);
-	for (idx_t group_idx = 0; group_idx < op.output_groups.size(); group_idx++) {
-		auto &output_group = op.output_groups[group_idx];
-		if (output_group.source == HashGroupJoinOutputSource::KEY) {
-			final_groups.data[group_idx].Reference(owner_keys.data[output_group.index]);
-		} else {
-			D_ASSERT(output_group.source == HashGroupJoinOutputSource::OWNER_PAYLOAD);
-			RowOperations::FinalizeStatesRange(row_state, *routing_target.GetLayoutPtr(), addresses, final_groups,
-			                                   group_idx, 1 + output_group.index, 1);
-		}
-	}
-	routed_state.Append(final_groups, payload);
-}
-
 static void ProcessExternalRoutedLookupPartition(const PhysicalHashGroupJoin &op, ClientContext &context,
                                                  ColumnDataCollection &owner_partition,
                                                  optional_ptr<ColumnDataCollection> probe_partition,
                                                  ExternalRoutedHashGroupJoinState &routed_state) {
 	auto routing_target = make_uniq<GroupedAggregateHashTable>(
-	    context, BufferAllocator::Get(context), op.grouped_aggregate_data.group_types,
-	    op.owner_payload_data.payload_types, CreateExternalRoutingGroupJoinAggregates(op),
-	    GroupedAggregateHashTable::InitialCapacity(), idx_t(0),
-	    op.null_equal ? TupleDataValidityType::CAN_HAVE_NULL_VALUES : TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
-	AggregateHTUpdateState owner_update_state(*routing_target);
+	    context, BufferAllocator::Get(context), op.grouped_aggregate_data.group_types, vector<LogicalType> {},
+	    CreateRoutingGroupJoinAggregates(), GroupedAggregateHashTable::InitialCapacity(), idx_t(0),
+	    op.null_equal || !op.unique_owner ? TupleDataValidityType::CAN_HAVE_NULL_VALUES
+	                                      : TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 	const auto key_count = op.grouped_aggregate_data.group_types.size();
-	vector<data_ptr_t> group_addresses;
+	vector<vector<idx_t>> route_build_rows;
+	idx_t owner_row_count = 0;
 	DataChunk owner_rows;
 	owner_partition.InitializeScanChunk(Allocator::Get(context), owner_rows);
 	ColumnDataScanState owner_scan;
 	owner_partition.InitializeScan(owner_scan);
 	DataChunk owner_keys;
 	owner_keys.InitializeEmpty(op.grouped_aggregate_data.group_types);
-	DataChunk owner_payload;
-	owner_payload.InitializeEmpty(op.owner_payload_data.payload_types);
 	Vector owner_addresses(LogicalType::POINTER);
 	SelectionVector new_groups(STANDARD_VECTOR_SIZE);
 	while (owner_partition.Scan(owner_scan, owner_rows)) {
@@ -1582,28 +1596,54 @@ static void ProcessExternalRoutedLookupPartition(const PhysicalHashGroupJoin &op
 		}
 		owner_keys.SetChildCardinality(owner_rows.size());
 		auto new_count = routing_target->FindOrCreateGroups(owner_keys, owner_addresses, new_groups);
-		if (new_count != owner_rows.size()) {
+		if (op.unique_owner && new_count != owner_rows.size()) {
 			throw InternalException("HASH_GROUP_JOIN external routed owner uniqueness proof was violated");
 		}
 		auto addresses = FlatVector::GetData<data_ptr_t>(owner_addresses);
 		for (idx_t new_idx = 0; new_idx < new_count; new_idx++) {
 			auto row_idx = new_groups.get_index_unsafe(new_idx);
-			auto group_id = group_addresses.size();
-			StoreGroupJoinId(routing_target->GetLayout(), addresses[row_idx], group_id);
-			group_addresses.push_back(addresses[row_idx]);
+			auto route_id = route_build_rows.size();
+			StoreGroupJoinId(routing_target->GetLayout(), addresses[row_idx], route_id);
+			route_build_rows.emplace_back();
 		}
-		if (!op.owner_payload_data.aggregates.empty()) {
-			owner_payload.Reset();
-			for (idx_t payload_idx = 0; payload_idx < op.owner_payload_data.payload_types.size(); payload_idx++) {
-				owner_payload.data[payload_idx].Reference(owner_rows.data[key_count + payload_idx]);
+		for (idx_t row_idx = 0; row_idx < owner_rows.size(); row_idx++) {
+			auto route_id = LoadGroupJoinId(routing_target->GetLayout(), addresses[row_idx]);
+			D_ASSERT(route_id < route_build_rows.size());
+			auto &routes = route_build_rows[route_id];
+			if (!op.single_match || routes.empty()) {
+				routes.push_back(owner_row_count + row_idx);
 			}
-			owner_payload.SetChildCardinality(owner_rows.size());
-			routing_target->UpdateAggregatesAtAddressesRange(owner_update_state, owner_addresses, owner_payload, 1,
-			                                                 op.owner_payload_data.aggregates.size());
 		}
+		owner_row_count += owner_rows.size();
 	}
 
-	vector<bool> matched(group_addresses.size(), false);
+	vector<idx_t> route_offsets;
+	vector<idx_t> route_owner_rows;
+	route_offsets.reserve(route_build_rows.size() + 1);
+	for (auto &routes : route_build_rows) {
+		D_ASSERT(!routes.empty());
+		route_offsets.push_back(route_owner_rows.size());
+		route_owner_rows.insert(route_owner_rows.end(), routes.begin(), routes.end());
+	}
+	route_offsets.push_back(route_owner_rows.size());
+	route_build_rows.clear();
+	auto materialized_owner_rows = owner_partition.GetRows();
+	D_ASSERT(materialized_owner_rows.size() == owner_row_count);
+	vector<bool> matched(owner_row_count, false);
+	DataChunk final_groups;
+	final_groups.Initialize(Allocator::Get(context), op.output_group_types);
+	DataChunk routed_payload;
+	routed_payload.InitializeEmpty(op.grouped_aggregate_data.payload_types);
+	SelectionVector route_input(STANDARD_VECTOR_SIZE);
+	auto set_owner_groups = [&](idx_t output_row, idx_t owner_row) {
+		for (idx_t group_idx = 0; group_idx < op.output_groups.size(); group_idx++) {
+			auto &output_group = op.output_groups[group_idx];
+			auto owner_column = output_group.source == HashGroupJoinOutputSource::KEY ? output_group.index
+			                                                                          : key_count + output_group.index;
+			final_groups.data[group_idx].SetValue(output_row,
+			                                      materialized_owner_rows.GetValue(owner_column, owner_row));
+		}
+	};
 	if (probe_partition) {
 		DataChunk probe_rows;
 		probe_partition->InitializeScanChunk(Allocator::Get(context), probe_rows);
@@ -1651,11 +1691,37 @@ static void ProcessExternalRoutedLookupPartition(const PhysicalHashGroupJoin &op
 			}
 			matched_payload.SetChildCardinality(match_count);
 			auto addresses = FlatVector::GetData<data_ptr_t>(matched_addresses);
+			idx_t routed_count = 0;
+			auto flush_routes = [&]() {
+				if (routed_count == 0) {
+					return;
+				}
+				final_groups.SetChildCardinality(routed_count);
+				routed_payload.Reset();
+				routed_payload.Slice(matched_payload, route_input, routed_count);
+				if (routed_payload.ColumnCount() == 0) {
+					routed_payload.SetChildCardinality(routed_count);
+				}
+				routed_state.Append(final_groups, routed_payload);
+				final_groups.Reset();
+				routed_count = 0;
+			};
 			for (idx_t match_idx = 0; match_idx < match_count; match_idx++) {
-				matched[LoadGroupJoinId(routing_target->GetLayout(), addresses[match_idx])] = true;
+				auto route_id = LoadGroupJoinId(routing_target->GetLayout(), addresses[match_idx]);
+				if (route_id + 1 >= route_offsets.size()) {
+					throw InternalException("HASH_GROUP_JOIN external routing identifier exceeds route count");
+				}
+				for (idx_t route_idx = route_offsets[route_id]; route_idx < route_offsets[route_id + 1]; route_idx++) {
+					auto owner_row = route_owner_rows[route_idx];
+					matched[owner_row] = true;
+					set_owner_groups(routed_count, owner_row);
+					route_input.set_index(routed_count++, match_idx);
+					if (routed_count == STANDARD_VECTOR_SIZE) {
+						flush_routes();
+					}
+				}
 			}
-			AppendExternalRoutedRows(op, context, *routing_target, matched_addresses, match_count, matched_payload,
-			                         routed_state);
+			flush_routes();
 		}
 	}
 
@@ -1668,26 +1734,12 @@ static void ProcessExternalRoutedLookupPartition(const PhysicalHashGroupJoin &op
 		null_probe.Initialize(Allocator::Get(context), op.unmatched_probe_types);
 		DataChunk unmatched_payload;
 		unmatched_payload.Initialize(Allocator::Get(context), op.grouped_aggregate_data.payload_types);
-		DataChunk groups;
-		groups.Initialize(Allocator::Get(context), op.grouped_aggregate_data.group_types);
-		Vector row_addresses(LogicalType::POINTER);
-		Vector unmatched_addresses(LogicalType::POINTER);
-		SelectionVector unmatched_sel(STANDARD_VECTOR_SIZE);
-		AggregateHTScanState scan;
-		routing_target->InitializeScan(scan);
-		while (routing_target->ScanGroupsAndAddresses(scan, groups, row_addresses)) {
-			auto addresses = FlatVector::GetData<data_ptr_t>(row_addresses);
-			idx_t unmatched_count = 0;
-			for (idx_t row_idx = 0; row_idx < groups.size(); row_idx++) {
-				if (!matched[LoadGroupJoinId(routing_target->GetLayout(), addresses[row_idx])]) {
-					unmatched_sel.set_index(unmatched_count++, row_idx);
-				}
-			}
+		idx_t unmatched_count = 0;
+		auto flush_unmatched = [&]() {
 			if (unmatched_count == 0) {
-				continue;
+				return;
 			}
-			unmatched_addresses.Slice(row_addresses, unmatched_sel, unmatched_count);
-			unmatched_addresses.Flatten();
+			final_groups.SetChildCardinality(unmatched_count);
 			null_probe.Reset();
 			for (idx_t column_idx = 0; column_idx < op.unmatched_probe_types.size(); column_idx++) {
 				null_probe.data[column_idx].Reference(Value(op.unmatched_probe_types[column_idx]),
@@ -1696,9 +1748,20 @@ static void ProcessExternalRoutedLookupPartition(const PhysicalHashGroupJoin &op
 			null_probe.SetChildCardinality(unmatched_count);
 			unmatched_payload.Reset();
 			executor.Execute(null_probe, unmatched_payload);
-			AppendExternalRoutedRows(op, context, *routing_target, unmatched_addresses, unmatched_count,
-			                         unmatched_payload, routed_state);
+			routed_state.Append(final_groups, unmatched_payload);
+			final_groups.Reset();
+			unmatched_count = 0;
+		};
+		for (idx_t owner_row = 0; owner_row < matched.size(); owner_row++) {
+			if (matched[owner_row]) {
+				continue;
+			}
+			set_owner_groups(unmatched_count++, owner_row);
+			if (unmatched_count == STANDARD_VECTOR_SIZE) {
+				flush_unmatched();
+			}
 		}
+		flush_unmatched();
 	}
 }
 
@@ -2136,7 +2199,9 @@ string PhysicalHashGroupJoin::GetName() const {
 
 InsertionOrderPreservingMap<string> PhysicalHashGroupJoin::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
-	result["Join Type"] = unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD ? "INNER" : "OWNER OUTER";
+	result["Join Type"] = single_match                                                ? "SEMI"
+	                      : unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD ? "INNER"
+	                                                                                  : "OWNER OUTER";
 	switch (unmatched_policy) {
 	case HashGroupJoinUnmatchedPolicy::DISCARD:
 		result["Unmatched Policy"] = "DISCARD";

@@ -519,7 +519,7 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalAggregate &op) {
 			auto &group_join = Make<PhysicalHashGroupJoin>(
 			    op, probe_projection, owner_projection, std::move(aggregates), std::move(owner_payload_aggregates),
 			    std::move(groups), std::move(candidate->output_groups), candidate->unmatched_policy, candidate->routed,
-			    op.estimated_cardinality);
+			    candidate->owner_key_proof.has_value(), candidate->single_match, op.estimated_cardinality);
 			return group_join;
 		}
 	}
