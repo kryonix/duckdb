@@ -74,7 +74,7 @@ public:
 		if (!aggr.grouping_functions.empty()) {
 			return true;
 		}
-		return Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context) == GroupJoinStrategy::FORCE &&
+		return ForceHashGroupJoinPlanning(optimizer.context) &&
 		       IsStaticHashGroupJoinAggregate(optimizer.GetPlan(), aggr, optimizer.context,
 		                                      HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER);
 	}
@@ -240,8 +240,7 @@ public:
 	}
 
 	bool ShouldSkip(LogicalAggregate &aggr) const override {
-		if (Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context) != GroupJoinStrategy::FORCE ||
-		    aggr.children.size() != 1) {
+		if (!ForceHashGroupJoinPlanning(optimizer.context) || aggr.children.size() != 1) {
 			return false;
 		}
 		if (IsStaticHashGroupJoinAggregate(optimizer.GetPlan(), aggr, optimizer.context,

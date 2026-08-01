@@ -12,7 +12,7 @@ namespace duckdb {
 
 void CompressedMaterialization::CompressAggregate(unique_ptr<LogicalOperator> &op) {
 	auto &aggregate = op->Cast<LogicalAggregate>();
-	if (Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context) == GroupJoinStrategy::FORCE && root &&
+	if (ForceHashGroupJoinPlanning(optimizer.context) && root &&
 	    IsStaticHashGroupJoinAggregate(*root, aggregate, optimizer.context,
 	                                   HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER)) {
 		return;

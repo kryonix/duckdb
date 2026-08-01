@@ -119,7 +119,7 @@ bool CompressedMaterialization::TryCompressVariantComparisonJoinKey(JoinConditio
 
 void CompressedMaterialization::CompressComparisonJoin(unique_ptr<LogicalOperator> &op) {
 	auto &join = op->Cast<LogicalComparisonJoin>();
-	if (Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context) == GroupJoinStrategy::FORCE &&
+	if (ForceHashGroupJoinPlanning(optimizer.context) &&
 	    TryGetStaticHashGroupJoinCandidate(join, optimizer.context,
 	                                       HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER)) {
 		return;

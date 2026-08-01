@@ -109,7 +109,7 @@ static bool TryGetRecursiveKeyProbe(LogicalComparisonJoin &op, PhysicalOperator 
 }
 
 PhysicalOperator &PhysicalPlanGenerator::PlanComparisonJoin(LogicalComparisonJoin &op) {
-	if (Settings::Get<DebugGroupJoinStrategySetting>(context) == GroupJoinStrategy::FORCE) {
+	if (ForceHashGroupJoinPlanning(context)) {
 		auto candidate =
 		    TryGetStaticHashGroupJoinCandidate(op, context, HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER);
 		if (candidate) {

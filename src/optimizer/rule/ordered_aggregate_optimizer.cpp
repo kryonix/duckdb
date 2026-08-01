@@ -3,6 +3,7 @@
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/optimizer/matcher/expression_matcher.hpp"
 #include "duckdb/optimizer/expression_rewriter.hpp"
+#include "duckdb/optimizer/hash_group_join.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -103,8 +104,7 @@ unique_ptr<Expression> OrderedAggregateOptimizer::Apply(LogicalOperator &op, vec
 		return nullptr;
 	}
 	auto &logical_aggregate = op.Cast<LogicalAggregate>();
-	if (Settings::Get<DebugGroupJoinStrategySetting>(rewriter.context) == GroupJoinStrategy::FORCE &&
-	    aggr.GetOrderBys() && logical_aggregate.children.size() == 1 &&
+	if (ForceHashGroupJoinPlanning(rewriter.context) && aggr.GetOrderBys() && logical_aggregate.children.size() == 1 &&
 	    logical_aggregate.children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		return nullptr;
 	}

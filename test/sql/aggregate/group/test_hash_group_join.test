@@ -975,6 +975,19 @@ FROM gj_static_owner o
 ----
 physical_plan	<REGEX>:.*Hash Group Join.*EMPTY_AGGREGATE.*STATIC.*
 
+# Disabling the optimizer also disables the physical static specialization and its earlier rewrite preservation.
+statement ok
+SET disabled_optimizers = 'group_join'
+
+query II
+EXPLAIN SELECT label, (SELECT sum(value) FROM gj_static_probe p WHERE p.k = o.k)
+FROM gj_static_owner o
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+statement ok
+SET disabled_optimizers = ''
+
 statement ok
 SET debug_group_join_strategy = 'disabled'
 
@@ -1079,6 +1092,20 @@ CREATE TABLE gj_eager_probe(id INTEGER, value INTEGER)
 
 statement ok
 INSERT INTO gj_eager_probe SELECT (i % 3) + 1, i FROM range(10000) t(i)
+
+# Disabling GroupJoin must leave the adjacent partial-aggregate optimization active.
+statement ok
+SET disabled_optimizers = 'group_join'
+
+query II
+EXPLAIN SELECT o.id, sum(p.value)
+FROM gj_nonunique o JOIN gj_eager_probe p ON o.id = p.id
+GROUP BY o.id
+----
+physical_plan	<REGEX>:(?s).*(Hash|Perfect Hash) Group By.*(Hash|Perfect Hash) Group By.*
+
+statement ok
+SET disabled_optimizers = ''
 
 query II
 EXPLAIN SELECT o.id, sum(p.value)

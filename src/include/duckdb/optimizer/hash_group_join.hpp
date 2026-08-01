@@ -40,6 +40,11 @@ struct StaticHashGroupJoinCandidate {
 	vector<HashGroupJoinOutputColumn> output_columns;
 };
 
+//! Returns whether GroupJoin planning is enabled by both the strategy setting and optimizer configuration.
+bool HashGroupJoinPlanningEnabled(ClientContext &context);
+//! Returns whether the complete forced GroupJoin planning path is enabled.
+bool ForceHashGroupJoinPlanning(ClientContext &context);
+
 optional<HashGroupJoinCandidate>
 TryGetHashGroupJoinCandidate(LogicalAggregate &aggregate, LogicalComparisonJoin &join, ClientContext &context,
                              HashGroupJoinCandidateMode mode = HashGroupJoinCandidateMode::STRICT);

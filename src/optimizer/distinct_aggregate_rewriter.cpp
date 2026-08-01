@@ -265,12 +265,12 @@ bool DistinctAggregateRewriter::TryRewrite(unique_ptr<LogicalOperator> &op) {
 		return false;
 	}
 	auto &aggr = op->Cast<LogicalAggregate>();
-	if (Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context) == GroupJoinStrategy::FORCE &&
+	if (ForceHashGroupJoinPlanning(optimizer.context) &&
 	    IsStaticHashGroupJoinAggregate(optimizer.GetPlan(), aggr, optimizer.context,
 	                                   HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER)) {
 		return false;
 	}
-	if (Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context) == GroupJoinStrategy::FORCE &&
+	if (ForceHashGroupJoinPlanning(optimizer.context) &&
 	    aggr.children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto &join = aggr.children[0]->Cast<LogicalComparisonJoin>();
 		if (TryGetHashGroupJoinCandidate(aggr, join, optimizer.context,

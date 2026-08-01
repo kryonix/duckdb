@@ -1,6 +1,7 @@
 #include "duckdb/optimizer/hash_group_join.hpp"
 
 #include "duckdb/optimizer/key_properties.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/execution/index/art/art.hpp"
@@ -18,6 +19,16 @@
 #include "duckdb/main/settings.hpp"
 
 namespace duckdb {
+
+bool HashGroupJoinPlanningEnabled(ClientContext &context) {
+	return Settings::Get<DebugGroupJoinStrategySetting>(context) != GroupJoinStrategy::DISABLED &&
+	       !Optimizer::OptimizerDisabled(context, OptimizerType::GROUP_JOIN);
+}
+
+bool ForceHashGroupJoinPlanning(ClientContext &context) {
+	return HashGroupJoinPlanningEnabled(context) &&
+	       Settings::Get<DebugGroupJoinStrategySetting>(context) == GroupJoinStrategy::FORCE;
+}
 
 static optional_idx GetDirectReferenceIndex(const Expression &expression, LogicalOperator &input) {
 	if (expression.GetExpressionClass() == ExpressionClass::BOUND_REF) {
@@ -486,6 +497,9 @@ static bool PassesAutoHashGroupJoinCostModel(LogicalAggregate &aggregate, Logica
 optional<HashGroupJoinCandidate> TrySelectHashGroupJoinCandidate(LogicalAggregate &aggregate,
                                                                  LogicalComparisonJoin &join, ClientContext &context,
                                                                  HashGroupJoinCandidateMode mode) {
+	if (!HashGroupJoinPlanningEnabled(context)) {
+		return nullopt;
+	}
 	auto candidate = TryGetHashGroupJoinCandidate(aggregate, join, context, mode);
 	if (!candidate) {
 		return nullopt;
@@ -515,6 +529,9 @@ optional<HashGroupJoinCandidate> TryGetPlannedHashGroupJoinCandidate(LogicalAggr
                                                                      LogicalComparisonJoin &join,
                                                                      ClientContext &context,
                                                                      HashGroupJoinCandidateMode mode) {
+	if (!HashGroupJoinPlanningEnabled(context)) {
+		return nullopt;
+	}
 	auto strategy = Settings::Get<DebugGroupJoinStrategySetting>(context);
 	if (strategy == GroupJoinStrategy::DISABLED ||
 	    (strategy == GroupJoinStrategy::AUTO && !aggregate.group_join_auto_selected)) {
