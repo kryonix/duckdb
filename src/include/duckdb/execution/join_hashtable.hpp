@@ -33,6 +33,55 @@ struct ClientConfig;
 struct ResidualPredicateInfo;
 class PhysicalHashJoin;
 
+//! Count metadata for all build rows that share one complete equality key.
+class JoinFactorDefinition {
+public:
+	JoinFactorDefinition() : count(0) {
+	}
+
+private:
+	friend class JoinHashTable;
+	atomic<idx_t> count;
+};
+
+//! Generation-checked pointer-table slot for one complete equality-key factor.
+struct JoinFactorRef {
+	static constexpr idx_t SLOT_BITS = 40;
+	static constexpr uint64_t SLOT_MASK = (uint64_t(1) << SLOT_BITS) - 1;
+	static constexpr idx_t MAX_GENERATION = (uint64_t(1) << (64 - SLOT_BITS)) - 1;
+
+	JoinFactorRef() : value(0) {
+	}
+	explicit JoinFactorRef(uint64_t value_p) : value(value_p) {
+	}
+	JoinFactorRef(idx_t generation, idx_t slot)
+	    : value((NumericCast<uint64_t>(generation) << SLOT_BITS) | NumericCast<uint64_t>(slot)) {
+		D_ASSERT(generation > 0 && generation <= MAX_GENERATION);
+		D_ASSERT(slot <= SLOT_MASK);
+	}
+
+	bool IsValid() const {
+		return value != 0;
+	}
+	uint64_t Value() const {
+		return value;
+	}
+	idx_t Generation() const {
+		return NumericCast<idx_t>(value >> SLOT_BITS);
+	}
+	idx_t Slot() const {
+		return NumericCast<idx_t>(value & SLOT_MASK);
+	}
+	bool operator==(const JoinFactorRef &other) const {
+		return value == other.value;
+	}
+	bool operator!=(const JoinFactorRef &other) const {
+		return value != other.value;
+	}
+
+	uint64_t value;
+};
+
 struct JoinHTScanState {
 public:
 	JoinHTScanState(TupleDataCollection &collection, idx_t chunk_idx_from, idx_t chunk_idx_to,
@@ -218,6 +267,28 @@ public:
 		unique_ptr<ProbeDictionaryState> dict_state;
 	};
 
+	//! Probe state used only by the factor-reference API.
+	struct FactorProbeState {
+		FactorProbeState();
+
+		ProbeState probe;
+		Vector pointers;
+	};
+
+	//! Resumable state for expanding factor references without constructing a cross product.
+	struct FactorExpansionState {
+		idx_t reference_position = 0;
+		data_ptr_t current_row = nullptr;
+
+		void Reset() {
+			reference_position = 0;
+			current_row = nullptr;
+		}
+		bool Finished(idx_t reference_count) const {
+			return reference_position >= reference_count && current_row == nullptr;
+		}
+	};
+
 	struct InsertState : SharedState {
 		explicit InsertState(const JoinHashTable &ht);
 		/// Because of the index hick up
@@ -256,6 +327,8 @@ public:
 	//! Combines the partitions in sink_collection into data_collection, as if it were not partitioned
 	void Unpartition();
 	//! Allocate the pointer table for the probe
+	//! Enable factor-count maintenance before allocating the pointer table.
+	void EnableFactorDefinitions();
 	void AllocatePointerTable();
 	//! Initialize the pointer table for the probe
 	void InitializePointerTable(idx_t entry_idx_from, idx_t entry_idx_to);
@@ -265,9 +338,52 @@ public:
 	void Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool parallel,
 	              optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state = nullptr,
 	              bool prefix_range_parallel = false);
+	//! Finalize a factor table while maintaining per-key counts in the insertion loop.
+	void FinalizeFactorized(idx_t chunk_idx_from, idx_t chunk_idx_to, bool parallel);
+	//! Publish factor handles after hash-chain finalization has completed.
+	void FinishFactorDefinitions();
 	//! Probe the HT with the given input chunk, resulting in the given result
 	void Probe(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state, ProbeState &probe_state,
 	           optional_ptr<Vector> precomputed_hashes = nullptr);
+	//! Resolve at most one factor reference per probe row. Missing and NULL keys produce no selected row.
+	idx_t ProbeFactorRefs(DataChunk &keys, TupleDataChunkState &key_state, FactorProbeState &probe_state,
+	                      Vector &factor_refs, SelectionVector &match_sel,
+	                      optional_ptr<Vector> precomputed_hashes = nullptr);
+	//! Incrementally expand selected factor references into build-row addresses and source-row indices.
+	idx_t ExpandFactorRefs(Vector &factor_refs, optional_ptr<const SelectionVector> ref_sel, idx_t reference_count,
+	                       FactorExpansionState &state, Vector &build_rows, SelectionVector &source_sel,
+	                       idx_t output_capacity = STANDARD_VECTOR_SIZE) const;
+	bool HasFactorDefinitions() const {
+		return factor_definitions_finalized;
+	}
+	idx_t FactorCount() const {
+		return factor_chain_count.load(std::memory_order_relaxed);
+	}
+	idx_t MaximumFactorLength() const;
+	idx_t FactorDefinitionSizeInBytes() const {
+		return factor_definition_capacity * sizeof(JoinFactorDefinition);
+	}
+	bool FactorDefinitionsEnabled() const {
+		return factor_definitions_enabled;
+	}
+	void RegisterFactorRow(idx_t entry_idx, bool new_factor) {
+		D_ASSERT(factor_definitions_enabled);
+		D_ASSERT(entry_idx < factor_definition_capacity);
+		factor_definitions[entry_idx].count.fetch_add(1, std::memory_order_relaxed);
+		if (new_factor) {
+			factor_chain_count.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	JoinFactorRef GetFactorRef(idx_t entry_idx) const {
+		D_ASSERT(factor_definitions_enabled);
+		D_ASSERT(entry_idx < factor_definition_capacity);
+		return JoinFactorRef(factor_definition_generation, entry_idx);
+	}
+	idx_t GetFactorCount(JoinFactorRef ref) const;
+	data_ptr_t GetFactorChainHead(JoinFactorRef ref) const;
+	idx_t GetFactorId(JoinFactorRef ref) const;
+	//! Scans the occupied factor slots into generation-checked references.
+	idx_t ScanFactorRefs(idx_t &slot, Vector &factor_refs) const;
 	//! Enable selective NULL refinement for an uncorrelated multi-column MARK join
 	void InitializeUncorrelatedMarkJoin();
 	bool HasUncorrelatedMarkJoin() const;
@@ -309,6 +425,7 @@ public:
 	}
 	idx_t SizeInBytes() const {
 		idx_t size = data_collection ? data_collection->SizeInBytes() : 0;
+		size += FactorDefinitionSizeInBytes();
 		if (mark_join_info.uncorrelated_condition_rows) {
 			size += mark_join_info.uncorrelated_condition_rows->SizeInBytes();
 		}
@@ -464,10 +581,15 @@ private:
 	void GetRowPointers(DataChunk &keys, TupleDataChunkState &key_state, ProbeState &state, Vector &hashes_v,
 	                    optional_ptr<const SelectionVector> sel, idx_t &count, Vector &pointers_result_v,
 	                    SelectionVector &match_sel, bool has_sel);
+	void GetFactorPointers(DataChunk &keys, TupleDataChunkState &key_state, FactorProbeState &state, Vector &hashes_v,
+	                       optional_ptr<const SelectionVector> sel, idx_t &count, Vector &pointers_result_v,
+	                       SelectionVector &match_sel, bool has_sel);
 
 private:
 	//! Insert the given set of locations into the HT with the given set of hashes_v
 	void InsertHashes(Vector &hashes_v, TupleDataChunkState &chunk_state, InsertState &insert_state, bool parallel);
+	void InsertFactorHashes(Vector &hashes_v, TupleDataChunkState &chunk_state, InsertState &insert_state,
+	                        bool parallel);
 	//! Prepares keys by filtering NULLs
 	idx_t PrepareKeys(DataChunk &keys, vector<TupleDataVectorFormat> &vector_data,
 	                  optional_ptr<const SelectionVector> &current_sel, SelectionVector &sel, bool build_side);
@@ -490,6 +612,13 @@ private:
 
 	//! The hash map of the HT, created after finalization
 	AllocatedData hash_map;
+	//! Stable per-slot factor metadata. Empty for every ordinary join.
+	unique_ptr<JoinFactorDefinition[]> factor_definitions;
+	idx_t factor_definition_capacity = 0;
+	idx_t factor_definition_generation = 0;
+	bool factor_definitions_enabled = false;
+	atomic<idx_t> factor_chain_count {0};
+	bool factor_definitions_finalized = false;
 	//! Whether or not NULL values are considered equal in each of the comparisons
 	vector<bool> null_values_are_equal;
 	//! An empty tuple that's a "dead end", can be used to stop chains early

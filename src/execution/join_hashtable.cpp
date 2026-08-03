@@ -20,6 +20,8 @@
 
 namespace duckdb {
 
+static atomic<idx_t> next_factor_definition_generation {1};
+
 using ValidityBytes = JoinHashTable::ValidityBytes;
 using ScanStructure = JoinHashTable::ScanStructure;
 using ProbeSpill = JoinHashTable::ProbeSpill;
@@ -32,6 +34,9 @@ JoinHashTable::SharedState::SharedState()
 JoinHashTable::ProbeState::ProbeState()
     : SharedState(), ht_offsets_and_salts_v(LogicalType::UBIGINT), hashes_dense_v(LogicalType::HASH),
       non_empty_sel(STANDARD_VECTOR_SIZE) {
+}
+
+JoinHashTable::FactorProbeState::FactorProbeState() : pointers(LogicalType::POINTER) {
 }
 
 JoinHashTable::ProbeDictionaryState::ProbeDictionaryState()
@@ -392,6 +397,7 @@ inline bool JoinHashTable::UseSalt() const {
 void JoinHashTable::GetRowPointers(DataChunk &keys, TupleDataChunkState &key_state, ProbeState &state, Vector &hashes_v,
                                    optional_ptr<const SelectionVector> sel, idx_t &count, Vector &pointers_result_v,
                                    SelectionVector &match_sel, const bool has_sel) {
+	D_ASSERT(!factor_definitions_finalized);
 	auto entries = GetEntries();
 	if (UseSalt()) {
 		GetRowPointersInternal<true>(keys, key_state, state, hashes_v, sel, count, *this, entries, pointers_result_v,
@@ -399,6 +405,27 @@ void JoinHashTable::GetRowPointers(DataChunk &keys, TupleDataChunkState &key_sta
 	} else {
 		GetRowPointersInternal<false>(keys, key_state, state, hashes_v, sel, count, *this, entries, pointers_result_v,
 		                              match_sel, has_sel);
+	}
+}
+
+void JoinHashTable::GetFactorPointers(DataChunk &keys, TupleDataChunkState &key_state, FactorProbeState &state,
+                                      Vector &hashes_v, optional_ptr<const SelectionVector> sel, idx_t &count,
+                                      Vector &pointers_result_v, SelectionVector &match_sel, const bool has_sel) {
+	D_ASSERT(factor_definitions_finalized);
+	auto entries = GetEntries();
+	if (UseSalt()) {
+		GetRowPointersInternal<true>(keys, key_state, state.probe, hashes_v, sel, count, *this, entries, state.pointers,
+		                             match_sel, has_sel);
+	} else {
+		GetRowPointersInternal<false>(keys, key_state, state.probe, hashes_v, sel, count, *this, entries,
+		                              state.pointers, match_sel, has_sel);
+	}
+	auto refs = FlatVector::GetDataMutable<uint64_t>(pointers_result_v);
+	const auto ht_offsets_and_salts = FlatVector::GetData<idx_t>(state.probe.ht_offsets_and_salts_v);
+	for (idx_t i = 0; i < count; i++) {
+		const auto row_index = match_sel.get_index(i);
+		const auto ht_offset = ht_offsets_and_salts[row_index] & bitmask;
+		refs[row_index] = GetFactorRef(ht_offset).Value();
 	}
 }
 
@@ -815,7 +842,7 @@ static inline void PerformKeyComparison(JoinHashTable::InsertState &state, JoinH
 	D_ASSERT(key_match_count + key_no_match_count == count);
 }
 
-template <bool PARALLEL>
+template <bool PARALLEL, bool FACTOR_COUNTS>
 static inline void InsertMatchesAndIncrementMisses(unsafe_optional_ptr<atomic<ht_entry_t>> entries,
                                                    JoinHashTable::InsertState &state, JoinHashTable &ht,
                                                    const data_ptr_t lhs_row_locations[], idx_t ht_offsets[],
@@ -840,6 +867,9 @@ static inline void InsertMatchesAndIncrementMisses(unsafe_optional_ptr<atomic<ht
 
 			const auto salt = hash_salts[entry_index];
 			InsertRowToEntry<PARALLEL, false>(entry, row_ptr_to_insert, salt, ht.pointer_offset);
+			if (FACTOR_COUNTS) {
+				ht.RegisterFactorRow(ht_offset, false);
+			}
 		}
 	}
 
@@ -855,7 +885,7 @@ static inline void InsertMatchesAndIncrementMisses(unsafe_optional_ptr<atomic<ht
 	}
 }
 
-template <bool PARALLEL>
+template <bool PARALLEL, bool FACTOR_COUNTS>
 static void InsertHashesLoop(unsafe_optional_ptr<atomic<ht_entry_t>> entries, Vector &row_locations, Vector &hashes_v,
                              JoinHashTable::InsertState &state, const TupleDataCollection &data_collection,
                              JoinHashTable &ht) {
@@ -945,6 +975,9 @@ static void InsertHashesLoop(unsafe_optional_ptr<atomic<ht_entry_t>> entries, Ve
 				const auto row_ptr_to_insert = lhs_row_locations[row_index];
 				const auto potential_collided_ptr =
 				    InsertRowToEntry<PARALLEL, true>(atomic_entry, row_ptr_to_insert, salt, ht.pointer_offset);
+				if (FACTOR_COUNTS && (!PARALLEL || potential_collided_ptr == nullptr)) {
+					ht.RegisterFactorRow(ht_offset, true);
+				}
 
 				if (PARALLEL) {
 					// if the insertion was not successful, the entry was occupied in the meantime, so we have to
@@ -972,8 +1005,9 @@ static void InsertHashesLoop(unsafe_optional_ptr<atomic<ht_entry_t>> entries, Ve
 			idx_t key_match_count = 0;
 			PerformKeyComparison(state, ht, data_collection, row_locations, salt_match_count, key_match_count,
 			                     key_no_match_count);
-			InsertMatchesAndIncrementMisses<PARALLEL>(entries, state, ht, lhs_row_locations, ht_offsets, hash_salts,
-			                                          capacity_mask, key_match_count, key_no_match_count);
+			InsertMatchesAndIncrementMisses<PARALLEL, FACTOR_COUNTS>(entries, state, ht, lhs_row_locations, ht_offsets,
+			                                                         hash_salts, capacity_mask, key_match_count,
+			                                                         key_no_match_count);
 		}
 
 		// update the overall selection vector to only point the entries that still need to be inserted
@@ -992,9 +1026,24 @@ void JoinHashTable::InsertHashes(Vector &hashes_v, TupleDataChunkState &chunk_st
 	auto atomic_entries = GetAtomicEntries();
 	auto &row_locations = chunk_state.row_locations;
 	if (parallel) {
-		InsertHashesLoop<true>(atomic_entries, row_locations, hashes_v, insert_state, *data_collection, *this);
+		InsertHashesLoop<true, false>(atomic_entries, row_locations, hashes_v, insert_state, *data_collection, *this);
 	} else {
-		InsertHashesLoop<false>(atomic_entries, row_locations, hashes_v, insert_state, *data_collection, *this);
+		InsertHashesLoop<false, false>(atomic_entries, row_locations, hashes_v, insert_state, *data_collection, *this);
+	}
+}
+
+void JoinHashTable::InsertFactorHashes(Vector &hashes_v, TupleDataChunkState &chunk_state, InsertState &insert_state,
+                                       bool parallel) {
+	D_ASSERT(factor_definitions_enabled);
+	if (bloom_filter.IsInitialized()) {
+		bloom_filter.InsertHashes(hashes_v);
+	}
+	auto atomic_entries = GetAtomicEntries();
+	auto &row_locations = chunk_state.row_locations;
+	if (parallel) {
+		InsertHashesLoop<true, true>(atomic_entries, row_locations, hashes_v, insert_state, *data_collection, *this);
+	} else {
+		InsertHashesLoop<false, true>(atomic_entries, row_locations, hashes_v, insert_state, *data_collection, *this);
 	}
 }
 
@@ -1045,6 +1094,12 @@ void JoinHashTable::MergePrefixRangeBuildState(PrefixRangeFilter::BuildState &st
 	prefix_range_filter->MergeBuildState(state);
 }
 
+void JoinHashTable::EnableFactorDefinitions() {
+	D_ASSERT(!hash_map.get());
+	D_ASSERT(!factor_definitions_finalized);
+	factor_definitions_enabled = true;
+}
+
 void JoinHashTable::AllocatePointerTable() {
 	capacity = PointerTableCapacity(Count());
 	D_ASSERT(IsPowerOfTwo(capacity));
@@ -1074,6 +1129,21 @@ void JoinHashTable::AllocatePointerTable() {
 		hash_map = buffer_manager.GetBufferAllocator().Allocate(capacity * sizeof(ht_entry_t));
 	}
 	D_ASSERT(hash_map.GetSize() == capacity * sizeof(ht_entry_t));
+	if (factor_definitions_enabled) {
+		if (capacity > JoinFactorRef::SLOT_MASK) {
+			throw OutOfRangeException("Join factor pointer-table capacity exceeds the handle slot range");
+		}
+		factor_definition_generation = next_factor_definition_generation.fetch_add(1, std::memory_order_relaxed);
+		if (factor_definition_generation == 0 || factor_definition_generation > JoinFactorRef::MAX_GENERATION) {
+			throw OutOfRangeException("Join factor pointer-table generation overflow");
+		}
+		factor_definitions = unique_ptr<JoinFactorDefinition[]>(new JoinFactorDefinition[capacity]);
+		factor_definition_capacity = capacity;
+		factor_chain_count.store(0, std::memory_order_relaxed);
+	} else {
+		factor_definitions.reset();
+		factor_definition_capacity = 0;
+	}
 
 	bitmask = capacity - 1;
 
@@ -1108,6 +1178,12 @@ void JoinHashTable::InitializePointerTable(idx_t entry_idx_from, idx_t entry_idx
 	// initialize HT with all-zero entries
 	auto entries = GetEntries();
 	std::fill_n(entries.get() + entry_idx_from, entry_idx_to - entry_idx_from, ht_entry_t());
+	if (factor_definitions_enabled) {
+		D_ASSERT(factor_definition_capacity == capacity);
+		for (idx_t entry_idx = entry_idx_from; entry_idx < entry_idx_to; entry_idx++) {
+			factor_definitions[entry_idx].count.store(0, std::memory_order_relaxed);
+		}
+	}
 }
 
 void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool parallel,
@@ -1136,6 +1212,82 @@ void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool para
 			InsertPrefixRangeChunk(chunk_state, count, *prefix_range_state, prefix_range_parallel);
 		}
 	} while (iterator.Next());
+}
+
+void JoinHashTable::FinalizeFactorized(idx_t chunk_idx_from, idx_t chunk_idx_to, bool parallel) {
+	D_ASSERT(hash_map.get());
+	D_ASSERT(factor_definitions_enabled);
+
+	Vector hashes(LogicalType::HASH);
+	TupleDataChunkIterator iterator(*data_collection, TupleDataPinProperties::KEEP_EVERYTHING_PINNED, chunk_idx_from,
+	                                chunk_idx_to, false);
+	const auto row_locations = iterator.GetRowLocations();
+	InsertState insert_state(*this);
+	do {
+		const auto count = iterator.GetCurrentChunkCount();
+		auto hash_data = FlatVector::Writer<hash_t>(hashes, count_t(count));
+		for (idx_t i = 0; i < count; i++) {
+			hash_data.WriteValue(Load<hash_t>(row_locations[i] + pointer_offset));
+		}
+		TupleDataChunkState &chunk_state = iterator.GetChunkState();
+		InsertFactorHashes(hashes, chunk_state, insert_state, parallel);
+	} while (iterator.Next());
+}
+
+void JoinHashTable::FinishFactorDefinitions() {
+	D_ASSERT(!factor_definitions_finalized);
+	D_ASSERT(factor_definitions_enabled);
+	D_ASSERT(Count() == 0 || factor_definition_capacity == capacity);
+	factor_definitions_finalized = true;
+}
+
+idx_t JoinHashTable::MaximumFactorLength() const {
+	D_ASSERT(factor_definitions_finalized);
+	idx_t result = 0;
+	for (idx_t entry_idx = 0; entry_idx < factor_definition_capacity; entry_idx++) {
+		result = MaxValue(result, factor_definitions[entry_idx].count.load(std::memory_order_relaxed));
+	}
+	return result;
+}
+
+idx_t JoinHashTable::GetFactorId(JoinFactorRef ref) const {
+	if (!ref.IsValid() || !factor_definitions_finalized || ref.Generation() != factor_definition_generation ||
+	    ref.Slot() >= factor_definition_capacity) {
+		throw InternalException("Stale or invalid join factor reference");
+	}
+	return ref.Slot();
+}
+
+idx_t JoinHashTable::GetFactorCount(JoinFactorRef ref) const {
+	const auto entry_idx = GetFactorId(ref);
+	return factor_definitions[entry_idx].count.load(std::memory_order_relaxed);
+}
+
+data_ptr_t JoinHashTable::GetFactorChainHead(JoinFactorRef ref) const {
+	const auto entry_idx = GetFactorId(ref);
+	auto entries = reinterpret_cast<const ht_entry_t *>(hash_map.get());
+	if (!entries || !entries[entry_idx].IsOccupied()) {
+		throw InternalException("Join factor reference points to an empty pointer-table slot");
+	}
+	return entries[entry_idx].GetPointer();
+}
+
+idx_t JoinHashTable::ScanFactorRefs(idx_t &slot, Vector &factor_refs) const {
+	D_ASSERT(factor_definitions_finalized);
+	if (factor_refs.GetType() != LogicalType::UBIGINT) {
+		throw InternalException("Join factor references require a UBIGINT vector");
+	}
+	factor_refs.SetVectorType(VectorType::FLAT_VECTOR);
+	auto result = FlatVector::GetDataMutable<uint64_t>(factor_refs);
+	idx_t count = 0;
+	while (slot < factor_definition_capacity && count < STANDARD_VECTOR_SIZE) {
+		if (factor_definitions[slot].count.load(std::memory_order_relaxed) != 0) {
+			result[count++] = GetFactorRef(slot).Value();
+		}
+		slot++;
+	}
+	FlatVector::SetSize(factor_refs, count);
+	return count;
 }
 
 void JoinHashTable::InitializeScanStructure(ScanStructure &scan_structure, DataChunk &keys,
@@ -1177,6 +1329,7 @@ static bool LHSChunkIsConstant(const Vector &lhs_key) {
 
 void JoinHashTable::Probe(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state,
                           ProbeState &probe_state, optional_ptr<Vector> precomputed_hashes) {
+	D_ASSERT(!factor_definitions_finalized);
 	// dispatch into the compressed-vector fast paths when the operator gated them on. precomputed_hashes
 	// is incompatible: the caller hashed the full N-row chunk; the fast paths re-hash a sliced D-row chunk.
 	if (probe_state.dict_state && !precomputed_hashes) {
@@ -1206,6 +1359,79 @@ void JoinHashTable::Probe(ScanStructure &scan_structure, DataChunk &keys, TupleD
 		GetRowPointers(keys, key_state, probe_state, hashes, current_sel, scan_structure.count, scan_structure.pointers,
 		               scan_structure.sel_vector, scan_structure.has_null_value_filter);
 	}
+}
+
+idx_t JoinHashTable::ProbeFactorRefs(DataChunk &keys, TupleDataChunkState &key_state, FactorProbeState &probe_state,
+                                     Vector &factor_refs, SelectionVector &match_sel,
+                                     optional_ptr<Vector> precomputed_hashes) {
+	if (!factor_definitions_finalized || !finalized) {
+		throw InternalException("Join factor references were probed before finalization completed");
+	}
+	if (factor_refs.GetType() != LogicalType::UBIGINT) {
+		throw InternalException("Join factor references require a UBIGINT vector");
+	}
+	factor_refs.SetVectorType(VectorType::FLAT_VECTOR);
+	auto refs = FlatVector::GetDataMutable<uint64_t>(factor_refs);
+	memset(refs, 0, sizeof(uint64_t) * keys.size());
+	FlatVector::SetSize(factor_refs, count_t(keys.size()));
+	if (Count() == 0 || keys.size() == 0) {
+		return 0;
+	}
+
+	TupleDataCollection::ToUnifiedFormat(key_state, keys);
+	SelectionVector prepared_sel(STANDARD_VECTOR_SIZE);
+	optional_ptr<const SelectionVector> current_sel;
+	idx_t count = PrepareKeys(keys, key_state.vector_data, current_sel, prepared_sel, false);
+	if (count == 0) {
+		return 0;
+	}
+	const bool has_sel = count < keys.size();
+	if (precomputed_hashes) {
+		GetFactorPointers(keys, key_state, probe_state, *precomputed_hashes, current_sel, count, factor_refs, match_sel,
+		                  has_sel);
+	} else {
+		Vector hashes(LogicalType::HASH);
+		Hash(keys, *current_sel, count, hashes);
+		GetFactorPointers(keys, key_state, probe_state, hashes, current_sel, count, factor_refs, match_sel, has_sel);
+	}
+	return count;
+}
+
+idx_t JoinHashTable::ExpandFactorRefs(Vector &factor_refs, optional_ptr<const SelectionVector> ref_sel,
+                                      idx_t reference_count, FactorExpansionState &state, Vector &build_rows,
+                                      SelectionVector &source_sel, idx_t output_capacity) const {
+	D_ASSERT(factor_definitions_finalized);
+	D_ASSERT(!use_dict_emission);
+	D_ASSERT(output_capacity <= STANDARD_VECTOR_SIZE);
+	if (factor_refs.GetType() != LogicalType::UBIGINT) {
+		throw InternalException("Join factor references require a UBIGINT vector");
+	}
+	build_rows.SetVectorType(VectorType::FLAT_VECTOR);
+	auto output_rows = FlatVector::GetDataMutable<data_ptr_t>(build_rows);
+	auto refs = factor_refs.Values<uint64_t>();
+	idx_t output_count = 0;
+
+	while (output_count < output_capacity && state.reference_position < reference_count) {
+		const auto source_idx = ref_sel ? ref_sel->get_index(state.reference_position) : state.reference_position;
+		if (state.current_row == nullptr) {
+			const auto ref = JoinFactorRef(refs[source_idx].GetValueUnsafe());
+			if (!ref.IsValid()) {
+				state.reference_position++;
+				continue;
+			}
+			state.current_row = GetFactorChainHead(ref);
+		}
+
+		output_rows[output_count] = state.current_row;
+		source_sel.set_index(output_count, source_idx);
+		output_count++;
+		state.current_row = GetNextPointer<false>(state.current_row);
+		if (state.current_row == nullptr) {
+			state.reference_position++;
+		}
+	}
+	FlatVector::SetSize(build_rows, count_t(output_count));
+	return output_count;
 }
 
 bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state,
@@ -2528,6 +2754,10 @@ void JoinHashTable::Repartition(JoinHashTable &global_ht) {
 void JoinHashTable::Reset() {
 	data_collection->Reset();
 	hash_map.Reset();
+	factor_definitions.reset();
+	factor_definition_capacity = 0;
+	factor_chain_count.store(0, std::memory_order_relaxed);
+	factor_definitions_finalized = false;
 	current_partitions.SetAllInvalid(RadixPartitioning::NumberOfPartitions(radix_bits));
 	finalized = false;
 }
@@ -2592,6 +2822,10 @@ void JoinHashTable::ResetForNewIterationSinglePartition() {
 	aux_next_ptrs.Reset();
 	aux_next_ptrs_data = nullptr;
 	use_dict_emission = false;
+	factor_definitions.reset();
+	factor_definition_capacity = 0;
+	factor_chain_count.store(0, std::memory_order_relaxed);
+	factor_definitions_finalized = false;
 	// Drop pinned upstream dictionary entries; the next iteration's first chunk re-pins
 	for (auto &entry : dict_registry) {
 		entry.reset();
