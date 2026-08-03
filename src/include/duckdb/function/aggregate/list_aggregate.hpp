@@ -130,7 +130,8 @@ inline void ListAbsorbFunction(Vector &states_vector, Vector &combined, Aggregat
 template <class OP>
 void ListCombineFunction(Vector &states_vector, Vector &combined, AggregateInputData &aggr_input_data, idx_t count) {
 	//	Can we use destructive combining?
-	if (aggr_input_data.combine_type == AggregateCombineType::ALLOW_DESTRUCTIVE) {
+	if (aggr_input_data.combine_type == AggregateCombineType::ALLOW_DESTRUCTIVE &&
+	    !aggr_input_data.combine_multiplicities) {
 		ListAbsorbFunction(states_vector, combined, aggr_input_data, count);
 		return;
 	}
@@ -141,8 +142,29 @@ void ListCombineFunction(Vector &states_vector, Vector &combined, AggregateInput
 	auto element_type = OP::GetElementType(aggr_input_data);
 	ListSegmentFunctions functions;
 	GetSegmentDataFunctions(functions, element_type);
+	UnifiedVectorFormat multiplicities;
+	const int64_t *multiplicity_data = nullptr;
+	if (aggr_input_data.combine_multiplicities) {
+		aggr_input_data.combine_multiplicities->ToUnifiedFormat(multiplicities);
+		multiplicity_data = UnifiedVectorFormat::GetData<int64_t>(multiplicities);
+	}
 
 	for (idx_t i = 0; i < count; i++) {
+		idx_t multiplicity = 1;
+		if (multiplicity_data) {
+			auto multiplicity_idx = multiplicities.sel->get_index(i);
+			if (!multiplicities.validity.RowIsValid(multiplicity_idx)) {
+				continue;
+			}
+			auto value = multiplicity_data[multiplicity_idx];
+			if (value < 0) {
+				throw InvalidInputException("combine_aggr multiplicity must be non-negative");
+			}
+			multiplicity = NumericCast<idx_t>(value);
+		}
+		if (multiplicity == 0) {
+			continue;
+		}
 		auto &source = *states[i].GetValue();
 		auto &target = *combined_ptr[i];
 
@@ -153,8 +175,10 @@ void ListCombineFunction(Vector &states_vector, Vector &combined, AggregateInput
 		RecursiveUnifiedVectorFormat input_data;
 		Vector::RecursiveToUnifiedFormat(input, input_data);
 
-		functions.AppendListEntry(aggr_input_data.allocator, target.linked_list, input_data,
-		                          list_entry_t(0, entry_count));
+		for (idx_t repeat_idx = 0; repeat_idx < multiplicity; repeat_idx++) {
+			functions.AppendListEntry(aggr_input_data.allocator, target.linked_list, input_data,
+			                          list_entry_t(0, entry_count));
+		}
 	}
 }
 

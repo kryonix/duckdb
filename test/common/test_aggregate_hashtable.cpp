@@ -26,6 +26,16 @@ static AggregateObject CreateCountAggregate(bool count_star) {
 	                       PhysicalType::INT64);
 }
 
+TEST_CASE("Aggregate repeat-combine capability is explicit", "[aggregate_hashtable]") {
+	auto count = CountFunctionBase::GetFunction();
+	auto count_star = CountStarFun::GetFunction();
+	REQUIRE(count.GetRepeatCombine() == AggregateRepeatCombine::SUPPORTED);
+	REQUIRE(count_star.GetRepeatCombine() == AggregateRepeatCombine::SUPPORTED);
+
+	AggregateFunctionProperties properties;
+	REQUIRE(properties.repeat_combine == AggregateRepeatCombine::UNSUPPORTED);
+}
+
 TEST_CASE("Grouped aggregate address lookup and update", "[aggregate_hashtable]") {
 	DuckDB database(nullptr);
 	Connection connection(database);

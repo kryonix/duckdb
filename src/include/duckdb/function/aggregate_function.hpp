@@ -284,6 +284,9 @@ public:
 	//! Whether the aggregate is affect by distinct modifiers
 	AggregateDistinctDependent distinct_dependent = AggregateDistinctDependent::DISTINCT_DEPENDENT;
 
+	//! Whether combine accepts a non-negative multiplicity with repeated-input semantics
+	AggregateRepeatCombine repeat_combine = AggregateRepeatCombine::UNSUPPORTED;
+
 	bool operator==(const AggregateFunctionProperties &rhs) const;
 	bool operator!=(const AggregateFunctionProperties &rhs) const;
 };
@@ -325,6 +328,9 @@ public: // Properties
 	//! Whether the aggregate is affect by distinct modifiers
 	auto GetDistinctDependent() const -> AggregateDistinctDependent { return properties.distinct_dependent; }
 	auto SetDistinctDependent(AggregateDistinctDependent value) -> void { properties.distinct_dependent = value; }
+
+	auto GetRepeatCombine() const -> AggregateRepeatCombine { return properties.repeat_combine; }
+	auto SetRepeatCombine(AggregateRepeatCombine value) -> void { properties.repeat_combine = value; }
 
 	// Derived properties
 	bool CanAggregate() const { return callbacks.update || callbacks.combine || callbacks.finalize; }
@@ -575,6 +581,7 @@ public:
 		    AggregateFunction::StateCombine<STATE, OP>, AggregateFunction::StateFinalize<STATE, RESULT_TYPE, OP>,
 		    FunctionNullHandling::DEFAULT_NULL_HANDLING, AggregateFunction::NullaryClusterUpdate<STATE, OP>);
 		WireStructStateType<STATE>(result);
+		result.SetRepeatCombine(AggregateRepeatCombine::SUPPORTED);
 		return result;
 	}
 
@@ -594,6 +601,7 @@ public:
 			result.callbacks.destructor = AggregateFunction::StateDestroy<STATE, OP>;
 		}
 		WireStructStateType<STATE>(result);
+		result.SetRepeatCombine(AggregateRepeatCombine::SUPPORTED);
 		return result;
 	}
 
@@ -618,6 +626,7 @@ public:
 		                         AggregateFunction::StateCombine<STATE, OP>,
 		                         AggregateFunction::StateFinalize<STATE, RESULT_TYPE, OP>, nullptr);
 		WireStructStateType<STATE>(result);
+		result.SetRepeatCombine(AggregateRepeatCombine::SUPPORTED);
 		return result;
 	}
 

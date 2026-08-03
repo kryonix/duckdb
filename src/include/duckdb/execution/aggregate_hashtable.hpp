@@ -169,6 +169,16 @@ public:
 	void UpdateAggregatesAtAddressesRange(AggregateHTUpdateState &state, Vector &addresses, Vector &group_ids,
 	                                      DataChunk &payload, idx_t aggregate_begin, idx_t aggregate_count,
 	                                      const unsafe_vector<idx_t> &filter);
+	//! Updates a range using filter vectors evaluated against a source-local payload.
+	void UpdateAggregatesAtAddressesRangeWithFilterSet(AggregateHTUpdateState &state, Vector &addresses,
+	                                                   DataChunk &payload, idx_t aggregate_begin, idx_t aggregate_count,
+	                                                   const unsafe_vector<idx_t> &filter,
+	                                                   AggregateFilterDataSet &source_filter_set);
+	//! Updates a dense range using filter vectors evaluated against a source-local payload.
+	void UpdateAggregatesAtAddressesRangeWithFilterSet(AggregateHTUpdateState &state, Vector &addresses,
+	                                                   Vector &group_ids, DataChunk &payload, idx_t aggregate_begin,
+	                                                   idx_t aggregate_count, const unsafe_vector<idx_t> &filter,
+	                                                   AggregateFilterDataSet &source_filter_set);
 	//! Imports one exported state per aggregate and combines it into the addressed rows.
 	void CombineExportedStatesAtAddressesRange(AggregateHTUpdateState &state, Vector &addresses,
 	                                           DataChunk &serialized_states, idx_t aggregate_begin,

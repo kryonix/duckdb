@@ -143,7 +143,8 @@ static idx_t GetAggregateStateOffset(TupleDataLayout &layout, idx_t aggregate_id
 
 void RowOperations::CombineStatesRange(RowOperationsState &state, TupleDataLayout &source_layout, Vector &sources,
                                        idx_t source_begin, TupleDataLayout &target_layout, Vector &targets,
-                                       idx_t target_begin, idx_t aggregate_count) {
+                                       idx_t target_begin, idx_t aggregate_count,
+                                       optional_ptr<const Vector> multiplicities, AggregateCombineType combine_type) {
 	if (sources.size() != targets.size()) {
 		throw InternalException("CombineStatesRange: source count (%llu) does not match target count (%llu)",
 		                        sources.size(), targets.size());
@@ -184,7 +185,8 @@ void RowOperations::CombineStatesRange(RowOperationsState &state, TupleDataLayou
 	for (idx_t i = 0; i < aggregate_count; i++) {
 		auto &source = source_aggregates[source_begin + i];
 		auto &target = target_aggregates[target_begin + i];
-		AggregateInputData aggr_input_data(target, state.allocator, AggregateCombineType::ALLOW_DESTRUCTIVE);
+		AggregateInputData aggr_input_data(target, state.allocator, combine_type);
+		aggr_input_data.combine_multiplicities = multiplicities;
 		target.function.GetStateCombineCallback()(sources, targets, aggr_input_data, count);
 
 		VectorOperations::AddInPlace(sources, UnsafeNumericCast<int64_t>(source.payload_size));

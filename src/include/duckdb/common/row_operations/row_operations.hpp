@@ -12,6 +12,7 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/function/function.hpp"
+#include "duckdb/function/aggregate_state.hpp"
 
 namespace duckdb {
 
@@ -68,7 +69,9 @@ struct RowOperations {
 	//! combine a contiguous range of compatible aggregate states from one layout into another
 	static void CombineStatesRange(RowOperationsState &state, TupleDataLayout &source_layout, Vector &sources,
 	                               idx_t source_begin, TupleDataLayout &target_layout, Vector &targets,
-	                               idx_t target_begin, idx_t aggregate_count);
+	                               idx_t target_begin, idx_t aggregate_count,
+	                               optional_ptr<const Vector> multiplicities = nullptr,
+	                               AggregateCombineType combine_type = AggregateCombineType::ALLOW_DESTRUCTIVE);
 	//! finalize - unaligned addresses, updated
 	static void FinalizeStates(RowOperationsState &state, TupleDataLayout &layout, Vector &addresses, DataChunk &result,
 	                           idx_t aggr_idx);

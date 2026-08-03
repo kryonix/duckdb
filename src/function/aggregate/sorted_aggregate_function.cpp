@@ -3,6 +3,7 @@
 #include "duckdb/common/sorting/sort.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector/struct_vector.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/list_segment.hpp"
 #include "duckdb/function/aggregate/list_aggregate.hpp"
 #include "duckdb/function/aggregate_function.hpp"
@@ -138,7 +139,7 @@ struct SortedAggregateBindData : public FunctionData {
 	    : context(other.context), function(other.function), sort_types(other.sort_types), scan_cols(other.scan_cols),
 	      scan_types(other.scan_types), buffered_cols(other.buffered_cols), buffered_types(other.buffered_types),
 	      buffered_struct_type(other.buffered_struct_type), buffered_funcs(other.buffered_funcs),
-	      sorted_on_args(other.sorted_on_args), threshold(other.threshold) {
+	      sorted_on_args(other.sorted_on_args), threshold(other.threshold), spill_enabled(other.spill_enabled) {
 		if (other.bind_info) {
 			bind_info = other.bind_info->Copy();
 		}
@@ -204,10 +205,23 @@ struct SortedAggregateBindData : public FunctionData {
 
 	//! The sort flush threshold
 	const idx_t threshold;
+	//! State export serializes the linked-list layout directly and cannot promote it.
+	bool spill_enabled = true;
 };
 
-//! The sorted aggregate buffers its input rows in a linked list of structs, sharing the "list" callbacks
-struct SortedAggregateState : ListAggState {};
+struct SortedAggregateSpillState {
+	SortedAggregateSpillState(ClientContext &context, const LogicalType &type) : rows(context, {type}) {
+		rows.InitializeAppend(append_state);
+	}
+
+	ColumnDataCollection rows;
+	ColumnDataAppendState append_state;
+};
+
+//! The sorted aggregate buffers small inputs in a linked list and promotes hot states to buffer-managed storage.
+struct SortedAggregateState : ListAggState {
+	SortedAggregateSpillState *spill = nullptr;
+};
 
 //! Caches the chunks, contexts and inner aggregate state used while finalizing the groups of a sorted aggregate.
 //! When the caller provides a local state slot (e.g. the hash table scan), this state survives across finalize
@@ -260,6 +274,17 @@ struct SortedAggregateFinalizeState : FunctionLocalState {
 };
 
 struct SortedAggregateFunction {
+	static void Initialize(SortedAggregateState &state) {
+		state.linked_list = LinkedList();
+		state.spill = nullptr;
+	}
+
+	template <class STATE>
+	static void Destroy(STATE &state, AggregateInputData &) {
+		delete state.spill;
+		state.spill = nullptr;
+	}
+
 	static LogicalType GetElementType(AggregateInputData &aggr_input_data) {
 		return aggr_input_data.bind_data->Cast<SortedAggregateBindData>().buffered_struct_type;
 	}
@@ -280,6 +305,129 @@ struct SortedAggregateFunction {
 		}
 		FlatVector::SetSize(packed, count_t(count));
 		ListUpdateFunction(&packed, aggr_input_data, 1, states, count);
+		auto state_data = states.Values<SortedAggregateState *>();
+		for (idx_t row_idx = 0; row_idx < count; row_idx++) {
+			auto &state = *state_data[row_idx].GetValue();
+			if (order_bind.spill_enabled && state.linked_list.total_capacity >= order_bind.threshold) {
+				SpillState(order_bind, state);
+			}
+		}
+	}
+
+	static void SpillState(const SortedAggregateBindData &order_bind, SortedAggregateState &state) {
+		if (!order_bind.spill_enabled || state.linked_list.total_capacity == 0) {
+			return;
+		}
+		if (!state.spill) {
+			state.spill = new SortedAggregateSpillState(order_bind.context, order_bind.buffered_struct_type);
+		}
+		DataChunk rows;
+		rows.Initialize(BufferManager::GetBufferManager(order_bind.context).GetBufferAllocator(),
+		                {order_bind.buffered_struct_type});
+		ListSegmentScanState scan;
+		order_bind.buffered_funcs.InitializeScan(state.linked_list, scan);
+		while (true) {
+			rows.Reset();
+			auto count = order_bind.buffered_funcs.Scan(scan, rows.data[0]);
+			if (count == 0) {
+				break;
+			}
+			rows.SetChildCardinality(count);
+			state.spill->rows.Append(state.spill->append_state, rows);
+		}
+		state.linked_list = LinkedList();
+	}
+
+	static void Combine(Vector &states_vector, Vector &combined, AggregateInputData &aggr_input_data, idx_t count) {
+		const auto &order_bind = aggr_input_data.bind_data->Cast<SortedAggregateBindData>();
+		auto states = states_vector.Values<SortedAggregateState *>();
+		auto targets = combined.Values<SortedAggregateState *>();
+		if (aggr_input_data.combine_type == AggregateCombineType::ALLOW_DESTRUCTIVE &&
+		    !aggr_input_data.combine_multiplicities) {
+			for (idx_t row_idx = 0; row_idx < count; row_idx++) {
+				auto &source = *states[row_idx].GetValue();
+				auto &target = *targets[row_idx].GetValue();
+				if (source.spill) {
+					if (!target.spill) {
+						target.spill = source.spill;
+						source.spill = nullptr;
+					} else {
+						target.spill->rows.Combine(source.spill->rows);
+						delete source.spill;
+						source.spill = nullptr;
+					}
+				}
+				if (source.linked_list.total_capacity != 0) {
+					if (target.linked_list.total_capacity == 0) {
+						target.linked_list = source.linked_list;
+					} else {
+						target.linked_list.last_segment->next = source.linked_list.first_segment;
+						target.linked_list.last_segment = source.linked_list.last_segment;
+						target.linked_list.total_capacity += source.linked_list.total_capacity;
+					}
+				}
+				if (target.spill && target.linked_list.total_capacity != 0) {
+					SpillState(order_bind, target);
+				}
+			}
+			return;
+		}
+		UnifiedVectorFormat multiplicities;
+		const int64_t *multiplicity_data = nullptr;
+		if (aggr_input_data.combine_multiplicities) {
+			aggr_input_data.combine_multiplicities->ToUnifiedFormat(multiplicities);
+			multiplicity_data = UnifiedVectorFormat::GetData<int64_t>(multiplicities);
+		}
+		for (idx_t row_idx = 0; row_idx < count; row_idx++) {
+			idx_t multiplicity = 1;
+			if (multiplicity_data) {
+				auto multiplicity_idx = multiplicities.sel->get_index(row_idx);
+				if (!multiplicities.validity.RowIsValid(multiplicity_idx)) {
+					continue;
+				}
+				auto value = multiplicity_data[multiplicity_idx];
+				if (value < 0) {
+					throw InvalidInputException("combine_aggr multiplicity must be non-negative");
+				}
+				multiplicity = NumericCast<idx_t>(value);
+			}
+			if (multiplicity == 0) {
+				continue;
+			}
+			auto &source = *states[row_idx].GetValue();
+			auto &target = *targets[row_idx].GetValue();
+			if (source.spill) {
+				if (!target.spill) {
+					target.spill = new SortedAggregateSpillState(order_bind.context, order_bind.buffered_struct_type);
+				}
+				DataChunk rows;
+				source.spill->rows.InitializeScanChunk(Allocator::Get(order_bind.context), rows);
+				ColumnDataScanState scan;
+				source.spill->rows.InitializeScan(scan);
+				while (true) {
+					rows.Reset();
+					if (!source.spill->rows.Scan(scan, rows)) {
+						break;
+					}
+					for (idx_t repeat_idx = 0; repeat_idx < multiplicity; repeat_idx++) {
+						target.spill->rows.Append(target.spill->append_state, rows);
+					}
+				}
+			}
+			if (source.linked_list.total_capacity != 0) {
+				Vector input(order_bind.buffered_struct_type, source.linked_list.total_capacity);
+				order_bind.buffered_funcs.BuildListVector(source.linked_list, input, 0);
+				RecursiveUnifiedVectorFormat input_data;
+				Vector::RecursiveToUnifiedFormat(input, input_data);
+				for (idx_t repeat_idx = 0; repeat_idx < multiplicity; repeat_idx++) {
+					order_bind.buffered_funcs.AppendListEntry(aggr_input_data.allocator, target.linked_list, input_data,
+					                                          list_entry_t(0, source.linked_list.total_capacity));
+				}
+				if (order_bind.spill_enabled && target.linked_list.total_capacity >= order_bind.threshold) {
+					SpillState(order_bind, target);
+				}
+			}
+		}
 	}
 
 	static void Window(AggregateInputData &aggr_input_data, const WindowPartitionInput &partition,
@@ -310,9 +458,50 @@ struct SortedAggregateFunction {
 			prefixed.data[col_idx + 1].Reference(entries[col_idx]);
 			FlatVector::SetSize(prefixed.data[col_idx + 1], count_t(accumulated));
 		}
+		prefixed.SetChildCardinality(accumulated);
 		order_bind.sort->Sink(context, prefixed, sink);
 		finalize_state.rows.Reset();
 		accumulated = 0;
+	}
+
+	static void SinkSpilledState(const SortedAggregateBindData &order_bind, SortedAggregateState &state,
+	                             idx_t group_number, SortedAggregateFinalizeState &finalize_state,
+	                             ExecutionContext &context, OperatorSinkInput &sink) {
+		if (!state.spill) {
+			return;
+		}
+		DataChunk rows;
+		state.spill->rows.InitializeScanChunk(Allocator::Get(order_bind.context), rows);
+		ColumnDataScanState scan;
+		state.spill->rows.InitializeScan(scan);
+		auto &prefixed = finalize_state.prefixed;
+		idx_t sunk_count = 0;
+		while (true) {
+			rows.Reset();
+			if (!state.spill->rows.Scan(scan, rows)) {
+				break;
+			}
+			prefixed.Reset();
+			auto group_numbers = FlatVector::GetDataMutable<uint16_t>(prefixed.data[0]);
+			for (idx_t row_idx = 0; row_idx < rows.size(); row_idx++) {
+				group_numbers[row_idx] = UnsafeNumericCast<uint16_t>(group_number);
+			}
+			FlatVector::SetSize(prefixed.data[0], rows.size());
+			auto &entries = StructVector::GetEntries(rows.data[0]);
+			for (idx_t column_idx = 0; column_idx < entries.size(); column_idx++) {
+				prefixed.data[column_idx + 1].Reference(entries[column_idx]);
+				FlatVector::SetSize(prefixed.data[column_idx + 1], rows.size());
+			}
+			prefixed.SetChildCardinality(rows.size());
+			order_bind.sort->Sink(context, prefixed, sink);
+			sunk_count += rows.size();
+		}
+		if (sunk_count != state.spill->rows.Count()) {
+			throw InternalException("Sorted aggregate spilled-row scan count mismatch (expected=%llu, actual=%llu)",
+			                        state.spill->rows.Count(), sunk_count);
+		}
+		delete state.spill;
+		state.spill = nullptr;
 	}
 
 	//! Buffers the rows of the state into the cached rows chunk, prefixed with the group number, flushing into
@@ -320,6 +509,10 @@ struct SortedAggregateFunction {
 	static void SinkState(const SortedAggregateBindData &order_bind, SortedAggregateState &state,
 	                      const idx_t group_number, idx_t &accumulated, SortedAggregateFinalizeState &finalize_state,
 	                      ExecutionContext &context, OperatorSinkInput &sink) {
+		if (state.spill) {
+			FlushAccumulated(order_bind, accumulated, finalize_state, context, sink);
+			SinkSpilledState(order_bind, state, group_number, finalize_state, context, sink);
+		}
 		const auto group_count = state.linked_list.total_capacity;
 		if (!group_count) {
 			return;
@@ -393,7 +586,11 @@ struct SortedAggregateFunction {
 
 		vector<idx_t> state_unprocessed(count, 0);
 		for (idx_t i = 0; i < count; ++i) {
-			state_unprocessed[i] = sdata[i].GetValueUnsafe()->linked_list.total_capacity;
+			auto state = sdata[i].GetValueUnsafe();
+			state_unprocessed[i] = state->linked_list.total_capacity;
+			if (state->spill) {
+				state_unprocessed[i] += state->spill->rows.Count();
+			}
 		}
 
 		auto &sort = order_bind.sort;
@@ -450,8 +647,13 @@ struct SortedAggregateFunction {
 
 				// Distribute the scanned chunk to the aggregates
 				while (consumed < scanned.size()) {
+					if (sorted >= state_unprocessed.size()) {
+						throw InternalException("Sorted aggregate emitted more spilled rows than its states recorded "
+						                        "(chunk=%llu, consumed=%llu)",
+						                        scanned.size(), consumed);
+					}
 					//	Find the next aggregate that needs data
-					for (; !state_unprocessed[sorted]; ++sorted) {
+					for (; sorted < state_unprocessed.size() && !state_unprocessed[sorted]; ++sorted) {
 						// Finalize a single value at the next offset
 						agg_state_vec.SetVectorType(states.GetVectorType());
 						finalize(agg_state_vec, aggr_bind_info, result, 1, sorted + offset);
@@ -460,6 +662,11 @@ struct SortedAggregateFunction {
 						}
 
 						initialize(state_input, &agg_state_ptr, 1);
+					}
+					if (sorted >= state_unprocessed.size()) {
+						throw InternalException("Sorted aggregate emitted more spilled rows than its states recorded "
+						                        "(chunk=%llu, consumed=%llu)",
+						                        scanned.size(), consumed);
 					}
 					const auto input_count = MinValue(state_unprocessed[sorted], scanned.size() - consumed);
 					for (column_t col_idx = 0; col_idx < scanned.ColumnCount(); ++col_idx) {
@@ -535,11 +742,14 @@ AggregateFunction CreateSortedAggregateWrapper(const Identifier &name, const vec
                                                const LogicalType &return_type, FunctionNullHandling null_handling) {
 	AggregateFunction ordered_aggregate(
 	    name, arguments, return_type, AggregateFunction::StateSize<SortedAggregateState>,
-	    AggregateFunction::StateInitialize<SortedAggregateState, ListFunction>, SortedAggregateFunction::ScatterUpdate,
-	    ListCombineFunction<SortedAggregateFunction>, SortedAggregateFunction::Finalize, null_handling, nullptr,
-	    nullptr, nullptr, nullptr, SortedAggregateFunction::WindowBatch);
+	    AggregateFunction::StateInitialize<SortedAggregateState, SortedAggregateFunction>,
+	    SortedAggregateFunction::ScatterUpdate, SortedAggregateFunction::Combine, SortedAggregateFunction::Finalize,
+	    null_handling, nullptr, nullptr, AggregateFunction::StateDestroy<SortedAggregateState, SortedAggregateFunction>,
+	    nullptr, SortedAggregateFunction::WindowBatch);
 	ordered_aggregate.SetInitLocalStateFinalizeCallback(SortedAggregateFinalizeState::Init);
 	ordered_aggregate.SetStructStateExport(SortedAggregateGetStateType);
+	ordered_aggregate.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
+	ordered_aggregate.SetRepeatCombine(AggregateRepeatCombine::SUPPORTED);
 	return ordered_aggregate;
 }
 
@@ -611,6 +821,7 @@ void FunctionBinder::BindSortedAggregate(ClientContext &context, BoundAggregateE
 	}
 
 	auto sorted_bind = make_uniq<SortedAggregateBindData>(context, expr);
+	sorted_bind->spill_enabled = !state_export;
 
 	if (!sorted_bind->sorted_on_args) {
 		// The arguments are the children plus the sort columns.
@@ -683,9 +894,10 @@ void FunctionBinder::BindSortedAggregate(ClientContext &context, BoundWindowExpr
 	// Replace the aggregate with the wrapper
 	AggregateFunction ordered_aggregate(
 	    aggregate.GetName(), arguments, aggregate.GetReturnType(), AggregateFunction::StateSize<SortedAggregateState>,
-	    AggregateFunction::StateInitialize<SortedAggregateState, ListFunction>, SortedAggregateFunction::ScatterUpdate,
-	    ListCombineFunction<SortedAggregateFunction>, SortedAggregateFunction::Finalize,
-	    aggregate.GetProperties().GetNullHandling(), nullptr, nullptr, nullptr, nullptr,
+	    AggregateFunction::StateInitialize<SortedAggregateState, SortedAggregateFunction>,
+	    SortedAggregateFunction::ScatterUpdate, SortedAggregateFunction::Combine, SortedAggregateFunction::Finalize,
+	    aggregate.GetProperties().GetNullHandling(), nullptr, nullptr,
+	    AggregateFunction::StateDestroy<SortedAggregateState, SortedAggregateFunction>, nullptr,
 	    SortedAggregateFunction::WindowBatch);
 	ordered_aggregate.SetWindowCallback(SortedAggregateFunction::Window);
 	ordered_aggregate.SetInitLocalStateFinalizeCallback(SortedAggregateFinalizeState::Init);

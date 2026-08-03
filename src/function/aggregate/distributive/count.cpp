@@ -296,6 +296,7 @@ AggregateFunction CountFunctionBase::GetFunction() {
 	                      FunctionNullHandling::SPECIAL_HANDLING, CountFunction::CountClusterUpdate);
 	fun.SetName("count");
 	fun.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
+	fun.SetRepeatCombine(AggregateRepeatCombine::SUPPORTED);
 	fun.SetStructStateExport(GetCountStateType);
 	fun.SetStatisticsCallback(CountPropagateStats);
 	return fun;

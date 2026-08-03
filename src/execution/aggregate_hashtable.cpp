@@ -959,6 +959,67 @@ void GroupedAggregateHashTable::UpdateAggregatesAtAddressesRange(AggregateHTUpda
 	}
 }
 
+void GroupedAggregateHashTable::UpdateAggregatesAtAddressesRangeWithFilterSet(
+    AggregateHTUpdateState &state, Vector &addresses, DataChunk &payload, idx_t aggregate_begin, idx_t aggregate_count,
+    const unsafe_vector<idx_t> &filter, AggregateFilterDataSet &source_filter_set) {
+	if (state.owner.get() != this) {
+		throw InternalException("Aggregate hash-table update state cannot be reused across hash tables");
+	}
+	if (addresses.size() != payload.size()) {
+		throw InternalException(
+		    "UpdateAggregatesAtAddressesRange: address count (%llu) does not match payload count (%llu)",
+		    addresses.size(), payload.size());
+	}
+	auto &aggregates = layout_ptr->GetAggregates();
+	if (aggregate_begin > aggregates.size() || aggregate_count > aggregates.size() - aggregate_begin) {
+		throw InternalException(
+		    "UpdateAggregatesAtAddressesRange: aggregate range [%llu, %llu) exceeds aggregate count %llu",
+		    aggregate_begin, aggregate_begin + aggregate_count, aggregates.size());
+	}
+	for (idx_t filter_idx = 0; filter_idx < filter.size(); filter_idx++) {
+		if (filter[filter_idx] >= aggregate_count || (filter_idx > 0 && filter[filter_idx - 1] >= filter[filter_idx])) {
+			throw InternalException("UpdateAggregatesAtAddressesRange requires sorted, unique in-range filter indexes");
+		}
+	}
+	idx_t expected_payload_columns = 0;
+	idx_t filter_count = 0;
+	idx_t state_offset = layout_ptr->GetAggrOffset();
+	for (idx_t aggregate_idx = 0; aggregate_idx < aggregate_begin; aggregate_idx++) {
+		state_offset += aggregates[aggregate_idx].payload_size;
+	}
+	for (idx_t range_idx = 0; range_idx < aggregate_count; range_idx++) {
+		auto &aggregate = aggregates[aggregate_begin + range_idx];
+		expected_payload_columns += aggregate.child_count;
+		filter_count += aggregate.filter ? 1 : 0;
+	}
+	expected_payload_columns += filter_count;
+	if (expected_payload_columns != payload.ColumnCount()) {
+		throw InternalException(
+		    "UpdateAggregatesAtAddressesRange: aggregate range expects %llu payload columns but received %llu",
+		    expected_payload_columns, payload.ColumnCount());
+	}
+
+	VectorOperations::Copy(addresses, state.addresses, addresses.size(), 0, 0);
+	FlatVector::SetSize(state.addresses, addresses.size());
+	VectorOperations::AddInPlace(state.addresses, NumericCast<int64_t>(state_offset));
+	idx_t payload_idx = 0;
+	idx_t filter_idx = 0;
+	for (idx_t range_idx = 0; range_idx < aggregate_count; range_idx++) {
+		auto &aggregate = aggregates[aggregate_begin + range_idx];
+		if (filter_idx < filter.size() && filter[filter_idx] == range_idx) {
+			if (aggregate.aggr_type != AggregateType::DISTINCT && aggregate.filter) {
+				RowOperations::UpdateFilteredStates(state.row_state, source_filter_set.GetFilterData(range_idx),
+				                                    aggregate, state.addresses, payload, payload_idx);
+			} else {
+				RowOperations::UpdateStates(state.row_state, aggregate, state.addresses, payload, payload_idx);
+			}
+			filter_idx++;
+		}
+		payload_idx += aggregate.child_count;
+		VectorOperations::AddInPlace(state.addresses, NumericCast<int64_t>(aggregate.payload_size));
+	}
+}
+
 void GroupedAggregateHashTable::UpdateAggregatesAtAddressesRange(AggregateHTUpdateState &state, Vector &addresses,
                                                                  Vector &group_ids, DataChunk &payload,
                                                                  idx_t aggregate_begin, idx_t aggregate_count,
@@ -1022,6 +1083,25 @@ void GroupedAggregateHashTable::UpdateAggregatesAtAddressesRange(AggregateHTUpda
 	clustered.InitializeStatesFromAddresses(FlatVector::GetData<data_ptr_t>(addresses), state_offset);
 	RowOperations::UpdateStatesClusteredRange(state.row_state, aggregates, aggregate_begin, aggregate_count,
 	                                          &filter_set, &filter, state.addresses, payload, clustered, false);
+}
+
+void GroupedAggregateHashTable::UpdateAggregatesAtAddressesRangeWithFilterSet(
+    AggregateHTUpdateState &state, Vector &addresses, Vector &group_ids, DataChunk &payload, idx_t aggregate_begin,
+    idx_t aggregate_count, const unsafe_vector<idx_t> &filter, AggregateFilterDataSet &source_filter_set) {
+	auto &aggregates = layout_ptr->GetAggregates();
+	if (aggregate_begin > aggregates.size() || aggregate_count > aggregates.size() - aggregate_begin) {
+		throw InternalException(
+		    "UpdateAggregatesAtAddressesRange: aggregate range [%llu, %llu) exceeds aggregate count %llu",
+		    aggregate_begin, aggregate_begin + aggregate_count, aggregates.size());
+	}
+	for (idx_t range_idx = 0; range_idx < aggregate_count; range_idx++) {
+		if (aggregates[aggregate_begin + range_idx].filter) {
+			UpdateAggregatesAtAddressesRangeWithFilterSet(state, addresses, payload, aggregate_begin, aggregate_count,
+			                                              filter, source_filter_set);
+			return;
+		}
+	}
+	UpdateAggregatesAtAddressesRange(state, addresses, group_ids, payload, aggregate_begin, aggregate_count, filter);
 }
 
 void GroupedAggregateHashTable::CombineExportedStatesAtAddressesRange(AggregateHTUpdateState &state, Vector &addresses,
