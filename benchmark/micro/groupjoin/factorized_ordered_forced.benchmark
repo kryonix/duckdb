@@ -1,0 +1,7 @@
+# name: benchmark/micro/groupjoin/factorized_ordered_forced.benchmark
+# group: [groupjoin]
+
+template benchmark/micro/groupjoin/factorized_ordered.benchmark.in
+LABEL=factorized
+STRATEGY=factorized
+DISABLED_OPTIMIZERS=top_n

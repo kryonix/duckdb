@@ -1,0 +1,7 @@
+# name: benchmark/micro/groupjoin/factorized_auto.benchmark
+# group: [groupjoin]
+
+template benchmark/micro/groupjoin/factorized_groupjoin.benchmark.in
+LABEL=auto
+STRATEGY=auto
+DISABLED_OPTIMIZERS=top_n

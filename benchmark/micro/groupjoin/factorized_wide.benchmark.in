@@ -1,0 +1,75 @@
+# description: Parameterized two-factor GroupJoin comparison with multiple aggregates per factor
+# group: [groupjoin]
+
+name Factorized GroupJoin wide ${LABEL} (R=${driver_rows}, left=${left_fanout}, right=${right_fanout}, match=${match_rate}%, unmatched=${unmatched_multiplier}x)
+group micro
+subgroup groupjoin
+
+argument driver_rows 20000
+argument left_fanout 16
+argument right_fanout 16
+argument match_rate 1
+argument unmatched_multiplier 4
+argument key_spacing 4
+argument groupjoin_threads 4
+
+load
+SET threads TO ${groupjoin_threads};
+SET debug_group_join_strategy TO '${STRATEGY}';
+SET disabled_optimizers TO '${DISABLED_OPTIMIZERS}';
+CREATE TABLE factor_driver(k BIGINT PRIMARY KEY, payload BIGINT);
+INSERT INTO factor_driver SELECT i * ${key_spacing}, i % 1000 FROM range(${driver_rows}) t(i);
+CREATE TABLE factor_left(k BIGINT, x BIGINT);
+INSERT INTO factor_left
+SELECT k * ${key_spacing}, repeat_index
+FROM range((${driver_rows} * ${match_rate}) // 100) keys(k), range(${left_fanout}) repeats(repeat_index);
+INSERT INTO factor_left
+SELECT (unmatched_key % ${driver_rows}) * ${key_spacing} + 1, repeat_index
+FROM range(${driver_rows} * ${unmatched_multiplier}) keys(unmatched_key),
+	 range(${left_fanout}) repeats(repeat_index);
+CREATE TABLE factor_right(k BIGINT, y BIGINT);
+INSERT INTO factor_right
+SELECT k * ${key_spacing}, repeat_index
+FROM range((${driver_rows} * ${match_rate}) // 100) keys(k), range(${right_fanout}) repeats(repeat_index);
+INSERT INTO factor_right
+SELECT (unmatched_key % ${driver_rows}) * ${key_spacing} + 2, repeat_index
+FROM range(${driver_rows} * ${unmatched_multiplier}) keys(unmatched_key),
+	 range(${right_fanout}) repeats(repeat_index);
+
+run
+SELECT count(*), sum(pair_count), sum(driver_sum), sum(left_sum), sum(left_square_sum), sum(right_sum),
+	   sum(right_square_sum)
+FROM (
+	SELECT r.k, count(*) AS pair_count, sum(r.payload) AS driver_sum, sum(s.x) AS left_sum,
+	       sum(s.x * s.x) AS left_square_sum, sum(t.y) AS right_sum, sum(t.y * t.y) AS right_square_sum
+	FROM factor_driver r
+	JOIN factor_left s USING (k)
+	JOIN factor_right t USING (k)
+	GROUP BY r.k
+) groups;
+
+result_query I
+WITH parameters AS (
+	SELECT ((${driver_rows}::HUGEINT * ${match_rate}) // 100) AS group_count,
+	       ${left_fanout}::HUGEINT AS left_fanout,
+	       ${right_fanout}::HUGEINT AS right_fanout
+), expected AS (
+	SELECT group_count::BIGINT AS group_count,
+	       group_count * left_fanout * right_fanout AS pair_count,
+	       (SELECT sum((k % 1000)::HUGEINT * left_fanout * right_fanout)
+	        FROM range(group_count::BIGINT) keys(k)) AS driver_sum,
+	       group_count * right_fanout * (left_fanout * (left_fanout - 1) // 2) AS left_sum,
+	       group_count * right_fanout * (left_fanout * (left_fanout - 1) * (2 * left_fanout - 1) // 6)
+	           AS left_square_sum,
+	       group_count * left_fanout * (right_fanout * (right_fanout - 1) // 2) AS right_sum,
+	       group_count * left_fanout * (right_fanout * (right_fanout - 1) * (2 * right_fanout - 1) // 6)
+	           AS right_square_sum
+	FROM parameters
+)
+SELECT count(*) FROM (
+	(SELECT * FROM __answer EXCEPT ALL SELECT * FROM expected)
+	UNION ALL
+	(SELECT * FROM expected EXCEPT ALL SELECT * FROM __answer)
+) differences;
+----
+0
