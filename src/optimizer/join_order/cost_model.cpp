@@ -61,6 +61,24 @@ double CostModel::ComputeCost(DPJoinNode &left, DPJoinNode &right, JoinRelationS
 	auto join_card = cardinality_estimator.EstimateCardinalityWithSet<double>(combination);
 	auto join_cost = join_card;
 	if (group_join_context && combination.count == query_graph_manager.relation_manager.NumRelations()) {
+		if (group_join_context->factorized) {
+			auto left_is_left_factor = ContainsRelations(left.set, group_join_context->factorized_left_relations) &&
+			                           ContainsRelations(right.set, group_join_context->factorized_driver_relations) &&
+			                           ContainsRelations(right.set, group_join_context->factorized_right_relations);
+			auto right_is_left_factor = ContainsRelations(right.set, group_join_context->factorized_left_relations) &&
+			                            ContainsRelations(left.set, group_join_context->factorized_driver_relations) &&
+			                            ContainsRelations(left.set, group_join_context->factorized_right_relations);
+			auto left_is_right_factor = ContainsRelations(left.set, group_join_context->factorized_right_relations) &&
+			                            ContainsRelations(right.set, group_join_context->factorized_driver_relations) &&
+			                            ContainsRelations(right.set, group_join_context->factorized_left_relations);
+			auto right_is_right_factor = ContainsRelations(right.set, group_join_context->factorized_right_relations) &&
+			                             ContainsRelations(left.set, group_join_context->factorized_driver_relations) &&
+			                             ContainsRelations(left.set, group_join_context->factorized_left_relations);
+			if (left_is_left_factor || right_is_left_factor || left_is_right_factor || right_is_right_factor) {
+				join_cost = -left.cost - right.cost;
+			}
+			return join_cost + left.cost + right.cost;
+		}
 		auto left_is_owner = ContainsRelations(left.set, group_join_context->owner_relations) &&
 		                     ContainsRelations(right.set, group_join_context->probe_relations);
 		auto right_is_owner = ContainsRelations(right.set, group_join_context->owner_relations) &&

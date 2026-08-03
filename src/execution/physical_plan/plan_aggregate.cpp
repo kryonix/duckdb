@@ -8,6 +8,7 @@
 #include "duckdb/execution/operator/filter/physical_filter.hpp"
 #include "duckdb/execution/operator/join/physical_index_group_join.hpp"
 #include "duckdb/execution/operator/join/physical_hash_group_join.hpp"
+#include "duckdb/execution/operator/join/physical_factorized_group_join.hpp"
 #include "duckdb/execution/operator/aggregate/physical_partitioned_aggregate.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
@@ -429,15 +430,100 @@ static HashGroupJoinCandidate GetHashGroupJoinCandidate(LogicalGroupJoin &op) {
 	                               op.single_match};
 }
 
+static void RewriteFactorizedAggregateReferences(unique_ptr<Expression> &expression, FactorizedAggregateSource source,
+                                                 idx_t driver_columns, idx_t left_columns) {
+	if (expression->GetExpressionClass() == ExpressionClass::BOUND_REF) {
+		auto &reference = expression->Cast<BoundReferenceExpression>();
+		auto index = reference.Index();
+		switch (source) {
+		case FactorizedAggregateSource::DRIVER:
+			if (index >= driver_columns) {
+				throw InternalException("Driver aggregate references a factor column");
+			}
+			break;
+		case FactorizedAggregateSource::LEFT_FACTOR:
+			if (index < driver_columns || index >= driver_columns + left_columns) {
+				throw InternalException("Left-factor aggregate references another source");
+			}
+			reference.IndexMutable() -= driver_columns;
+			break;
+		case FactorizedAggregateSource::RIGHT_FACTOR:
+			if (index < driver_columns + left_columns) {
+				throw InternalException("Right-factor aggregate references another source");
+			}
+			reference.IndexMutable() -= driver_columns + left_columns;
+			break;
+		}
+		return;
+	}
+	ExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<Expression> &child) {
+		RewriteFactorizedAggregateReferences(child, source, driver_columns, left_columns);
+	});
+}
+
+static PhysicalOperator &CreateFactorizedGroupJoinPlan(PhysicalPlanGenerator &generator, LogicalGroupJoin &op) {
+	D_ASSERT(op.children.size() == 3);
+	D_ASSERT(op.factorized_aggregate_sources.size() == op.expressions.size());
+	reference<PhysicalOperator> driver = generator.CreatePlan(*op.children[0]);
+	reference<PhysicalOperator> left_factor = generator.CreatePlan(*op.children[1]);
+	reference<PhysicalOperator> right_factor = generator.CreatePlan(*op.children[2]);
+
+	vector<idx_t> output_group_indices;
+	output_group_indices.reserve(op.groups.size());
+	for (auto &group : op.groups) {
+		if (group->GetExpressionClass() != ExpressionClass::BOUND_REF ||
+		    group->Cast<BoundReferenceExpression>().Index() >= op.factorized_driver_column_count) {
+			throw InternalException("Factorized GroupJoin group does not reference the driver");
+		}
+		auto driver_index = group->Cast<BoundReferenceExpression>().Index();
+		if (op.routed) {
+			output_group_indices.push_back(driver_index);
+			continue;
+		}
+		auto key_entry =
+		    std::find(op.factorized_driver_key_indices.begin(), op.factorized_driver_key_indices.end(), driver_index);
+		if (key_entry == op.factorized_driver_key_indices.end()) {
+			throw InternalException("Factorized GroupJoin group is not a complete driver key");
+		}
+		output_group_indices.push_back(NumericCast<idx_t>(key_entry - op.factorized_driver_key_indices.begin()));
+	}
+	vector<unique_ptr<Expression>> aggregates;
+	aggregates.reserve(op.expressions.size());
+	for (idx_t aggregate_idx = 0; aggregate_idx < op.expressions.size(); aggregate_idx++) {
+		auto source = op.factorized_aggregate_sources[aggregate_idx];
+		auto aggregate = std::move(op.expressions[aggregate_idx]);
+		RewriteFactorizedAggregateReferences(aggregate, source, op.factorized_driver_column_count,
+		                                     op.factorized_left_column_count);
+		aggregates.push_back(std::move(aggregate));
+	}
+	auto &result =
+	    generator
+	        .Make<PhysicalFactorizedGroupJoin>(
+	            op, driver, left_factor, right_factor, op.factorized_driver_key_indices, op.factorized_left_key_indices,
+	            op.factorized_right_key_indices, std::move(output_group_indices), std::move(aggregates),
+	            op.factorized_aggregate_sources, op.factorized_preserve_left, op.factorized_preserve_right,
+	            op.factorized_semi_left, op.factorized_semi_right, op.unique_owner, op.routed, op.execution_mode,
+	            std::move(op.perfect_min), std::move(op.perfect_max), op.perfect_range,
+	            std::move(op.factorized_left_filter_pushdown), std::move(op.factorized_right_filter_pushdown),
+	            std::move(op.factorized_left_driver_filter_pushdown),
+	            std::move(op.factorized_right_driver_filter_pushdown), op.estimated_cardinality)
+	        .Cast<PhysicalFactorizedGroupJoin>();
+	result.InitializeSinks();
+	return result;
+}
+
 PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalGroupJoin &op) {
-	D_ASSERT(op.children.size() == 2);
-	auto candidate = GetHashGroupJoinCandidate(op);
 	for (auto &expression : op.expressions) {
 		auto &aggregate = expression->Cast<BoundAggregateExpression>();
 		if (aggregate.GetOrderBys()) {
 			FunctionBinder::BindSortedAggregate(context, aggregate, op.groups, op.grouping_sets);
 		}
 	}
+	if (op.IsFactorized()) {
+		return CreateFactorizedGroupJoinPlan(*this, op);
+	}
+	D_ASSERT(op.children.size() == 2);
+	auto candidate = GetHashGroupJoinCandidate(op);
 	reference<PhysicalOperator> probe = CreatePlan(*op.children[candidate.probe_child]);
 	reference<PhysicalOperator> owner = CreatePlan(*op.children[candidate.owner_child]);
 

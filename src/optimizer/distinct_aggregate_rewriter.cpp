@@ -265,6 +265,9 @@ bool DistinctAggregateRewriter::TryRewrite(unique_ptr<LogicalOperator> &op) {
 		return false;
 	}
 	auto &aggr = op->Cast<LogicalAggregate>();
+	if (HasPotentialFactorizedGroupJoinCandidate(aggr, optimizer.context)) {
+		return false;
+	}
 	if (ForceHashGroupJoinPlanning(optimizer.context) &&
 	    IsStaticHashGroupJoinAggregate(optimizer.GetPlan(), aggr, optimizer.context,
 	                                   HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER)) {

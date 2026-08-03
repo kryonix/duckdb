@@ -134,13 +134,16 @@ void ColumnBindingResolver::VisitOperator(LogicalOperator &op) {
 		return;
 	}
 	case LogicalOperatorType::LOGICAL_GROUP_JOIN: {
-		D_ASSERT(op.children.size() == 2);
+		auto &group_join = op.Cast<LogicalGroupJoin>();
+		D_ASSERT(op.children.size() == (group_join.IsFactorized() ? 3 : 2));
 		VisitOperator(*op.children[0]);
 		auto combined_bindings = bindings;
 		auto combined_types = types;
-		VisitOperator(*op.children[1]);
-		combined_bindings.insert(combined_bindings.end(), bindings.begin(), bindings.end());
-		combined_types.insert(combined_types.end(), types.begin(), types.end());
+		for (idx_t child_idx = 1; child_idx < op.children.size(); child_idx++) {
+			VisitOperator(*op.children[child_idx]);
+			combined_bindings.insert(combined_bindings.end(), bindings.begin(), bindings.end());
+			combined_types.insert(combined_types.end(), types.begin(), types.end());
+		}
 		bindings = std::move(combined_bindings);
 		types = std::move(combined_types);
 		VisitOperatorExpressions(op);

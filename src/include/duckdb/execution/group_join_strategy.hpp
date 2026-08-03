@@ -13,9 +13,9 @@
 
 namespace duckdb {
 
-enum class GroupJoinStrategy : uint8_t { DISABLED, FORCE, AUTO, SEPARATE, EAGER, HASH, PERFECT, INDEX };
+enum class GroupJoinStrategy : uint8_t { DISABLED, FORCE, AUTO, SEPARATE, EAGER, HASH, PERFECT, INDEX, FACTORIZED };
 
-enum class GroupJoinImplementation : uint8_t { MEMOIZING_HASH, PERFECT_HASH, EAGER_HASH, INDEX };
+enum class GroupJoinImplementation : uint8_t { MEMOIZING_HASH, PERFECT_HASH, EAGER_HASH, INDEX, FACTORIZED_HASH };
 
 enum class GroupJoinExecutionMode : uint8_t { AUTO, SERIAL, LOCAL, OWNERSHIP, EXTERNAL, INDEX };
 
@@ -34,6 +34,8 @@ inline bool PerfectGroupJoinDirectoryFits(idx_t range, idx_t max_memory) {
 enum class HashGroupJoinUnmatchedPolicy : uint8_t { DISCARD, EMPTY_AGGREGATE, NULL_EXTENDED_ROW };
 
 enum class HashGroupJoinOutputSource : uint8_t { KEY, OWNER_PAYLOAD, MATCHED_KEY, AGGREGATE };
+
+enum class FactorizedAggregateSource : uint8_t { DRIVER = 0, LEFT_FACTOR = 1, RIGHT_FACTOR = 2 };
 
 struct HashGroupJoinOutputColumn {
 	HashGroupJoinOutputSource source;

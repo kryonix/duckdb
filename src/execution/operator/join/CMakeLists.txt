@@ -8,6 +8,7 @@ add_library_unity(
   physical_cross_product.cpp
   physical_delim_join.cpp
   physical_left_delim_join.cpp
+  physical_factorized_group_join.cpp
   physical_hash_join.cpp
   physical_hash_group_join.cpp
   physical_iejoin.cpp

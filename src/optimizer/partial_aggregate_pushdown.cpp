@@ -22,7 +22,8 @@
 
 namespace duckdb {
 
-PartialAggregatePushdown::PartialAggregatePushdown(Optimizer &optimizer_p) : optimizer(optimizer_p) {
+PartialAggregatePushdown::PartialAggregatePushdown(Optimizer &optimizer_p, bool deferred_only_p)
+    : optimizer(optimizer_p), deferred_only(deferred_only_p) {
 }
 
 //===--------------------------------------------------------------------===//
@@ -946,6 +947,22 @@ bool PartialAggregatePushdown::FuseInterveningProjections(LogicalOperator &op) {
 }
 
 void PartialAggregatePushdown::VisitOperator(unique_ptr<LogicalOperator> &op) {
+	if (deferred_only) {
+		if (op->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY ||
+		    !op->Cast<LogicalAggregate>().factorized_group_join_deferred) {
+			LogicalOperatorVisitor::VisitOperator(op);
+			return;
+		}
+		op->Cast<LogicalAggregate>().factorized_group_join_deferred = false;
+	} else if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && op->children.size() == 1 &&
+	           HasPotentialFactorizedGroupJoinCandidate(op->Cast<LogicalAggregate>(), optimizer.context)) {
+		op->Cast<LogicalAggregate>().factorized_group_join_deferred = true;
+		return;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && op->children.size() == 1 &&
+	    HasFactorizedGroupJoinCandidate(op->Cast<LogicalAggregate>(), optimizer.context)) {
+		return;
+	}
 	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && op->children.size() == 1 &&
 	    op->children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto &aggregate = op->Cast<LogicalAggregate>();
@@ -960,6 +977,9 @@ void PartialAggregatePushdown::VisitOperator(unique_ptr<LogicalOperator> &op) {
 	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && op->children.size() == 1 &&
 	    op->children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto &aggregate = op->Cast<LogicalAggregate>();
+		if (HasFactorizedGroupJoinCandidate(aggregate, optimizer.context)) {
+			return;
+		}
 		auto &join = op->children[0]->Cast<LogicalComparisonJoin>();
 		if (TrySelectHashGroupJoinCandidate(aggregate, join, optimizer.context,
 		                                    HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER)) {
@@ -971,7 +991,7 @@ void PartialAggregatePushdown::VisitOperator(unique_ptr<LogicalOperator> &op) {
 			auto strategy = Settings::Get<DebugGroupJoinStrategySetting>(optimizer.context);
 			if (strategy == GroupJoinStrategy::SEPARATE || strategy == GroupJoinStrategy::HASH ||
 			    strategy == GroupJoinStrategy::PERFECT || strategy == GroupJoinStrategy::EAGER ||
-			    strategy == GroupJoinStrategy::INDEX) {
+			    strategy == GroupJoinStrategy::INDEX || strategy == GroupJoinStrategy::FACTORIZED) {
 				return;
 			}
 			const auto direct_inner = join.join_type == JoinType::INNER && !candidate->routed &&

@@ -18,6 +18,9 @@ class QueryGraphManager;
 struct GroupJoinOrderCostContext {
 	unordered_set<RelationIndex> owner_relations;
 	unordered_set<RelationIndex> probe_relations;
+	unordered_set<RelationIndex> factorized_driver_relations;
+	unordered_set<RelationIndex> factorized_left_relations;
+	unordered_set<RelationIndex> factorized_right_relations;
 	idx_t key_width;
 	idx_t state_width;
 	bool routed;
@@ -27,6 +30,7 @@ struct GroupJoinOrderCostContext {
 	bool perfect_supported;
 	idx_t perfect_range;
 	GroupJoinStrategy strategy;
+	bool factorized;
 };
 
 class CostModel {

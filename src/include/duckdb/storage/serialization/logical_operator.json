@@ -346,6 +346,174 @@
         "name": "perfect_cost",
         "type": "double",
         "default": "0"
+      },
+      {
+        "id": 237,
+        "name": "factorized_driver_key_indices",
+        "type": "vector<idx_t>",
+        "default": "{}"
+      },
+      {
+        "id": 238,
+        "name": "factorized_left_key_indices",
+        "type": "vector<idx_t>",
+        "default": "{}"
+      },
+      {
+        "id": 239,
+        "name": "factorized_right_key_indices",
+        "type": "vector<idx_t>",
+        "default": "{}"
+      },
+      {
+        "id": 240,
+        "name": "factorized_aggregate_sources",
+        "type": "vector<FactorizedAggregateSource>",
+        "default": "{}"
+      },
+      {
+        "id": 241,
+        "name": "factorized_driver_column_count",
+        "type": "idx_t",
+        "default": "0"
+      },
+      {
+        "id": 242,
+        "name": "factorized_left_column_count",
+        "type": "idx_t",
+        "default": "0"
+      },
+      {
+        "id": 243,
+        "name": "estimated_left_factor_rows",
+        "type": "idx_t",
+        "default": "0"
+      },
+      {
+        "id": 244,
+        "name": "estimated_right_factor_rows",
+        "type": "idx_t",
+        "default": "0"
+      },
+      {
+        "id": 245,
+        "name": "factorized_preserve_left",
+        "type": "bool",
+        "default": "false"
+      },
+      {
+        "id": 246,
+        "name": "factorized_preserve_right",
+        "type": "bool",
+        "default": "false"
+      },
+      {
+        "id": 247,
+        "name": "factorized_semi_left",
+        "type": "bool",
+        "default": "false"
+      },
+      {
+        "id": 248,
+        "name": "factorized_semi_right",
+        "type": "bool",
+        "default": "false"
+      },
+      {
+        "id": 249,
+        "name": "estimated_factorized_join_rows",
+        "type": "idx_t",
+        "default": "0"
+      },
+      {
+        "id": 250,
+        "name": "estimated_factorized_matched_drivers",
+        "type": "idx_t",
+        "default": "0"
+      },
+      {
+        "id": 251,
+        "name": "estimated_left_factor_scan_rows",
+        "type": "idx_t",
+        "default": "0"
+      },
+      {
+        "id": 252,
+        "name": "estimated_right_factor_scan_rows",
+        "type": "idx_t",
+        "default": "0"
+      },
+      {
+        "id": 253,
+        "name": "factorized_build_cost",
+        "type": "double",
+        "default": "0"
+      },
+      {
+        "id": 254,
+        "name": "factorized_probe_cost",
+        "type": "double",
+        "default": "0"
+      },
+      {
+        "id": 255,
+        "name": "factorized_scan_cost",
+        "type": "double",
+        "default": "0"
+      },
+      {
+        "id": 256,
+        "name": "factorized_routing_cost",
+        "type": "double",
+        "default": "0"
+      },
+      {
+        "id": 257,
+        "name": "factorized_spill_cost",
+        "type": "double",
+        "default": "0"
+      },
+      {
+        "id": 258,
+        "name": "factorized_cost",
+        "type": "double",
+        "default": "0"
+      },
+      {
+        "id": 259,
+        "name": "factorized_best_existing_cost",
+        "type": "double",
+        "default": "0"
+      },
+      {
+        "id": 260,
+        "name": "factorized_cost_reliable",
+        "type": "bool",
+        "default": "false"
+      },
+      {
+        "id": 261,
+        "name": "factorized_auto_selected",
+        "type": "bool",
+        "default": "false"
+      },
+      {
+        "id": 262,
+        "name": "factorized_filter_cost",
+        "type": "double",
+        "default": "0"
+      },
+      {
+        "id": 263,
+        "name": "factorized_cache_cost",
+        "type": "double",
+        "default": "0"
+      },
+      {
+        "id": 264,
+        "name": "factorized_eager_work_cost",
+        "type": "double",
+        "default": "0"
       }
     ],
     "constructor": [

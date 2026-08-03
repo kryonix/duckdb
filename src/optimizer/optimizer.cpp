@@ -415,6 +415,11 @@ void Optimizer::RunBuiltInOptimizers() {
 		});
 	}
 
+	RunOptimizer(OptimizerType::PARTIAL_AGGREGATE_PUSHDOWN, [&]() {
+		PartialAggregatePushdown deferred_partial_aggregate_pushdown(*this, true);
+		deferred_partial_aggregate_pushdown.VisitOperator(plan);
+	});
+
 	// rewrite row_number window function + filter on row_number to aggregate
 	RunOptimizer(OptimizerType::TOP_N_WINDOW_ELIMINATION, [&]() {
 		TopNWindowElimination topn_window_elimination(context, *this, &statistics_map);

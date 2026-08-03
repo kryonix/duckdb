@@ -45,6 +45,8 @@ public:
 	bool group_join_auto_selected = false;
 	//! Whether the automatic selection requires the transactional ART-backed implementation
 	bool group_join_auto_index = false;
+	//! Whether partial aggregation was deferred until factorized GroupJoin has reliable statistics
+	bool factorized_group_join_deferred = false;
 
 public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;

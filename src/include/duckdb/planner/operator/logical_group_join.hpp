@@ -41,6 +41,40 @@ public:
 	idx_t estimated_match_rows = 0;
 	idx_t estimated_matched_groups = 0;
 	idx_t estimated_distinct_probe_keys = 0;
+	vector<idx_t> factorized_driver_key_indices;
+	vector<idx_t> factorized_left_key_indices;
+	vector<idx_t> factorized_right_key_indices;
+	vector<FactorizedAggregateSource> factorized_aggregate_sources;
+	idx_t factorized_driver_column_count = 0;
+	idx_t factorized_left_column_count = 0;
+	bool factorized_preserve_left = false;
+	bool factorized_preserve_right = false;
+	bool factorized_semi_left = false;
+	bool factorized_semi_right = false;
+	idx_t estimated_left_factor_rows = 0;
+	idx_t estimated_right_factor_rows = 0;
+	idx_t estimated_factorized_join_rows = 0;
+	idx_t estimated_factorized_matched_drivers = 0;
+	idx_t estimated_left_factor_scan_rows = 0;
+	idx_t estimated_right_factor_scan_rows = 0;
+	double factorized_build_cost = 0;
+	double factorized_filter_cost = 0;
+	double factorized_probe_cost = 0;
+	double factorized_scan_cost = 0;
+	double factorized_cache_cost = 0;
+	double factorized_eager_work_cost = 0;
+	double factorized_routing_cost = 0;
+	double factorized_spill_cost = 0;
+	double factorized_cost = 0;
+	double factorized_best_existing_cost = 0;
+	bool factorized_cost_reliable = false;
+	bool factorized_auto_selected = false;
+	//! Runtime filters produced independently by the left and right factor builds
+	unique_ptr<JoinFilterPushdownInfo> factorized_left_filter_pushdown;
+	unique_ptr<JoinFilterPushdownInfo> factorized_right_filter_pushdown;
+	//! Runtime filters produced by a driver-first build and consumed by the factor scans
+	unique_ptr<JoinFilterPushdownInfo> factorized_left_driver_filter_pushdown;
+	unique_ptr<JoinFilterPushdownInfo> factorized_right_driver_filter_pushdown;
 	double separate_cost = 0;
 	double eager_cost = 0;
 	double physical_eager_cost = 0;
@@ -49,6 +83,10 @@ public:
 	double index_cost = 0;
 	//! Runtime filters generated for the probe subtree when the owner is the original join build side
 	unique_ptr<JoinFilterPushdownInfo> filter_pushdown;
+
+	bool IsFactorized() const {
+		return implementation == GroupJoinImplementation::FACTORIZED_HASH;
+	}
 
 public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;

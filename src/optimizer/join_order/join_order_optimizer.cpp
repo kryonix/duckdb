@@ -57,6 +57,9 @@ unique_ptr<LogicalOperator> JoinOrderOptimizer::Optimize(unique_ptr<LogicalOpera
 		if (group_join_context) {
 			GroupJoinOrderCostContext mapped {{},
 			                                  {},
+			                                  {},
+			                                  {},
+			                                  {},
 			                                  group_join_context->key_width,
 			                                  group_join_context->state_width,
 			                                  group_join_context->routed,
@@ -65,7 +68,8 @@ unique_ptr<LogicalOperator> JoinOrderOptimizer::Optimize(unique_ptr<LogicalOpera
 			                                  group_join_context->physical_eager_supported,
 			                                  group_join_context->perfect_supported,
 			                                  group_join_context->perfect_range,
-			                                  group_join_context->strategy};
+			                                  group_join_context->strategy,
+			                                  group_join_context->factorized};
 			bool valid = true;
 			auto map_relations = [&](const unordered_set<TableIndex> &tables, unordered_set<RelationIndex> &relations) {
 				for (auto table : tables) {
@@ -79,13 +83,36 @@ unique_ptr<LogicalOperator> JoinOrderOptimizer::Optimize(unique_ptr<LogicalOpera
 			};
 			map_relations(group_join_context->owner_tables, mapped.owner_relations);
 			map_relations(group_join_context->probe_tables, mapped.probe_relations);
+			map_relations(group_join_context->factorized_driver_tables, mapped.factorized_driver_relations);
+			map_relations(group_join_context->factorized_left_tables, mapped.factorized_left_relations);
+			map_relations(group_join_context->factorized_right_tables, mapped.factorized_right_relations);
 			for (auto relation : mapped.owner_relations) {
 				if (mapped.probe_relations.find(relation) != mapped.probe_relations.end()) {
 					valid = false;
 					break;
 				}
 			}
-			if (valid && !mapped.owner_relations.empty() && !mapped.probe_relations.empty()) {
+			if (mapped.factorized) {
+				for (auto relation : mapped.factorized_driver_relations) {
+					if (mapped.factorized_left_relations.find(relation) != mapped.factorized_left_relations.end() ||
+					    mapped.factorized_right_relations.find(relation) != mapped.factorized_right_relations.end()) {
+						valid = false;
+						break;
+					}
+				}
+				for (auto relation : mapped.factorized_left_relations) {
+					if (mapped.factorized_right_relations.find(relation) != mapped.factorized_right_relations.end()) {
+						valid = false;
+						break;
+					}
+				}
+			}
+			const auto valid_factorized = mapped.factorized && !mapped.factorized_driver_relations.empty() &&
+			                              !mapped.factorized_left_relations.empty() &&
+			                              !mapped.factorized_right_relations.empty();
+			const auto valid_binary =
+			    !mapped.factorized && !mapped.owner_relations.empty() && !mapped.probe_relations.empty();
+			if (valid && (valid_factorized || valid_binary)) {
 				group_join_cost_context = std::move(mapped);
 			}
 		}

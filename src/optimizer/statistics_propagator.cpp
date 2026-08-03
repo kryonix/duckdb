@@ -4,6 +4,7 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/optimizer/compressed_materialization.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/optimizer/hash_group_join.hpp"
 #include "duckdb/planner/expression/list.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/logical_operator.hpp"
@@ -86,7 +87,10 @@ unique_ptr<NodeStatistics> StatisticsPropagator::PropagateStatistics(LogicalOper
 		result = PropagateChildren(node, node_ptr);
 	}
 
-	if (!suppress_compressed_materialization &&
+	const auto preserve_factorized_group_join =
+	    node_ptr->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY &&
+	    HasPotentialFactorizedGroupJoinCandidate(node_ptr->Cast<LogicalAggregate>(), context);
+	if (!suppress_compressed_materialization && !preserve_factorized_group_join &&
 	    !optimizer.OptimizerDisabled(OptimizerType::COMPRESSED_MATERIALIZATION)) {
 		// compress data based on statistics for materializing operators
 		CompressedMaterialization compressed_materialization(optimizer, *root, statistics_map);

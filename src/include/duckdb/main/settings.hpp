@@ -610,7 +610,7 @@ struct DebugGroupJoinExecutionSetting {
 struct DebugGroupJoinStrategySetting {
 	using RETURN_TYPE = GroupJoinStrategy;
 	static constexpr const char *Name = "debug_group_join_strategy";
-	static constexpr const char *Description = "DEBUG SETTING: choose the physical GroupJoin strategy";
+	static constexpr const char *Description = "DEBUG SETTING: choose the aggregate/join strategy";
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "AUTO";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;

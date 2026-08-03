@@ -66,6 +66,9 @@ struct HashGroupJoinCostEstimate {
 struct HashGroupJoinOrderContext {
 	unordered_set<TableIndex> owner_tables;
 	unordered_set<TableIndex> probe_tables;
+	unordered_set<TableIndex> factorized_driver_tables;
+	unordered_set<TableIndex> factorized_left_tables;
+	unordered_set<TableIndex> factorized_right_tables;
 	idx_t key_width = 0;
 	idx_t state_width = 0;
 	bool routed = false;
@@ -75,6 +78,7 @@ struct HashGroupJoinOrderContext {
 	bool perfect_supported = false;
 	idx_t perfect_range = 0;
 	GroupJoinStrategy strategy = GroupJoinStrategy::AUTO;
+	bool factorized = false;
 };
 
 //! Returns whether GroupJoin planning is enabled by both the strategy setting and optimizer configuration.
@@ -96,6 +100,8 @@ HashGroupJoinCostEstimate EstimateHashGroupJoinAlternatives(idx_t owner_rows, id
                                                             idx_t perfect_range, ClientContext &context);
 
 optional<HashGroupJoinOrderContext> GetHashGroupJoinOrderContext(LogicalAggregate &aggregate, ClientContext &context);
+optional<HashGroupJoinOrderContext> GetFactorizedGroupJoinOrderContext(LogicalAggregate &aggregate,
+                                                                       ClientContext &context);
 
 //! Selects a forced or cost-qualified automatic candidate and records an automatic selection on the aggregate.
 optional<HashGroupJoinCandidate>
@@ -106,6 +112,10 @@ TrySelectHashGroupJoinCandidate(LogicalAggregate &aggregate, LogicalComparisonJo
 optional<HashGroupJoinCandidate>
 TryGetPlannedHashGroupJoinCandidate(LogicalAggregate &aggregate, LogicalComparisonJoin &join, ClientContext &context,
                                     HashGroupJoinCandidateMode mode = HashGroupJoinCandidateMode::STRICT);
+
+//! Returns whether the aggregate has a semantically valid factorized two-branch candidate under the exact strategy.
+bool HasFactorizedGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context);
+bool HasPotentialFactorizedGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context);
 
 //! Replaces selected aggregate-over-join patterns with first-class logical GroupJoin operators.
 void PlanHashGroupJoins(unique_ptr<LogicalOperator> &root, ClientContext &context);

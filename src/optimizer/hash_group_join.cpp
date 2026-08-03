@@ -1,11 +1,15 @@
 #include "duckdb/optimizer/hash_group_join.hpp"
 
 #include "duckdb/optimizer/key_properties.hpp"
+#include "duckdb/optimizer/join_filter_pushdown_optimizer.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/common/operator/multiply.hpp"
 #include "duckdb/common/operator/subtract.hpp"
 #include "duckdb/execution/index/art/art.hpp"
+#include "duckdb/function/aggregate/distributive_function_utils.hpp"
+#include "duckdb/function/function_binder.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -664,7 +668,7 @@ optional<HashGroupJoinOrderContext> GetHashGroupJoinOrderContext(LogicalAggregat
 	}
 	HashGroupJoinOrderContext result;
 	result.strategy = Settings::Get<DebugGroupJoinStrategySetting>(context);
-	if (result.strategy == GroupJoinStrategy::SEPARATE) {
+	if (result.strategy == GroupJoinStrategy::SEPARATE || result.strategy == GroupJoinStrategy::FACTORIZED) {
 		return nullopt;
 	}
 	const auto auto_aggregates_supported = AutoHashGroupJoinAggregatesSupported(aggregate, result.state_width);
@@ -873,6 +877,7 @@ optional<HashGroupJoinCandidate> TryGetPlannedHashGroupJoinCandidate(LogicalAggr
 	}
 	auto strategy = Settings::Get<DebugGroupJoinStrategySetting>(context);
 	if (strategy == GroupJoinStrategy::DISABLED || strategy == GroupJoinStrategy::SEPARATE ||
+	    strategy == GroupJoinStrategy::FACTORIZED ||
 	    (strategy == GroupJoinStrategy::AUTO && !aggregate.group_join_auto_selected)) {
 		return nullopt;
 	}
@@ -887,15 +892,1124 @@ optional<HashGroupJoinCandidate> TryGetPlannedHashGroupJoinCandidate(LogicalAggr
 	return candidate;
 }
 
+struct FactorizedGroupJoinCandidate {
+	idx_t nested_child;
+	idx_t driver_child;
+	vector<idx_t> driver_key_indices;
+	vector<idx_t> left_key_indices;
+	vector<idx_t> right_key_indices;
+	vector<idx_t> group_driver_indices;
+	vector<FactorizedAggregateSource> aggregate_sources;
+	bool unique_driver;
+	bool routed;
+	bool preserve_left;
+	bool preserve_right;
+	bool semi_left;
+	bool semi_right;
+};
+
+struct FactorizedGroupJoinCostEstimate {
+	idx_t driver_rows = 0;
+	idx_t left_rows = 0;
+	idx_t right_rows = 0;
+	idx_t join_rows = 0;
+	idx_t matched_drivers = 0;
+	idx_t left_scan_rows = 0;
+	idx_t right_scan_rows = 0;
+	double build_cost = 0;
+	double filter_cost = 0;
+	double probe_cost = 0;
+	double scan_cost = 0;
+	double cache_cost = 0;
+	double eager_work_cost = 0;
+	double routing_cost = 0;
+	double spill_cost = 0;
+	double factorized_cost = 0;
+	double separate_cost = 0;
+	double eager_cost = 0;
+	double best_existing_cost = 0;
+	bool reliable = false;
+	bool selected = false;
+};
+
+static constexpr double FACTORIZED_MIN_CACHE_AMORTIZATION_RATIO = 64.0;
+static constexpr double FACTORIZED_MAX_CACHE_FACTOR_DRIVER_RATIO = 160.0;
+
+struct FactorizedGroupJoinInputs {
+	LogicalComparisonJoin &top_join;
+	LogicalComparisonJoin &nested_join;
+	LogicalOperator &driver;
+	LogicalOperator &left_factor;
+	LogicalOperator &right_factor;
+};
+
+static bool IsFactorizedEqualityJoin(const LogicalComparisonJoin &join) {
+	return (join.join_type == JoinType::INNER || join.join_type == JoinType::LEFT ||
+	        join.join_type == JoinType::RIGHT || join.join_type == JoinType::SEMI ||
+	        join.join_type == JoinType::RIGHT_SEMI) &&
+	       join.children.size() == 2 && !join.conditions.empty() && !join.HasArbitraryConditions();
+}
+
+static optional<bool> FactorizedEdgePreservesDriver(const LogicalComparisonJoin &join, idx_t driver_child, bool &semi) {
+	semi = false;
+	if (join.join_type == JoinType::INNER) {
+		return false;
+	}
+	if ((join.join_type == JoinType::SEMI && driver_child == 0) ||
+	    (join.join_type == JoinType::RIGHT_SEMI && driver_child == 1)) {
+		semi = true;
+		return false;
+	}
+	if ((join.join_type == JoinType::LEFT && driver_child == 0) ||
+	    (join.join_type == JoinType::RIGHT && driver_child == 1)) {
+		return true;
+	}
+	return nullopt;
+}
+
+static bool ExtractDirectFactorizedEdge(LogicalComparisonJoin &join, idx_t driver_child, vector<idx_t> &driver_keys,
+                                        vector<idx_t> &factor_keys, bool &preserve_driver, bool &semi) {
+	auto preserve = FactorizedEdgePreservesDriver(join, driver_child, semi);
+	if (!preserve) {
+		return false;
+	}
+	preserve_driver = *preserve;
+	for (auto &condition : join.conditions) {
+		if (!condition.IsComparison() || condition.GetComparisonType() != ExpressionType::COMPARE_EQUAL ||
+		    condition.GetLHS().GetReturnType() != condition.GetRHS().GetReturnType()) {
+			return false;
+		}
+		auto &driver_expression = driver_child == 0 ? condition.GetLHS() : condition.GetRHS();
+		auto &factor_expression = driver_child == 0 ? condition.GetRHS() : condition.GetLHS();
+		auto driver_index = GetDirectReferenceIndex(driver_expression, *join.children[driver_child]);
+		auto factor_index = GetDirectReferenceIndex(factor_expression, *join.children[1 - driver_child]);
+		if (!driver_index.IsValid() || !factor_index.IsValid()) {
+			return false;
+		}
+		driver_keys.push_back(driver_index.GetIndex());
+		factor_keys.push_back(factor_index.GetIndex());
+	}
+	return true;
+}
+
+static bool ExtractOuterFactorizedEdge(LogicalComparisonJoin &join, idx_t nested_child,
+                                       LogicalComparisonJoin &nested_join, idx_t driver_child,
+                                       const vector<idx_t> &driver_keys, const vector<idx_t> &left_factor_keys,
+                                       vector<idx_t> &right_factor_keys, bool &preserve_driver, bool &semi) {
+	auto preserve = FactorizedEdgePreservesDriver(join, nested_child, semi);
+	if (!preserve) {
+		return false;
+	}
+	preserve_driver = *preserve;
+	vector<optional_idx> mapped_right_keys(driver_keys.size());
+	for (auto &condition : join.conditions) {
+		if (!condition.IsComparison() || condition.GetComparisonType() != ExpressionType::COMPARE_EQUAL ||
+		    condition.GetLHS().GetReturnType() != condition.GetRHS().GetReturnType()) {
+			return false;
+		}
+		auto &nested_expression = nested_child == 0 ? condition.GetLHS() : condition.GetRHS();
+		auto &factor_expression = nested_child == 0 ? condition.GetRHS() : condition.GetLHS();
+		auto driver_index = GetDirectReferenceIndex(nested_expression, *nested_join.children[driver_child]);
+		auto left_factor_index = GetDirectReferenceIndex(nested_expression, *nested_join.children[1 - driver_child]);
+		auto factor_index = GetDirectReferenceIndex(factor_expression, *join.children[1 - nested_child]);
+		if (driver_index.IsValid() == left_factor_index.IsValid() || !factor_index.IsValid()) {
+			return false;
+		}
+		auto &nested_keys = driver_index.IsValid() ? driver_keys : left_factor_keys;
+		const auto nested_key = driver_index.IsValid() ? driver_index.GetIndex() : left_factor_index.GetIndex();
+		optional_idx pair_index;
+		for (idx_t key_idx = 0; key_idx < nested_keys.size(); key_idx++) {
+			if (nested_keys[key_idx] != nested_key) {
+				continue;
+			}
+			if (pair_index.IsValid()) {
+				return false;
+			}
+			pair_index = optional_idx(key_idx);
+		}
+		if (!pair_index.IsValid()) {
+			return false;
+		}
+		auto &mapped_right = mapped_right_keys[pair_index.GetIndex()];
+		if (mapped_right.IsValid() && mapped_right.GetIndex() != factor_index.GetIndex()) {
+			return false;
+		}
+		mapped_right = factor_index;
+	}
+	for (auto &right_key : mapped_right_keys) {
+		if (!right_key.IsValid()) {
+			return false;
+		}
+		right_factor_keys.push_back(right_key.GetIndex());
+	}
+	return true;
+}
+
+static uint8_t GetFactorizedExpressionSources(const Expression &expression, const vector<ColumnBinding> (&bindings)[3],
+                                              bool &valid) {
+	if (!valid) {
+		return 0;
+	}
+	if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+		auto binding = expression.Cast<BoundColumnRefExpression>().Binding();
+		uint8_t result = 0;
+		for (idx_t source_idx = 0; source_idx < 3; source_idx++) {
+			if (std::find(bindings[source_idx].begin(), bindings[source_idx].end(), binding) !=
+			    bindings[source_idx].end()) {
+				result |= NumericCast<uint8_t>(1U << source_idx);
+			}
+		}
+		valid = result != 0 && (result & (result - 1)) == 0;
+		return result;
+	}
+	if (expression.GetExpressionClass() == ExpressionClass::BOUND_REF) {
+		valid = false;
+		return 0;
+	}
+	uint8_t result = 0;
+	ExpressionIterator::EnumerateChildren(
+	    expression, [&](const Expression &child) { result |= GetFactorizedExpressionSources(child, bindings, valid); });
+	return result;
+}
+
+static optional<FactorizedAggregateSource> GetFactorizedAggregateSource(const BoundAggregateExpression &aggregate,
+                                                                        const vector<ColumnBinding> (&bindings)[3]) {
+	if (aggregate.IsVolatile() || aggregate.StateExportMode() != AggregateStateExportMode::NONE ||
+	    (!aggregate.GetOrderBys() &&
+	     (aggregate.Function().GetOrderDependent() == AggregateOrderDependent::ORDER_DEPENDENT ||
+	      aggregate.Function().GetRepeatCombine() != AggregateRepeatCombine::SUPPORTED))) {
+		return nullopt;
+	}
+	uint8_t sources = 0;
+	bool valid = true;
+	for (auto &child : aggregate.GetChildren()) {
+		if (child->IsVolatile() || child->GetReturnType().IsAggregateState()) {
+			return nullopt;
+		}
+		sources |= GetFactorizedExpressionSources(*child, bindings, valid);
+	}
+	if (aggregate.GetOrderBys()) {
+		for (auto &order : aggregate.GetOrderBys()->orders) {
+			if (order.expression->IsVolatile()) {
+				return nullopt;
+			}
+			sources |= GetFactorizedExpressionSources(*order.expression, bindings, valid);
+		}
+	}
+	if (aggregate.GetFilter()) {
+		if (aggregate.GetFilter()->IsVolatile()) {
+			return nullopt;
+		}
+		sources |= GetFactorizedExpressionSources(*aggregate.GetFilter(), bindings, valid);
+	}
+	if (!valid || (sources & (sources - 1)) != 0) {
+		return nullopt;
+	}
+	if (sources == 0 || sources == 1) {
+		return FactorizedAggregateSource::DRIVER;
+	}
+	if (sources == 2) {
+		return FactorizedAggregateSource::LEFT_FACTOR;
+	}
+	if (sources == 4) {
+		return FactorizedAggregateSource::RIGHT_FACTOR;
+	}
+	return nullopt;
+}
+
+static optional<FactorizedGroupJoinCandidate> ValidateFactorizedGroupJoinCandidate(
+    const vector<unique_ptr<Expression>> &groups, const vector<unique_ptr<Expression>> &expressions,
+    LogicalOperator &driver, LogicalOperator &left_factor, LogicalOperator &right_factor, idx_t nested_child,
+    idx_t driver_child, vector<idx_t> driver_keys, vector<idx_t> left_keys, vector<idx_t> right_keys,
+    bool preserve_left, bool preserve_right, bool semi_left, bool semi_right) {
+	const auto unique_driver = GetUniqueKeyProperty(driver, driver_keys).has_value();
+	unordered_set<idx_t> group_key_pairs;
+	vector<idx_t> group_driver_indices;
+	bool routed = false;
+	for (auto &group : groups) {
+		if (group->IsVolatile()) {
+			return nullopt;
+		}
+		optional_idx pair_index;
+		optional_idx direct_driver_index;
+		for (idx_t source_idx = 0; source_idx < 3; source_idx++) {
+			auto &source = source_idx == 0 ? driver : source_idx == 1 ? left_factor : right_factor;
+			auto &source_keys = source_idx == 0 ? driver_keys : source_idx == 1 ? left_keys : right_keys;
+			auto source_index = GetDirectReferenceIndex(*group, source);
+			if (!source_index.IsValid()) {
+				continue;
+			}
+			if (source_idx == 0) {
+				direct_driver_index = source_index;
+			}
+			if ((source_idx == 1 && (preserve_left || semi_left)) ||
+			    (source_idx == 2 && (preserve_right || semi_right))) {
+				return nullopt;
+			}
+			for (idx_t key_idx = 0; key_idx < source_keys.size(); key_idx++) {
+				if (source_keys[key_idx] != source_index.GetIndex()) {
+					continue;
+				}
+				if (pair_index.IsValid()) {
+					return nullopt;
+				}
+				pair_index = optional_idx(key_idx);
+			}
+		}
+		if (pair_index.IsValid()) {
+			if (!group_key_pairs.insert(pair_index.GetIndex()).second) {
+				return nullopt;
+			}
+			group_driver_indices.push_back(driver_keys[pair_index.GetIndex()]);
+		} else {
+			if (!direct_driver_index.IsValid()) {
+				return nullopt;
+			}
+			group_driver_indices.push_back(direct_driver_index.GetIndex());
+			routed = true;
+		}
+	}
+	if (group_key_pairs.size() != driver_keys.size()) {
+		return nullopt;
+	}
+
+	vector<ColumnBinding> source_bindings[3] = {driver.GetColumnBindings(), left_factor.GetColumnBindings(),
+	                                            right_factor.GetColumnBindings()};
+	vector<FactorizedAggregateSource> aggregate_sources;
+	for (auto &expression : expressions) {
+		if (expression->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+			return nullopt;
+		}
+		auto source = GetFactorizedAggregateSource(expression->Cast<BoundAggregateExpression>(), source_bindings);
+		if (!source) {
+			return nullopt;
+		}
+		if ((*source == FactorizedAggregateSource::LEFT_FACTOR && semi_left) ||
+		    (*source == FactorizedAggregateSource::RIGHT_FACTOR && semi_right)) {
+			return nullopt;
+		}
+		aggregate_sources.push_back(*source);
+	}
+	return FactorizedGroupJoinCandidate {nested_child,
+	                                     driver_child,
+	                                     std::move(driver_keys),
+	                                     std::move(left_keys),
+	                                     std::move(right_keys),
+	                                     std::move(group_driver_indices),
+	                                     std::move(aggregate_sources),
+	                                     unique_driver,
+	                                     routed,
+	                                     preserve_left,
+	                                     preserve_right,
+	                                     semi_left,
+	                                     semi_right};
+}
+
+static optional<FactorizedGroupJoinCandidate>
+AnalyzeFactorizedGroupJoinCandidate(const vector<unique_ptr<Expression>> &groups,
+                                    const vector<unique_ptr<Expression>> &expressions,
+                                    LogicalComparisonJoin &top_join) {
+	if (!IsFactorizedEqualityJoin(top_join)) {
+		return nullopt;
+	}
+	optional<FactorizedGroupJoinCandidate> fallback;
+	for (idx_t nested_child = 0; nested_child < 2; nested_child++) {
+		if (top_join.children[nested_child]->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+			continue;
+		}
+		auto &nested_join = top_join.children[nested_child]->Cast<LogicalComparisonJoin>();
+		if (!IsFactorizedEqualityJoin(nested_join)) {
+			continue;
+		}
+		for (idx_t driver_child = 0; driver_child < 2; driver_child++) {
+			vector<idx_t> inner_driver_keys;
+			vector<idx_t> left_factor_keys;
+			vector<idx_t> right_factor_keys;
+			bool preserve_left;
+			bool preserve_right;
+			bool semi_left;
+			bool semi_right;
+			if (!ExtractDirectFactorizedEdge(nested_join, driver_child, inner_driver_keys, left_factor_keys,
+			                                 preserve_left, semi_left) ||
+			    !ExtractOuterFactorizedEdge(top_join, nested_child, nested_join, driver_child, inner_driver_keys,
+			                                left_factor_keys, right_factor_keys, preserve_right, semi_right)) {
+				continue;
+			}
+			auto candidate = ValidateFactorizedGroupJoinCandidate(
+			    groups, expressions, *nested_join.children[driver_child], *nested_join.children[1 - driver_child],
+			    *top_join.children[1 - nested_child], nested_child, driver_child, std::move(inner_driver_keys),
+			    std::move(left_factor_keys), std::move(right_factor_keys), preserve_left, preserve_right, semi_left,
+			    semi_right);
+			if (candidate) {
+				if (candidate->unique_driver) {
+					return candidate;
+				}
+				if (!fallback) {
+					fallback = std::move(candidate);
+				}
+			}
+		}
+
+		vector<idx_t> nested_keys[2];
+		bool nested_preserves_left;
+		bool nested_semi_left;
+		if (top_join.join_type != JoinType::INNER ||
+		    !ExtractDirectFactorizedEdge(nested_join, 0, nested_keys[0], nested_keys[1], nested_preserves_left,
+		                                 nested_semi_left) ||
+		    nested_join.join_type != JoinType::INNER) {
+			continue;
+		}
+		vector<optional_idx> pair_driver_keys(nested_keys[0].size());
+		bool valid = true;
+		for (auto &condition : top_join.conditions) {
+			auto &nested_expression = nested_child == 0 ? condition.GetLHS() : condition.GetRHS();
+			auto &driver_expression = nested_child == 0 ? condition.GetRHS() : condition.GetLHS();
+			auto driver_index = GetDirectReferenceIndex(driver_expression, *top_join.children[1 - nested_child]);
+			auto nested_left_index = GetDirectReferenceIndex(nested_expression, *nested_join.children[0]);
+			auto nested_right_index = GetDirectReferenceIndex(nested_expression, *nested_join.children[1]);
+			if (!condition.IsComparison() || condition.GetComparisonType() != ExpressionType::COMPARE_EQUAL ||
+			    condition.GetLHS().GetReturnType() != condition.GetRHS().GetReturnType() || !driver_index.IsValid() ||
+			    nested_left_index.IsValid() == nested_right_index.IsValid()) {
+				valid = false;
+				break;
+			}
+			const auto factor_child = nested_left_index.IsValid() ? idx_t(0) : idx_t(1);
+			const auto factor_index = factor_child == 0 ? nested_left_index.GetIndex() : nested_right_index.GetIndex();
+			optional_idx pair_index;
+			for (idx_t key_idx = 0; key_idx < nested_keys[factor_child].size(); key_idx++) {
+				if (nested_keys[factor_child][key_idx] != factor_index) {
+					continue;
+				}
+				if (pair_index.IsValid()) {
+					valid = false;
+					break;
+				}
+				pair_index = optional_idx(key_idx);
+			}
+			if (!valid || !pair_index.IsValid()) {
+				valid = false;
+				break;
+			}
+			auto &mapped_driver = pair_driver_keys[pair_index.GetIndex()];
+			if (mapped_driver.IsValid() && mapped_driver.GetIndex() != driver_index.GetIndex()) {
+				valid = false;
+				break;
+			}
+			mapped_driver = driver_index;
+		}
+		vector<idx_t> driver_keys;
+		for (auto &driver_key : pair_driver_keys) {
+			if (!driver_key.IsValid()) {
+				valid = false;
+				break;
+			}
+			driver_keys.push_back(driver_key.GetIndex());
+		}
+		if (!valid) {
+			continue;
+		}
+		auto candidate = ValidateFactorizedGroupJoinCandidate(
+		    groups, expressions, *top_join.children[1 - nested_child], *nested_join.children[0],
+		    *nested_join.children[1], nested_child, DConstants::INVALID_INDEX, std::move(driver_keys),
+		    std::move(nested_keys[0]), std::move(nested_keys[1]), false, false, false, false);
+		if (candidate) {
+			if (candidate->unique_driver) {
+				return candidate;
+			}
+			if (!fallback) {
+				fallback = std::move(candidate);
+			}
+		}
+	}
+	return fallback;
+}
+
+static void InlineFactorizedProjection(unique_ptr<Expression> &expression, const LogicalProjection &projection) {
+	if (expression->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+		auto &reference = expression->Cast<BoundColumnRefExpression>();
+		if (reference.Binding().table_index == projection.table_index) {
+			auto projection_index = reference.Binding().column_index.GetIndex();
+			if (projection_index >= projection.expressions.size()) {
+				throw InternalException("Factorized GroupJoin projection reference is out of bounds");
+			}
+			expression = projection.expressions[projection_index]->Copy();
+			return;
+		}
+	}
+	ExpressionIterator::EnumerateChildren(
+	    *expression, [&](unique_ptr<Expression> &child) { InlineFactorizedProjection(child, projection); });
+}
+
+static optional_ptr<LogicalComparisonJoin> GetFactorizedJoinRoot(LogicalAggregate &aggregate,
+                                                                 vector<reference<LogicalProjection>> &projections) {
+	if (aggregate.children.size() != 1) {
+		return nullptr;
+	}
+	reference<LogicalOperator> current = *aggregate.children[0];
+	while (current.get().type == LogicalOperatorType::LOGICAL_PROJECTION && current.get().children.size() == 1) {
+		auto &projection = current.get().Cast<LogicalProjection>();
+		for (auto &expression : projection.expressions) {
+			if (expression->IsVolatile()) {
+				return nullptr;
+			}
+		}
+		projections.push_back(projection);
+		current = *projection.children[0];
+	}
+	if (current.get().type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		return nullptr;
+	}
+	return current.get().Cast<LogicalComparisonJoin>();
+}
+
+static void InlineFactorizedProjections(vector<unique_ptr<Expression>> &groups,
+                                        vector<unique_ptr<Expression>> &expressions,
+                                        const vector<reference<LogicalProjection>> &projections) {
+	for (auto &group : groups) {
+		for (auto &projection : projections) {
+			InlineFactorizedProjection(group, projection);
+		}
+	}
+	for (auto &expression : expressions) {
+		for (auto &projection : projections) {
+			InlineFactorizedProjection(expression, projection);
+		}
+	}
+}
+
+static vector<unique_ptr<Expression>> CopyFactorizedExpressions(const vector<unique_ptr<Expression>> &expressions) {
+	vector<unique_ptr<Expression>> result;
+	result.reserve(expressions.size());
+	for (auto &expression : expressions) {
+		result.push_back(expression->Copy());
+	}
+	return result;
+}
+
+static optional<FactorizedGroupJoinCandidate> TryAnalyzeFactorizedGroupJoinCandidate(LogicalAggregate &aggregate,
+                                                                                     ClientContext &context) {
+	if (!HashGroupJoinPlanningEnabled(context) || aggregate.groups.empty() || !aggregate.grouping_functions.empty() ||
+	    aggregate.grouping_sets.size() > 1 || aggregate.expressions.empty()) {
+		return nullopt;
+	}
+	if (!aggregate.grouping_sets.empty()) {
+		auto &grouping_set = aggregate.grouping_sets[0];
+		if (grouping_set.size() != aggregate.groups.size()) {
+			return nullopt;
+		}
+		for (idx_t group_idx = 0; group_idx < aggregate.groups.size(); group_idx++) {
+			if (grouping_set.find(ProjectionIndex(group_idx)) == grouping_set.end()) {
+				return nullopt;
+			}
+		}
+	}
+
+	vector<reference<LogicalProjection>> projections;
+	auto top_join = GetFactorizedJoinRoot(aggregate, projections);
+	if (!top_join) {
+		return nullopt;
+	}
+	if (projections.empty()) {
+		return AnalyzeFactorizedGroupJoinCandidate(aggregate.groups, aggregate.expressions, *top_join);
+	}
+	auto groups = CopyFactorizedExpressions(aggregate.groups);
+	auto expressions = CopyFactorizedExpressions(aggregate.expressions);
+	InlineFactorizedProjections(groups, expressions, projections);
+	return AnalyzeFactorizedGroupJoinCandidate(groups, expressions, *top_join);
+}
+
+static void ApplyFactorizedProjectionInlining(LogicalAggregate &aggregate) {
+	vector<reference<LogicalProjection>> projections;
+	auto top_join = GetFactorizedJoinRoot(aggregate, projections);
+	D_ASSERT(top_join);
+	if (projections.empty()) {
+		return;
+	}
+	InlineFactorizedProjections(aggregate.groups, aggregate.expressions, projections);
+	aggregate.children[0] = std::move(projections.back().get().children[0]);
+}
+
+static unique_ptr<BaseStatistics>
+GetFactorizedPerfectGroupJoinSourceStats(LogicalOperator &driver, const FactorizedGroupJoinCandidate &candidate,
+                                         ClientContext &context) {
+	if (candidate.driver_key_indices.size() != 1) {
+		return nullptr;
+	}
+	auto bindings = driver.GetColumnBindings();
+	if (candidate.driver_key_indices[0] >= bindings.size()) {
+		return nullptr;
+	}
+	auto binding = bindings[candidate.driver_key_indices[0]];
+	auto get = FindPerfectGroupJoinGet(driver, binding.table_index);
+	if (!get || !get->bind_data || (!get->function.statistics && !get->function.statistics_extended) ||
+	    binding.column_index >= get->GetColumnIds().size()) {
+		return nullptr;
+	}
+	auto &column_id = get->GetColumnIndex(binding);
+	if (get->function.statistics_extended) {
+		TableFunctionGetStatisticsInput input(get->bind_data.get(), column_id);
+		return get->function.statistics_extended(context, input);
+	}
+	return get->function.statistics(context, get->bind_data.get(), column_id.GetPrimaryIndex());
+}
+
+static bool TryGetFactorizedPerfectGroupJoinBounds(LogicalAggregate &aggregate, LogicalOperator &driver,
+                                                   const FactorizedGroupJoinCandidate &candidate,
+                                                   ClientContext &context, Value &minimum, Value &maximum,
+                                                   idx_t &range) {
+	if (!candidate.unique_driver || candidate.routed || candidate.driver_key_indices.size() != 1) {
+		return false;
+	}
+	auto key_group = std::find(candidate.group_driver_indices.begin(), candidate.group_driver_indices.end(),
+	                           candidate.driver_key_indices[0]);
+	if (key_group == candidate.group_driver_indices.end()) {
+		return false;
+	}
+	auto group_idx = NumericCast<idx_t>(key_group - candidate.group_driver_indices.begin());
+	if (group_idx >= aggregate.groups.size()) {
+		return false;
+	}
+	auto &key_type = aggregate.groups[group_idx]->GetReturnType();
+	switch (key_type.InternalType()) {
+	case PhysicalType::INT8:
+	case PhysicalType::INT16:
+	case PhysicalType::INT32:
+	case PhysicalType::INT64:
+	case PhysicalType::UINT8:
+	case PhysicalType::UINT16:
+	case PhysicalType::UINT32:
+	case PhysicalType::UINT64:
+		break;
+	default:
+		return false;
+	}
+	if (group_idx < aggregate.group_stats.size() && aggregate.group_stats[group_idx] &&
+	    NumericStats::HasMinMax(*aggregate.group_stats[group_idx])) {
+		minimum = NumericStats::Min(*aggregate.group_stats[group_idx]);
+		maximum = NumericStats::Max(*aggregate.group_stats[group_idx]);
+	} else {
+		auto source_stats = GetFactorizedPerfectGroupJoinSourceStats(driver, candidate, context);
+		if (!source_stats || source_stats->GetStatsType() != StatisticsType::NUMERIC_STATS ||
+		    !NumericStats::HasMinMax(*source_stats)) {
+			return false;
+		}
+		minimum = NumericStats::Min(*source_stats);
+		maximum = NumericStats::Max(*source_stats);
+	}
+	Value minimum_hugeint = minimum;
+	Value maximum_hugeint = maximum;
+	if (!minimum_hugeint.DefaultTryCastAs(LogicalType::HUGEINT) ||
+	    !maximum_hugeint.DefaultTryCastAs(LogicalType::HUGEINT)) {
+		return false;
+	}
+	hugeint_t range_hugeint;
+	if (!TrySubtractOperator::Operation(maximum_hugeint.GetValue<hugeint_t>(), minimum_hugeint.GetValue<hugeint_t>(),
+	                                    range_hugeint) ||
+	    range_hugeint < 0 || range_hugeint > Hugeint::Convert(PERFECT_GROUP_JOIN_MAX_RANGE)) {
+		return false;
+	}
+	range = NumericCast<idx_t>(range_hugeint);
+	return PerfectGroupJoinDirectoryFits(range, BufferManager::GetBufferManager(context).GetMaxMemory());
+}
+
+static FactorizedGroupJoinInputs GetFactorizedGroupJoinInputs(LogicalAggregate &aggregate,
+                                                              const FactorizedGroupJoinCandidate &candidate) {
+	vector<reference<LogicalProjection>> projections;
+	auto top_join_ptr = GetFactorizedJoinRoot(aggregate, projections);
+	if (!top_join_ptr ||
+	    top_join_ptr->children[candidate.nested_child]->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		throw InternalException("Factorized GroupJoin candidate no longer references a two-join star");
+	}
+	auto &top_join = *top_join_ptr;
+	auto &nested_join = top_join.children[candidate.nested_child]->Cast<LogicalComparisonJoin>();
+	if (candidate.driver_child == DConstants::INVALID_INDEX) {
+		return {top_join, nested_join, *top_join.children[1 - candidate.nested_child], *nested_join.children[0],
+		        *nested_join.children[1]};
+	}
+	return {top_join, nested_join, *nested_join.children[candidate.driver_child],
+	        *nested_join.children[1 - candidate.driver_child], *top_join.children[1 - candidate.nested_child]};
+}
+
+static idx_t FactorizedCardinalityFromDouble(double value) {
+	if (value >= static_cast<double>(NumericLimits<idx_t>::Maximum())) {
+		return NumericLimits<idx_t>::Maximum();
+	}
+	return LossyNumericCast<idx_t>(MaxValue<double>(value, 0));
+}
+
+static bool AutoFactorizedGroupJoinAggregatesSupported(const LogicalAggregate &aggregate,
+                                                       const FactorizedGroupJoinCandidate &candidate,
+                                                       array<idx_t, 3> &state_widths, array<idx_t, 3> &payload_widths) {
+	static constexpr idx_t MAX_AUTO_STATE_WIDTH = 256;
+	if (aggregate.expressions.size() != candidate.aggregate_sources.size()) {
+		return false;
+	}
+	state_widths.fill(sizeof(idx_t));
+	payload_widths.fill(0);
+	idx_t total_state_width = 0;
+	for (idx_t aggregate_idx = 0; aggregate_idx < aggregate.expressions.size(); aggregate_idx++) {
+		auto &aggr = aggregate.expressions[aggregate_idx]->Cast<BoundAggregateExpression>();
+		auto &callbacks = aggr.Function().GetCallbacks();
+		if (aggr.IsDistinct() || aggr.GetFilter() || aggr.GetOrderBys() || callbacks.HasStateDestructorCallback() ||
+		    aggr.Function().GetName() == "combine_aggr") {
+			return false;
+		}
+		auto source_idx = NumericCast<idx_t>(candidate.aggregate_sources[aggregate_idx]);
+		if (source_idx >= state_widths.size()) {
+			return false;
+		}
+		state_widths[source_idx] += aggr.Function().GetStateSize(aggr.BindInfo().get());
+		for (auto &child : aggr.GetChildren()) {
+			if (child->GetReturnType().IsAggregateState()) {
+				return false;
+			}
+			payload_widths[source_idx] += GetTypeIdSize(child->GetReturnType().InternalType());
+		}
+	}
+	for (auto width : state_widths) {
+		if (!TryAddOperator::Operation(total_state_width, width, total_state_width)) {
+			return false;
+		}
+	}
+	return total_state_width <= MAX_AUTO_STATE_WIDTH;
+}
+
+static FactorizedGroupJoinCostEstimate EstimateFactorizedGroupJoinCost(LogicalAggregate &aggregate,
+                                                                       const FactorizedGroupJoinCandidate &candidate,
+                                                                       ClientContext &context) {
+	static constexpr double AUTO_MAX_COST_RATIO = 0.9;
+	static constexpr double FILTER_ROW_COST = 0.25;
+	static constexpr double DIRECTORY_PROBE_COST = 0.5;
+	static constexpr double CACHE_AMORTIZATION_COST = 1.5;
+	static constexpr double CACHE_PRESSURE_COST = 2.0;
+	static constexpr bool ENABLE_FACTORIZED_AUTO = true;
+
+	FactorizedGroupJoinCostEstimate result;
+	auto inputs = GetFactorizedGroupJoinInputs(aggregate, candidate);
+	result.driver_rows = inputs.driver.EstimateCardinality(context);
+	result.left_rows = inputs.left_factor.EstimateCardinality(context);
+	result.right_rows = inputs.right_factor.EstimateCardinality(context);
+	inputs.nested_join.EstimateCardinality(context);
+	result.join_rows = inputs.top_join.EstimateCardinality(context);
+	result.matched_drivers = aggregate.EstimateCardinality(context);
+	result.matched_drivers = MinValue(result.matched_drivers, result.driver_rows);
+
+	array<idx_t, 3> state_widths;
+	array<idx_t, 3> payload_widths;
+	const auto aggregates_supported =
+	    AutoFactorizedGroupJoinAggregatesSupported(aggregate, candidate, state_widths, payload_widths);
+	idx_t key_width = 0;
+	for (auto key_idx : candidate.driver_key_indices) {
+		if (key_idx >= inputs.driver.types.size()) {
+			return result;
+		}
+		key_width += GetTypeIdSize(inputs.driver.types[key_idx].InternalType());
+	}
+	const auto direct_driver_edge = candidate.driver_child != DConstants::INVALID_INDEX;
+	const auto inner_edges =
+	    inputs.nested_join.join_type == JoinType::INNER && inputs.top_join.join_type == JoinType::INNER;
+	Value perfect_min;
+	Value perfect_max;
+	idx_t perfect_range;
+	const auto exact_driver_filter = TryGetFactorizedPerfectGroupJoinBounds(
+	    aggregate, inputs.driver, candidate, context, perfect_min, perfect_max, perfect_range);
+	result.reliable = direct_driver_edge && inner_edges && candidate.unique_driver && !candidate.routed &&
+	                  exact_driver_filter && aggregates_supported && inputs.driver.has_estimated_cardinality &&
+	                  inputs.left_factor.has_estimated_cardinality && inputs.right_factor.has_estimated_cardinality &&
+	                  inputs.nested_join.has_estimated_cardinality && inputs.top_join.has_estimated_cardinality &&
+	                  aggregate.has_estimated_cardinality;
+
+	if (direct_driver_edge) {
+		result.left_scan_rows = MinValue(result.left_rows, inputs.nested_join.estimated_cardinality);
+		const auto left_fanout = static_cast<double>(result.left_scan_rows) /
+		                         static_cast<double>(MaxValue<idx_t>(result.matched_drivers, 1));
+		result.right_scan_rows = MinValue(
+		    result.right_rows, FactorizedCardinalityFromDouble(std::ceil(static_cast<double>(result.join_rows) /
+		                                                                 MaxValue<double>(left_fanout, 1.0))));
+	} else {
+		// The factor-factor-first orientation does not provide reliable branch-local match estimates.
+		result.left_scan_rows = result.left_rows;
+		result.right_scan_rows = result.right_rows;
+	}
+
+	const auto key_cost = MaxValue<double>(static_cast<double>(key_width) / 8.0, 1.0);
+	array<double, 3> state_costs;
+	array<double, 3> payload_costs;
+	for (idx_t source_idx = 0; source_idx < state_costs.size(); source_idx++) {
+		state_costs[source_idx] = MaxValue<double>(static_cast<double>(state_widths[source_idx]) / 16.0, 1.0);
+		payload_costs[source_idx] = static_cast<double>(payload_widths[source_idx]) / 16.0;
+	}
+	result.build_cost = static_cast<double>(result.driver_rows) * (key_cost + state_costs[0] + payload_costs[0] + 1.0);
+	result.filter_cost = static_cast<double>(result.driver_rows) * 2.0 * key_cost +
+	                     static_cast<double>(result.left_rows + result.right_rows) * FILTER_ROW_COST * key_cost;
+	result.probe_cost =
+	    static_cast<double>(result.left_scan_rows + result.right_scan_rows) * DIRECTORY_PROBE_COST * key_cost;
+	result.scan_cost = static_cast<double>(result.left_scan_rows) * (payload_costs[1] + state_costs[1]) +
+	                   static_cast<double>(result.right_scan_rows) * (payload_costs[2] + state_costs[2]);
+	const auto thread_count = MaxValue<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads(), 1);
+	result.cache_cost =
+	    static_cast<double>(result.driver_rows) * static_cast<double>(thread_count) * (state_costs[1] + state_costs[2]);
+	const auto minimum_amortized_factor_rows =
+	    static_cast<double>(result.driver_rows) * FACTORIZED_MIN_CACHE_AMORTIZATION_RATIO;
+	const auto cached_factor_rows = static_cast<double>(result.driver_rows) * FACTORIZED_MAX_CACHE_FACTOR_DRIVER_RATIO;
+	const auto total_factor_rows = static_cast<double>(result.left_rows + result.right_rows);
+	if (total_factor_rows < minimum_amortized_factor_rows) {
+		result.cache_cost += (minimum_amortized_factor_rows - total_factor_rows) * CACHE_AMORTIZATION_COST * key_cost;
+	}
+	if (total_factor_rows > cached_factor_rows) {
+		result.cache_cost += (total_factor_rows - cached_factor_rows) * CACHE_PRESSURE_COST * key_cost;
+	}
+	if (!candidate.unique_driver || candidate.routed) {
+		result.eager_work_cost =
+		    static_cast<double>(result.left_scan_rows) * (key_cost + payload_costs[1] + state_costs[1]) +
+		    static_cast<double>(result.right_scan_rows) * (key_cost + payload_costs[2] + state_costs[2]);
+	}
+	if (candidate.routed) {
+		result.routing_cost = static_cast<double>(result.driver_rows + result.matched_drivers) * (key_cost + 2.0);
+	}
+	result.factorized_cost = result.build_cost + result.filter_cost + result.probe_cost + result.scan_cost +
+	                         result.cache_cost + result.eager_work_cost + result.routing_cost;
+
+	const auto intermediate_rows =
+	    direct_driver_edge ? inputs.nested_join.estimated_cardinality : result.left_rows + result.right_rows;
+	const auto total_payload_cost = payload_costs[0] + payload_costs[1] + payload_costs[2];
+	const auto total_state_cost = state_costs[0] + state_costs[1] + state_costs[2];
+	result.separate_cost = static_cast<double>(result.driver_rows + result.left_rows + result.right_rows) * key_cost +
+	                       static_cast<double>(intermediate_rows) * (key_cost + 1.0) +
+	                       static_cast<double>(result.join_rows) * (total_payload_cost + total_state_cost + 2.0);
+	result.eager_cost = static_cast<double>(result.left_rows) * (key_cost + payload_costs[1] + state_costs[1] + 1.0) +
+	                    static_cast<double>(result.right_rows) * (key_cost + payload_costs[2] + state_costs[2] + 1.0) +
+	                    result.build_cost + static_cast<double>(result.matched_drivers) * (key_cost + 1.0);
+	result.best_existing_cost = MinValue(result.separate_cost, result.eager_cost);
+
+	idx_t estimated_memory_rows = 0;
+	idx_t estimated_memory = 0;
+	const auto row_bytes =
+	    key_width + state_widths[0] + state_widths[1] + state_widths[2] + sizeof(hash_t) + sizeof(data_ptr_t) * 2;
+	if (!TryMultiplyOperator::Operation(result.driver_rows, thread_count, estimated_memory_rows) ||
+	    !TryMultiplyOperator::Operation(estimated_memory_rows, row_bytes, estimated_memory) ||
+	    estimated_memory > BufferManager::GetBufferManager(context).GetMaxMemory() / 4) {
+		result.spill_cost = result.factorized_cost * 0.75;
+		result.factorized_cost += result.spill_cost;
+	}
+	result.selected = ENABLE_FACTORIZED_AUTO && result.reliable && result.best_existing_cost > 0 &&
+	                  result.factorized_cost <= result.best_existing_cost * AUTO_MAX_COST_RATIO;
+	return result;
+}
+
+bool HasPotentialFactorizedGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context) {
+	auto strategy = Settings::Get<DebugGroupJoinStrategySetting>(context);
+	if (strategy != GroupJoinStrategy::FACTORIZED && strategy != GroupJoinStrategy::AUTO) {
+		return false;
+	}
+	auto candidate = TryAnalyzeFactorizedGroupJoinCandidate(aggregate, context);
+	if (!candidate || strategy == GroupJoinStrategy::FACTORIZED) {
+		return candidate.has_value();
+	}
+	auto inputs = GetFactorizedGroupJoinInputs(aggregate, *candidate);
+	array<idx_t, 3> state_widths;
+	array<idx_t, 3> payload_widths;
+	const auto inner_edges =
+	    inputs.nested_join.join_type == JoinType::INNER && inputs.top_join.join_type == JoinType::INNER;
+	if (candidate->driver_child == DConstants::INVALID_INDEX || !inner_edges || !candidate->unique_driver ||
+	    candidate->routed ||
+	    !AutoFactorizedGroupJoinAggregatesSupported(aggregate, *candidate, state_widths, payload_widths)) {
+		return false;
+	}
+	const auto driver_rows = inputs.driver.EstimateCardinality(context);
+	if (driver_rows == 0) {
+		return false;
+	}
+	const auto factor_rows = static_cast<double>(inputs.left_factor.EstimateCardinality(context)) +
+	                         static_cast<double>(inputs.right_factor.EstimateCardinality(context));
+	const auto factor_driver_ratio = factor_rows / static_cast<double>(driver_rows);
+	return factor_driver_ratio >= FACTORIZED_MIN_CACHE_AMORTIZATION_RATIO &&
+	       factor_driver_ratio <= FACTORIZED_MAX_CACHE_FACTOR_DRIVER_RATIO;
+}
+
+optional<HashGroupJoinOrderContext> GetFactorizedGroupJoinOrderContext(LogicalAggregate &aggregate,
+                                                                       ClientContext &context) {
+	if (!HasPotentialFactorizedGroupJoinCandidate(aggregate, context)) {
+		return nullopt;
+	}
+	auto candidate = TryAnalyzeFactorizedGroupJoinCandidate(aggregate, context);
+	if (!candidate) {
+		return nullopt;
+	}
+	auto inputs = GetFactorizedGroupJoinInputs(aggregate, *candidate);
+	HashGroupJoinOrderContext result;
+	result.strategy = Settings::Get<DebugGroupJoinStrategySetting>(context);
+	result.factorized = true;
+	LogicalJoin::GetTableReferences(inputs.driver, result.factorized_driver_tables);
+	LogicalJoin::GetTableReferences(inputs.left_factor, result.factorized_left_tables);
+	LogicalJoin::GetTableReferences(inputs.right_factor, result.factorized_right_tables);
+	if (result.factorized_driver_tables.empty() || result.factorized_left_tables.empty() ||
+	    result.factorized_right_tables.empty()) {
+		return nullopt;
+	}
+	return result;
+}
+
+bool HasFactorizedGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context) {
+	auto strategy = Settings::Get<DebugGroupJoinStrategySetting>(context);
+	if (strategy != GroupJoinStrategy::FACTORIZED && strategy != GroupJoinStrategy::AUTO) {
+		return false;
+	}
+	auto candidate = TryAnalyzeFactorizedGroupJoinCandidate(aggregate, context);
+	if (!candidate || strategy == GroupJoinStrategy::FACTORIZED) {
+		return candidate.has_value();
+	}
+	auto cost = EstimateFactorizedGroupJoinCost(aggregate, *candidate, context);
+	if (cost.selected) {
+		return true;
+	}
+	if (!cost.reliable) {
+		return false;
+	}
+	return false;
+}
+
+static optional<FactorizedGroupJoinCandidate> TrySelectFactorizedGroupJoinCandidate(LogicalAggregate &aggregate,
+                                                                                    ClientContext &context) {
+	auto strategy = Settings::Get<DebugGroupJoinStrategySetting>(context);
+	if (strategy != GroupJoinStrategy::FACTORIZED && strategy != GroupJoinStrategy::AUTO) {
+		return nullopt;
+	}
+	auto candidate = TryAnalyzeFactorizedGroupJoinCandidate(aggregate, context);
+	if (!candidate || strategy == GroupJoinStrategy::FACTORIZED) {
+		return candidate;
+	}
+	return EstimateFactorizedGroupJoinCost(aggregate, *candidate, context).selected ? std::move(candidate) : nullopt;
+}
+
+static unique_ptr<JoinFilterPushdownInfo> TakeFactorizedRuntimeFilter(LogicalComparisonJoin &join, idx_t factor_child,
+                                                                      const vector<idx_t> &factor_keys) {
+	// Join filter pushdown always derives filters from the right-hand build child. Other orientations cannot be
+	// retained by an independently built factor without changing the filter's source semantics.
+	if (factor_child != 1 || !join.filter_pushdown) {
+		return nullptr;
+	}
+	vector<idx_t> remapped_conditions;
+	remapped_conditions.reserve(join.filter_pushdown->join_condition.size());
+	for (auto condition_idx : join.filter_pushdown->join_condition) {
+		if (condition_idx >= join.conditions.size()) {
+			return nullptr;
+		}
+		auto factor_index = GetDirectReferenceIndex(join.conditions[condition_idx].GetRHS(), *join.children[1]);
+		if (!factor_index.IsValid()) {
+			return nullptr;
+		}
+		auto entry = std::find(factor_keys.begin(), factor_keys.end(), factor_index.GetIndex());
+		if (entry == factor_keys.end()) {
+			return nullptr;
+		}
+		remapped_conditions.push_back(NumericCast<idx_t>(entry - factor_keys.begin()));
+	}
+	join.filter_pushdown->join_condition = std::move(remapped_conditions);
+	return std::move(join.filter_pushdown);
+}
+
+static unique_ptr<JoinFilterPushdownInfo> CreateFactorizedDriverRuntimeFilter(LogicalOperator &factor,
+                                                                              const vector<idx_t> &factor_keys,
+                                                                              const vector<LogicalType> &key_types,
+                                                                              ClientContext &context) {
+	if (factor_keys.size() != key_types.size()) {
+		throw InternalException("Factorized GroupJoin runtime-filter key counts differ");
+	}
+	auto bindings = factor.GetColumnBindings();
+	auto result = make_uniq<JoinFilterPushdownInfo>();
+	vector<JoinFilterPushdownColumn> columns;
+	columns.reserve(factor_keys.size());
+	for (idx_t key_idx = 0; key_idx < factor_keys.size(); key_idx++) {
+		if (factor_keys[key_idx] >= bindings.size()) {
+			return nullptr;
+		}
+		BoundColumnRefExpression key_expression(key_types[key_idx], bindings[factor_keys[key_idx]]);
+		JoinFilterPushdownColumn column;
+		if (!JoinFilterPushdownUtil::PushdownJoinFilterExpression(key_expression, column)) {
+			return nullptr;
+		}
+		column.join_filter_idx = key_idx;
+		columns.push_back(std::move(column));
+		result->join_condition.push_back(key_idx);
+	}
+
+	vector<PushdownFilterTarget> targets;
+	JoinFilterPushdownOptimizer::GetPushdownFilterTargets(factor, std::move(columns), targets);
+	for (auto &target : targets) {
+		auto &get = target.get;
+		if (!get.dynamic_filters) {
+			get.dynamic_filters = make_shared_ptr<DynamicTableFilterSet>();
+		}
+		JoinFilterPushdownFilter filter;
+		filter.dynamic_filters = get.dynamic_filters;
+		filter.columns = std::move(target.columns);
+		result->probe_info.push_back(std::move(filter));
+	}
+	if (result->probe_info.empty()) {
+		return nullptr;
+	}
+
+	array<AggregateFunction, 2> functions {MinFunction::GetFunction(), MaxFunction::GetFunction()};
+	FunctionBinder binder(context);
+	for (idx_t key_idx = 0; key_idx < key_types.size(); key_idx++) {
+		for (auto &function : functions) {
+			vector<unique_ptr<Expression>> children;
+			children.push_back(make_uniq<BoundReferenceExpression>(key_types[key_idx], key_idx));
+			auto aggregate =
+			    binder.BindAggregateFunction(function, std::move(children), nullptr, AggregateType::NON_DISTINCT);
+			if (aggregate->GetChildren().size() != 1) {
+				return nullptr;
+			}
+			result->min_max_aggregates.push_back(std::move(aggregate));
+		}
+	}
+	result->build_side_has_filter = false;
+	return result;
+}
+
+static void PlanFactorizedGroupJoin(unique_ptr<LogicalOperator> &root, LogicalAggregate &aggregate,
+                                    FactorizedGroupJoinCandidate candidate, ClientContext &context) {
+	auto cost = EstimateFactorizedGroupJoinCost(aggregate, candidate, context);
+	const auto auto_selected =
+	    Settings::Get<DebugGroupJoinStrategySetting>(context) == GroupJoinStrategy::AUTO && cost.selected;
+	auto &top_join = aggregate.children[0]->Cast<LogicalComparisonJoin>();
+	auto &nested_join = top_join.children[candidate.nested_child]->Cast<LogicalComparisonJoin>();
+	optional_ptr<LogicalOperator> driver;
+	optional_ptr<LogicalOperator> left_factor;
+	optional_ptr<LogicalOperator> right_factor;
+	if (candidate.driver_child == DConstants::INVALID_INDEX) {
+		driver = top_join.children[1 - candidate.nested_child].get();
+		left_factor = nested_join.children[0].get();
+		right_factor = nested_join.children[1].get();
+	} else {
+		driver = nested_join.children[candidate.driver_child].get();
+		left_factor = nested_join.children[1 - candidate.driver_child].get();
+		right_factor = top_join.children[1 - candidate.nested_child].get();
+	}
+	auto driver_rows = driver->EstimateCardinality(context);
+	auto left_rows = left_factor->EstimateCardinality(context);
+	auto right_rows = right_factor->EstimateCardinality(context);
+	auto driver_column_count = driver->GetColumnBindings().size();
+	auto left_column_count = left_factor->GetColumnBindings().size();
+	Value factorized_perfect_min;
+	Value factorized_perfect_max;
+	idx_t factorized_perfect_range = 0;
+	TryGetFactorizedPerfectGroupJoinBounds(aggregate, *driver, candidate, context, factorized_perfect_min,
+	                                       factorized_perfect_max, factorized_perfect_range);
+	if (candidate.group_driver_indices.size() != aggregate.groups.size()) {
+		throw InternalException("Factorized GroupJoin group mapping count does not match");
+	}
+	auto driver_bindings = driver->GetColumnBindings();
+	for (idx_t group_idx = 0; group_idx < aggregate.groups.size(); group_idx++) {
+		auto driver_index = candidate.group_driver_indices[group_idx];
+		if (driver_index >= driver_bindings.size()) {
+			throw InternalException("Factorized GroupJoin driver group index is out of bounds");
+		}
+		auto alias = aggregate.groups[group_idx]->GetAlias();
+		auto type = aggregate.groups[group_idx]->GetReturnType();
+		aggregate.groups[group_idx] =
+		    make_uniq<BoundColumnRefExpression>(std::move(alias), type, driver_bindings[driver_index]);
+	}
+
+	auto result =
+	    make_uniq<LogicalGroupJoin>(aggregate.group_index, aggregate.aggregate_index, std::move(aggregate.expressions));
+	result->groupings_index = aggregate.groupings_index;
+	result->groups = std::move(aggregate.groups);
+	result->grouping_sets = std::move(aggregate.grouping_sets);
+	result->grouping_functions = std::move(aggregate.grouping_functions);
+	result->group_stats = std::move(aggregate.group_stats);
+	result->distinct_validity = aggregate.distinct_validity;
+	result->types = std::move(aggregate.types);
+	result->estimated_cardinality = aggregate.estimated_cardinality;
+	result->has_estimated_cardinality = aggregate.has_estimated_cardinality;
+	result->implementation = GroupJoinImplementation::FACTORIZED_HASH;
+	result->unique_owner = candidate.unique_driver;
+	result->routed = candidate.routed;
+	result->factorized_driver_key_indices = std::move(candidate.driver_key_indices);
+	result->factorized_left_key_indices = std::move(candidate.left_key_indices);
+	result->factorized_right_key_indices = std::move(candidate.right_key_indices);
+	result->factorized_aggregate_sources = std::move(candidate.aggregate_sources);
+	result->factorized_driver_column_count = driver_column_count;
+	result->factorized_left_column_count = left_column_count;
+	result->factorized_preserve_left = candidate.preserve_left;
+	result->factorized_preserve_right = candidate.preserve_right;
+	result->factorized_semi_left = candidate.semi_left;
+	result->factorized_semi_right = candidate.semi_right;
+	auto configured_execution = Settings::Get<DebugGroupJoinExecutionSetting>(context);
+	if (Settings::Get<DebugForceExternalSetting>(context) || configured_execution == GroupJoinExecutionMode::EXTERNAL) {
+		result->execution_mode = GroupJoinExecutionMode::EXTERNAL;
+	}
+	if (candidate.unique_driver && !candidate.routed && result->execution_mode != GroupJoinExecutionMode::EXTERNAL) {
+		vector<LogicalType> driver_key_types;
+		driver_key_types.reserve(result->factorized_driver_key_indices.size());
+		for (auto key_idx : result->factorized_driver_key_indices) {
+			if (key_idx >= driver->types.size()) {
+				throw InternalException("Factorized GroupJoin driver filter key is out of bounds");
+			}
+			driver_key_types.push_back(driver->types[key_idx]);
+		}
+		result->factorized_left_driver_filter_pushdown = CreateFactorizedDriverRuntimeFilter(
+		    *left_factor, result->factorized_left_key_indices, driver_key_types, context);
+		result->factorized_right_driver_filter_pushdown = CreateFactorizedDriverRuntimeFilter(
+		    *right_factor, result->factorized_right_key_indices, driver_key_types, context);
+	}
+	result->estimated_owner_rows = driver_rows;
+	result->estimated_left_factor_rows = left_rows;
+	result->estimated_right_factor_rows = right_rows;
+	result->estimated_factorized_join_rows = cost.join_rows;
+	result->estimated_factorized_matched_drivers = cost.matched_drivers;
+	result->estimated_left_factor_scan_rows = cost.left_scan_rows;
+	result->estimated_right_factor_scan_rows = cost.right_scan_rows;
+	result->factorized_build_cost = cost.build_cost;
+	result->factorized_filter_cost = cost.filter_cost;
+	result->factorized_probe_cost = cost.probe_cost;
+	result->factorized_scan_cost = cost.scan_cost;
+	result->factorized_cache_cost = cost.cache_cost;
+	result->factorized_eager_work_cost = cost.eager_work_cost;
+	result->factorized_routing_cost = cost.routing_cost;
+	result->factorized_spill_cost = cost.spill_cost;
+	result->factorized_cost = cost.factorized_cost;
+	result->factorized_best_existing_cost = cost.best_existing_cost;
+	result->factorized_cost_reliable = cost.reliable;
+	result->factorized_auto_selected = auto_selected;
+	if (candidate.driver_child != DConstants::INVALID_INDEX) {
+		result->factorized_left_filter_pushdown =
+		    TakeFactorizedRuntimeFilter(nested_join, 1 - candidate.driver_child, result->factorized_left_key_indices);
+		result->factorized_right_filter_pushdown =
+		    TakeFactorizedRuntimeFilter(top_join, 1 - candidate.nested_child, result->factorized_right_key_indices);
+	}
+	result->perfect_min = std::move(factorized_perfect_min);
+	result->perfect_max = std::move(factorized_perfect_max);
+	result->perfect_range = factorized_perfect_range;
+	if (candidate.driver_child == DConstants::INVALID_INDEX) {
+		result->children.push_back(std::move(top_join.children[1 - candidate.nested_child]));
+		result->children.push_back(std::move(nested_join.children[0]));
+		result->children.push_back(std::move(nested_join.children[1]));
+	} else {
+		result->children.push_back(std::move(nested_join.children[candidate.driver_child]));
+		result->children.push_back(std::move(nested_join.children[1 - candidate.driver_child]));
+		result->children.push_back(std::move(top_join.children[1 - candidate.nested_child]));
+	}
+	root = std::move(result);
+}
+
 void PlanHashGroupJoins(unique_ptr<LogicalOperator> &root, ClientContext &context) {
 	for (auto &child : root->children) {
 		PlanHashGroupJoins(child, context);
 	}
-	if (root->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY || root->children.size() != 1 ||
-	    root->children[0]->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+	if (root->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY || root->children.size() != 1) {
 		return;
 	}
 	auto &aggregate = root->Cast<LogicalAggregate>();
+	if (auto factorized = TrySelectFactorizedGroupJoinCandidate(aggregate, context)) {
+		ApplyFactorizedProjectionInlining(aggregate);
+		PlanFactorizedGroupJoin(root, aggregate, std::move(*factorized), context);
+		return;
+	}
+	if (root->children[0]->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		return;
+	}
 	auto &join = root->children[0]->Cast<LogicalComparisonJoin>();
 	auto candidate = TryGetPlannedHashGroupJoinCandidate(aggregate, join, context,
 	                                                     HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER);
@@ -998,7 +2112,7 @@ optional<StaticHashGroupJoinCandidate> TryGetStaticHashGroupJoinCandidate(Logica
                                                                           HashGroupJoinCandidateMode mode) {
 	auto strategy = Settings::Get<DebugGroupJoinStrategySetting>(context);
 	if (strategy == GroupJoinStrategy::INDEX || strategy == GroupJoinStrategy::PERFECT ||
-	    strategy == GroupJoinStrategy::EAGER) {
+	    strategy == GroupJoinStrategy::EAGER || strategy == GroupJoinStrategy::FACTORIZED) {
 		return nullopt;
 	}
 	if (join.join_type != JoinType::LEFT || join.children.size() != 2 || join.conditions.empty() ||

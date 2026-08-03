@@ -54,6 +54,8 @@ enum class AggregateHandling : uint8_t;
 
 enum class AggregateOrderDependent : uint8_t;
 
+enum class AggregateRepeatCombine : uint8_t;
+
 enum class AggregateStateExportMode : uint8_t;
 
 enum class AggregateType : uint8_t;
@@ -231,6 +233,10 @@ enum class ExtraDropInfoType : uint8_t;
 enum class ExtraPersistentColumnDataType : uint8_t;
 
 enum class ExtraTypeInfoType : uint8_t;
+
+enum class FactorizedAggregateSource : uint8_t;
+
+enum class FactorizedGroupJoinBranchMode : uint8_t;
 
 enum class FileBufferType : uint8_t;
 
@@ -659,6 +665,9 @@ template<>
 const char* EnumUtil::ToChars<AggregateOrderDependent>(AggregateOrderDependent value);
 
 template<>
+const char* EnumUtil::ToChars<AggregateRepeatCombine>(AggregateRepeatCombine value);
+
+template<>
 const char* EnumUtil::ToChars<AggregateStateExportMode>(AggregateStateExportMode value);
 
 template<>
@@ -924,6 +933,12 @@ const char* EnumUtil::ToChars<ExtraPersistentColumnDataType>(ExtraPersistentColu
 
 template<>
 const char* EnumUtil::ToChars<ExtraTypeInfoType>(ExtraTypeInfoType value);
+
+template<>
+const char* EnumUtil::ToChars<FactorizedAggregateSource>(FactorizedAggregateSource value);
+
+template<>
+const char* EnumUtil::ToChars<FactorizedGroupJoinBranchMode>(FactorizedGroupJoinBranchMode value);
 
 template<>
 const char* EnumUtil::ToChars<FileBufferType>(FileBufferType value);
@@ -1548,6 +1563,9 @@ template<>
 AggregateOrderDependent EnumUtil::FromString<AggregateOrderDependent>(const char *value);
 
 template<>
+AggregateRepeatCombine EnumUtil::FromString<AggregateRepeatCombine>(const char *value);
+
+template<>
 AggregateStateExportMode EnumUtil::FromString<AggregateStateExportMode>(const char *value);
 
 template<>
@@ -1813,6 +1831,12 @@ ExtraPersistentColumnDataType EnumUtil::FromString<ExtraPersistentColumnDataType
 
 template<>
 ExtraTypeInfoType EnumUtil::FromString<ExtraTypeInfoType>(const char *value);
+
+template<>
+FactorizedAggregateSource EnumUtil::FromString<FactorizedAggregateSource>(const char *value);
+
+template<>
+FactorizedGroupJoinBranchMode EnumUtil::FromString<FactorizedGroupJoinBranchMode>(const char *value);
 
 template<>
 FileBufferType EnumUtil::FromString<FileBufferType>(const char *value);

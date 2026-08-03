@@ -353,7 +353,10 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 		// optimize children
 		RelationStats child_stats;
 		auto child_optimizer = optimizer.CreateChildOptimizer();
-		auto group_join_context = GetHashGroupJoinOrderContext(op->Cast<LogicalAggregate>(), context);
+		auto group_join_context = GetFactorizedGroupJoinOrderContext(op->Cast<LogicalAggregate>(), context);
+		if (!group_join_context) {
+			group_join_context = GetHashGroupJoinOrderContext(op->Cast<LogicalAggregate>(), context);
+		}
 		if (group_join_context) {
 			child_optimizer.SetGroupJoinContext(std::move(*group_join_context));
 		}

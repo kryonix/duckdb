@@ -240,6 +240,9 @@ public:
 	}
 
 	bool ShouldSkip(LogicalAggregate &aggr) const override {
+		if (HasPotentialFactorizedGroupJoinCandidate(aggr, optimizer.context)) {
+			return true;
+		}
 		if (!ForceHashGroupJoinPlanning(optimizer.context) || aggr.children.size() != 1) {
 			return false;
 		}
