@@ -16,7 +16,12 @@
         "test/sql/copy/parquet/parquet_glob_cache.test",
         "test/sql/copy/parquet/parquet_expression_filter_pruning.test",
         "test/sql/copy/parquet/parquet_stats.test",
+        "test/sql/aggregate/group/test_factorized_group_join.test",
+        "test/sql/aggregate/group/test_factorized_group_join_external.test_slow",
+        "test/sql/aggregate/group/test_hash_group_join.test",
+        "test/sql/optimizer/test_aggregate_numeric_statistics.test",
         "test/sql/optimizer/expression/test_common_aggregate.test",
+        "test/sql/subquery/scalar/test_reduced_correlation_domain.test",
         "test/sql/pragma/profiling/test_custom_profiling_row_group_metrics_local_storage.test"
       ]
     },

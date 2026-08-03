@@ -1,0 +1,88 @@
+# name: test/sql/aggregate/group/test_factorized_group_join_external.test_slow
+# description: Recursive external factorized GroupJoin repartitioning
+# group: [group]
+
+statement ok
+SET threads = 4
+
+statement ok
+SET memory_limit = '32MB'
+
+statement ok
+SET preserve_insertion_order = false
+
+statement ok
+SET debug_group_join_strategy = 'factorized'
+
+statement ok
+SET debug_group_join_execution = 'external'
+
+statement ok
+CREATE TABLE driver AS SELECT i::INTEGER AS k, i::BIGINT AS payload FROM range(100000) t(i)
+
+statement ok
+CREATE UNIQUE INDEX driver_key ON driver(k)
+
+statement ok
+CREATE TABLE left_factor AS
+SELECT i::INTEGER AS k, j::BIGINT AS x FROM range(100000) t(i), range(56) u(j)
+
+statement ok
+CREATE TABLE right_factor AS
+SELECT i::INTEGER AS k, j::BIGINT AS y FROM range(100000) t(i), range(56) u(j)
+
+query II
+SELECT count(*), sum(n) FROM (
+	SELECT r.k, count(*) AS n, sum(r.payload), sum(s.x), sum(t.y)
+	FROM driver r JOIN left_factor s USING (k) JOIN right_factor t USING (k)
+	GROUP BY r.k
+)
+----
+100000	313600000
+
+query II
+EXPLAIN ANALYZE SELECT r.k, count(*)
+FROM driver r JOIN left_factor s USING (k) JOIN right_factor t USING (k)
+GROUP BY r.k
+----
+analyzed_plan	<REGEX>:(?s).*common-radix external partitions.*External Repartitions: [1-9][0-9]*.*External Maximum Radix Bits: ([5-9]|[1-9][0-9]+).*
+
+# A single unsplittable key keeps its raw run buffer-managed; the ordered state promotes before final sorting.
+statement ok
+CREATE TABLE hot_driver(k INTEGER PRIMARY KEY)
+
+statement ok
+INSERT INTO hot_driver VALUES (1)
+
+statement ok
+CREATE TABLE hot_left AS SELECT 1::INTEGER AS k, i::BIGINT AS x FROM range(300000) t(i)
+
+statement ok
+CREATE TABLE hot_right(k INTEGER, y INTEGER)
+
+statement ok
+INSERT INTO hot_right VALUES (1, 1)
+
+query III
+SELECT list_count(xs), list_first(xs), list_last(xs) FROM (
+	SELECT r.k, list(s.x ORDER BY s.x) AS xs
+	FROM hot_driver r JOIN hot_left s USING (k) JOIN hot_right t USING (k)
+	GROUP BY r.k
+)
+----
+300000	0	299999
+
+statement ok
+SET max_execution_time = 10
+
+statement error
+SELECT sum(list_count(n)) FROM (
+	SELECT r.k, list(s.x ORDER BY s.x) AS n
+	FROM driver r JOIN left_factor s USING (k) JOIN right_factor t USING (k)
+	GROUP BY r.k
+)
+----
+Query exceeded maximum execution time
+
+statement ok
+RESET max_execution_time

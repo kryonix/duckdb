@@ -13,6 +13,7 @@
         "test/sql/types/list/list_stats.test",
         "test/sql/types/nested/array/array_statistics.test",
         "test/sql/vacuum/test_analyze.test",
+        "test/sql/vacuum/test_analyze_numeric_moments.test",
         "test/sql/function/date/date_part_stats.test",
         "test/sql/function/date/test_date_trunc.test",
         "test/sql/function/time/test_extract_stats.test",

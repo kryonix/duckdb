@@ -8,6 +8,13 @@
   "inherit_skip_tests": "test/configs/force_storage_restart.json",
   "skip_tests": [
     {
+      "reason": "ANALYZE statistics are checkpointed but not written to the WAL, and this config deliberately disables checkpoint-on-shutdown.",
+      "paths": [
+        "test/sql/optimizer/test_aggregate_numeric_statistics.test",
+        "test/sql/vacuum/test_analyze_numeric_moments.test"
+      ]
+    },
+    {
       "reason": "Loading from disk is necessary to trigger expected OOM.",
       "paths": [
         "test/sql/storage/constraints/foreignkey/foreign_key_persistent_memory_limit.test"

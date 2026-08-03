@@ -1,0 +1,39 @@
+# name: test/sql/aggregate/group/test_factorized_group_join.test_slow
+# description: Factorized GroupJoin incrementally scans a million-row hot factor
+# group: [group]
+
+statement ok
+SET threads = 4
+
+statement ok
+SET debug_group_join_strategy = 'factorized'
+
+statement ok
+CREATE TABLE hot_driver(k BIGINT PRIMARY KEY)
+
+statement ok
+CREATE TABLE hot_left(k BIGINT, x BIGINT)
+
+statement ok
+CREATE TABLE hot_right(k BIGINT, y BIGINT)
+
+statement ok
+INSERT INTO hot_driver VALUES (1)
+
+statement ok
+INSERT INTO hot_left SELECT 1, i FROM range(1000000) t(i)
+
+statement ok
+INSERT INTO hot_right VALUES (1, 1), (1, 2)
+
+query III
+SELECT count(*), sum(s.x), sum(t.y)
+FROM hot_driver r
+JOIN hot_left s USING (k)
+JOIN hot_right t USING (k)
+GROUP BY r.k
+----
+2000000	999999000000	3000000
+
+statement ok
+RESET debug_group_join_strategy

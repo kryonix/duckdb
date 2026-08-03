@@ -5,6 +5,12 @@
   "inherit_skip_tests": "test/configs/stats_dependent_tests.json",
   "skip_tests": [
     {
+      "reason": "This test protects an optimizer transformation and its unordered array aggregate has no stable physical input order without the optimizer.",
+      "paths": [
+        "test/optimizer/joins/delim_left_join_pushdown.test"
+      ]
+    },
+    {
       "reason": "Requires the join order optimizer to enforce debug_force_no_cross_product.",
       "paths": [
         "test/optimizer/joins/required_cross_product_activation.test"

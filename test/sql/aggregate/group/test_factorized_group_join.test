@@ -1,0 +1,1162 @@
+# name: test/sql/aggregate/group/test_factorized_group_join.test
+# description: Factorized two-branch GroupJoin correctness, eligibility, and fallback
+# group: [group]
+
+statement ok
+SET threads = 1
+
+statement ok
+SET debug_group_join_strategy = 'disabled'
+
+statement ok
+CREATE TABLE fg_driver(k INTEGER PRIMARY KEY, payload INTEGER)
+
+statement ok
+CREATE TABLE fg_left(k INTEGER, x INTEGER, d DECIMAL(18, 2), label VARCHAR, flag BOOLEAN)
+
+statement ok
+CREATE TABLE fg_right(k INTEGER, y INTEGER, d DECIMAL(18, 2), label VARCHAR, flag BOOLEAN)
+
+statement ok
+INSERT INTO fg_driver VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)
+
+statement ok
+INSERT INTO fg_left VALUES
+	(1, 2, 1.25, 'b', true), (1, NULL, NULL, NULL, NULL), (1, 3, 2.50, 'a', false),
+	(2, 5, 4.00, 'c', true), (3, 9, 8.00, 'z', false),
+	(NULL, 100, 100.00, 'null-key', true), (99, 200, 200.00, 'unmatched', true)
+
+statement ok
+INSERT INTO fg_right VALUES
+	(1, 7, 3.00, 'y', true), (1, 11, NULL, 'x', false),
+	(2, NULL, 5.50, NULL, NULL), (2, 17, 6.50, 'w', true),
+	(4, 23, 9.00, 'v', false),
+	(NULL, 300, 300.00, 'null-key', true), (98, 400, 400.00, 'unmatched', true)
+
+statement ok
+CREATE TEMP TABLE fg_baseline AS
+SELECT r.k,
+	count(*) AS pair_count,
+	count(s.x) AS sx_count,
+	count(t.y) AS ty_count,
+	sum(r.payload) AS driver_sum,
+	sum(s.x) AS sx_sum,
+	sum(t.y) AS ty_sum,
+	avg(s.x) AS sx_avg,
+	avg(t.y) AS ty_avg,
+	min(s.x) AS sx_min,
+	max(t.y) AS ty_max,
+	sum(s.d) AS sd_sum,
+	sum(t.d) AS td_sum,
+	min(s.label) AS left_label_min,
+	max(t.label) AS right_label_max,
+	bool_and(s.flag) AS left_all,
+	bool_or(t.flag) AS right_any,
+	sum(1) AS constant_sum
+FROM fg_driver r
+JOIN fg_left s ON r.k = s.k
+JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+
+statement ok
+SET debug_group_join_strategy = 'factorized'
+
+statement ok
+PRAGMA explain_output = 'physical_only'
+
+query II
+EXPLAIN SELECT r.k, count(*), sum(r.payload), sum(s.x), sum(t.y)
+FROM fg_driver r
+JOIN fg_left s ON r.k = s.k
+JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*Driver: UNIQUE.*Lookup: DIRECTORY.*
+
+query II
+EXPLAIN ANALYZE SELECT r.k, count(*), sum(r.payload), sum(s.x), sum(t.y)
+FROM fg_driver r
+JOIN fg_left s ON r.k = s.k
+JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+analyzed_plan	<REGEX>:(?s).*driver-first target \+ task-local dense factor states.*Runtime Filters:.*driver->left=YES, driver->right=YES.*Dynamic Filters:.*driver_key_0.*
+
+# For k=1, m=3 and n=2. For k=2, m=1 and n=2.
+query IIIIII rowsort
+SELECT r.k, count(*), sum(r.payload), sum(s.x), sum(t.y), sum(1)
+FROM fg_driver r
+JOIN fg_left s ON r.k = s.k
+JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+1	6	60	10	54	6
+2	2	40	10	17	2
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM fg_baseline EXCEPT ALL
+	 SELECT r.k, count(*), count(s.x), count(t.y), sum(r.payload), sum(s.x), sum(t.y), avg(s.x), avg(t.y),
+	        min(s.x), max(t.y), sum(s.d), sum(t.d), min(s.label), max(t.label), bool_and(s.flag), bool_or(t.flag),
+	        sum(1)
+	 FROM fg_driver r JOIN fg_left s ON r.k = s.k JOIN fg_right t ON r.k = t.k GROUP BY r.k)
+	UNION ALL
+	(SELECT r.k, count(*), count(s.x), count(t.y), sum(r.payload), sum(s.x), sum(t.y), avg(s.x), avg(t.y),
+	        min(s.x), max(t.y), sum(s.d), sum(t.d), min(s.label), max(t.label), bool_and(s.flag), bool_or(t.flag),
+	        sum(1)
+	 FROM fg_driver r JOIN fg_left s ON r.k = s.k JOIN fg_right t ON r.k = t.k GROUP BY r.k
+	 EXCEPT ALL SELECT * FROM fg_baseline)
+) differences
+----
+0
+
+# Source-local FILTER predicates are evaluated before the opposite factor multiplicity is applied.
+query II
+EXPLAIN SELECT r.k,
+	sum(s.x) FILTER (WHERE s.flag),
+	count(t.y) FILTER (WHERE t.flag),
+	sum(r.payload) FILTER (WHERE r.payload > 10),
+	count(*) FILTER (WHERE s.x > 2)
+FROM fg_driver r
+JOIN fg_left s ON r.k = s.k
+JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*driver-first target \+ task-local dense factor states.*Estimated Costs:.*Decision:.*Runtime Filters:.*driver->left=YES, driver->right=YES.*
+
+query IIIII rowsort
+SELECT r.k,
+	sum(s.x) FILTER (WHERE s.flag),
+	count(t.y) FILTER (WHERE t.flag),
+	sum(r.payload) FILTER (WHERE r.payload > 10),
+	count(*) FILTER (WHERE s.x > 2)
+FROM fg_driver r
+JOIN fg_left s ON r.k = s.k
+JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+1	4	3	NULL	2
+2	10	1	40	2
+
+# DISTINCT is applied within the source range and is not repeated for opposite-branch duplicates.
+query II
+EXPLAIN SELECT r.k, count(DISTINCT s.x), count(DISTINCT t.y), sum(DISTINCT s.x)
+FROM fg_driver r JOIN fg_left s ON r.k = s.k JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*
+
+query IIIIII rowsort
+SELECT r.k,
+	count(DISTINCT s.x),
+	count(DISTINCT t.y),
+	sum(DISTINCT s.x),
+	count(DISTINCT r.payload),
+	count(DISTINCT 1)
+FROM fg_driver r JOIN fg_left s ON r.k = s.k JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+1	2	2	5	1	1
+2	1	1	5	1	1
+
+query III rowsort
+SELECT r.k,
+	count(DISTINCT s.x) FILTER (WHERE s.flag),
+	count(DISTINCT t.y) FILTER (WHERE t.flag)
+FROM fg_driver r JOIN fg_left s ON r.k = s.k JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+1	1	1
+2	1	1
+
+# Ordered aggregates buffer source-local rows and repeat only non-DISTINCT states by the opposite fan-out.
+statement ok
+SET debug_group_join_strategy = 'disabled'
+
+statement ok
+SET disabled_optimizers = 'partial_aggregate_pushdown,top_n'
+
+statement ok
+CREATE TEMP TABLE fg_ordered_baseline AS
+SELECT r.k,
+	list(s.x ORDER BY s.x) AS sx_list,
+	list(t.y ORDER BY t.y DESC) AS ty_list,
+	first(s.x ORDER BY s.x DESC) AS sx_first,
+	string_agg(s.label, ',' ORDER BY s.label DESC) AS labels,
+	list(DISTINCT s.x ORDER BY s.x) AS sx_distinct
+FROM fg_driver r JOIN fg_left s ON r.k = s.k JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+
+statement ok
+SET debug_group_join_strategy = 'factorized'
+
+query II
+EXPLAIN SELECT r.k, list(s.x ORDER BY s.x), list(t.y ORDER BY t.y DESC)
+FROM fg_driver r JOIN fg_left s ON r.k = s.k JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM fg_ordered_baseline EXCEPT ALL
+	 SELECT r.k, list(s.x ORDER BY s.x), list(t.y ORDER BY t.y DESC), first(s.x ORDER BY s.x DESC),
+	        string_agg(s.label, ',' ORDER BY s.label DESC), list(DISTINCT s.x ORDER BY s.x)
+	 FROM fg_driver r JOIN fg_left s ON r.k = s.k JOIN fg_right t ON r.k = t.k GROUP BY r.k)
+	UNION ALL
+	(SELECT r.k, list(s.x ORDER BY s.x), list(t.y ORDER BY t.y DESC), first(s.x ORDER BY s.x DESC),
+	        string_agg(s.label, ',' ORDER BY s.label DESC), list(DISTINCT s.x ORDER BY s.x)
+	 FROM fg_driver r JOIN fg_left s ON r.k = s.k JOIN fg_right t ON r.k = t.k GROUP BY r.k
+	 EXCEPT ALL SELECT * FROM fg_ordered_baseline)
+) differences
+----
+0
+
+# Destructive aggregate-state import must still honor an explicit repeat multiplicity.
+query T
+SELECT finalize(combine_aggr(state, 3))::VARCHAR
+FROM (SELECT list(i) EXPORT_STATE AS state FROM range(3) t(i))
+----
+[0, 1, 2, 0, 1, 2, 0, 1, 2]
+
+statement ok
+SET disabled_optimizers = 'top_n'
+
+# Each driver-factor edge independently supports driver-preserving null extension.
+query II
+EXPLAIN SELECT r.k, count(*), sum(s.x), sum(t.y)
+FROM fg_driver r LEFT JOIN fg_left s ON r.k = s.k JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*driver-first target \+ task-local dense factor states.*
+
+query IIII rowsort
+SELECT r.k, count(*), sum(s.x), sum(t.y)
+FROM fg_driver r LEFT JOIN fg_left s ON r.k = s.k JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+1	6	10	54
+2	2	10	17
+4	1	NULL	23
+
+query IIII rowsort
+SELECT r.k, count(*), sum(s.x), sum(t.y)
+FROM fg_driver r JOIN fg_left s ON r.k = s.k LEFT JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+1	6	10	54
+2	2	10	17
+3	1	9	NULL
+
+query IIII rowsort
+SELECT r.k, count(*), sum(s.x), sum(t.y)
+FROM fg_driver r LEFT JOIN fg_left s ON r.k = s.k LEFT JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+1	6	10	54
+2	2	10	17
+3	1	9	NULL
+4	1	NULL	23
+5	1	NULL	NULL
+
+# Missing preserved factors execute one physical NULL row, including source-local expressions and filters.
+query IIIII rowsort
+SELECT r.k,
+	count(*) FILTER (WHERE s.x IS NULL),
+	count(s.x),
+	sum(coalesce(s.x, 42)),
+	count(*) FILTER (WHERE t.y IS NULL)
+FROM fg_driver r LEFT JOIN fg_left s ON r.k = s.k LEFT JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+1	2	4	94	0
+2	0	2	10	1
+3	0	1	9	1
+4	1	0	42	0
+5	1	0	42	1
+
+query III rowsort
+SELECT r.k, count(DISTINCT coalesce(s.x, 42)), count(DISTINCT s.x)
+FROM fg_driver r LEFT JOIN fg_left s ON r.k = s.k LEFT JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+1	3	2
+2	1	1
+3	1	1
+4	1	0
+5	1	0
+
+# RIGHT syntax is normalized only when it preserves the driver side.
+query IIII rowsort
+SELECT r.k, count(*), sum(s.x), sum(t.y)
+FROM fg_left s RIGHT JOIN fg_driver r ON s.k = r.k
+LEFT JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+1	6	10	54
+2	2	10	17
+3	1	9	NULL
+4	1	NULL	23
+5	1	NULL	NULL
+
+# SEMI edges use factor existence rather than physical factor multiplicity.
+query II
+EXPLAIN SELECT r.k, count(*), sum(r.payload), sum(t.y)
+FROM fg_driver r SEMI JOIN fg_left s ON r.k = s.k
+JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*Left Edge: SEMI.*
+
+query IIII rowsort
+SELECT r.k, count(*), sum(r.payload), sum(t.y)
+FROM fg_driver r SEMI JOIN fg_left s ON r.k = s.k
+JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+1	2	20	18
+2	2	40	17
+
+query IIII rowsort
+SELECT r.k, count(*), sum(r.payload), sum(s.x)
+FROM (fg_driver r JOIN fg_left s ON r.k = s.k)
+SEMI JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+1	3	30	5
+2	1	20	5
+
+query III rowsort
+SELECT r.k, count(*), sum(r.payload)
+FROM (fg_driver r SEMI JOIN fg_left s ON r.k = s.k)
+SEMI JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+1	1	10
+2	1	20
+
+# Empty inputs and disjoint factors preserve INNER elimination, including the zero-row factor finalization path.
+statement ok
+CREATE TABLE fg_empty_driver(k INTEGER PRIMARY KEY)
+
+statement ok
+CREATE TABLE fg_empty_left(k INTEGER, x INTEGER)
+
+statement ok
+CREATE TABLE fg_empty_right(k INTEGER, y INTEGER)
+
+query II
+EXPLAIN SELECT r.k, count(*)
+FROM fg_empty_driver r JOIN fg_empty_left s USING (k) JOIN fg_empty_right t USING (k)
+GROUP BY r.k
+----
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*driver-first target \+ task-local dense factor states.*
+
+query I
+SELECT count(*) FROM (
+	SELECT r.k, count(*)
+	FROM fg_empty_driver r JOIN fg_empty_left s USING (k) JOIN fg_empty_right t USING (k)
+	GROUP BY r.k
+)
+----
+0
+
+statement ok
+INSERT INTO fg_empty_driver VALUES (1), (2)
+
+statement ok
+INSERT INTO fg_empty_left VALUES (1, 10), (3, 30)
+
+statement ok
+INSERT INTO fg_empty_right VALUES (2, 20), (3, 30)
+
+query I
+SELECT count(*) FROM (
+	SELECT r.k, count(*)
+	FROM fg_empty_driver r JOIN fg_empty_left s USING (k) JOIN fg_empty_right t USING (k)
+	GROUP BY r.k
+)
+----
+0
+
+# Reversed join syntax and join-enumerator orientation normalize to the same three-child plan.
+query II
+EXPLAIN SELECT r.k, count(*), sum(s.x), sum(t.y)
+FROM fg_right t
+JOIN (fg_left s JOIN fg_driver r ON s.k = r.k) ON t.k = r.k
+GROUP BY r.k
+----
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*driver-first target \+ task-local dense factor states.*
+
+query IIII rowsort
+SELECT r.k, count(*), sum(s.x), sum(t.y)
+FROM fg_right t
+JOIN (fg_left s JOIN fg_driver r ON s.k = r.k) ON t.k = r.k
+GROUP BY r.k
+----
+1	6	10	54
+2	2	10	17
+
+# Logical serialization records normalized branch roles and provenance, never runtime factor pointers.
+statement ok
+SET debug_verify_serializer = true
+
+query IIII rowsort
+SELECT r.k, count(*), sum(s.x), sum(t.y)
+FROM fg_driver r
+JOIN fg_left s ON r.k = s.k
+JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+1	6	10	54
+2	2	10	17
+
+query III rowsort
+SELECT r.k, count(*), sum(r.payload)
+FROM (fg_driver r SEMI JOIN fg_left s ON r.k = s.k)
+SEMI JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+1	1	10
+2	1	20
+
+statement ok
+SET debug_verify_serializer = false
+
+# Composite keys, projections, filters, and deterministic branch expressions retain safe binding maps.
+statement ok
+CREATE TABLE fg_comp_driver(a INTEGER, b VARCHAR, payload INTEGER, PRIMARY KEY(a, b))
+
+statement ok
+CREATE TABLE fg_comp_left(a INTEGER, b VARCHAR, x INTEGER)
+
+statement ok
+CREATE TABLE fg_comp_right(a INTEGER, b VARCHAR, y INTEGER)
+
+statement ok
+INSERT INTO fg_comp_driver VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', -1)
+
+statement ok
+INSERT INTO fg_comp_left VALUES (1, 'one', 2), (1, 'one', 3), (2, 'two', NULL), (2, 'two', 7),
+	(3, 'three', 9), (NULL, 'one', 100)
+
+statement ok
+INSERT INTO fg_comp_right VALUES (1, 'one', 5), (1, 'one', 11), (2, 'two', 13), (3, 'three', 17),
+	(3, 'three', 19), (1, NULL, 200)
+
+query II
+EXPLAIN SELECT r.a, r.b, count(*), sum(s.x2 + 1), sum(t.y2 - 1)
+FROM (SELECT a, b, payload FROM fg_comp_driver WHERE payload > 0) r
+JOIN (SELECT a, b, x * 2 AS x2 FROM fg_comp_left WHERE x IS NOT NULL) s USING (a, b)
+JOIN (SELECT a, b, y * 3 AS y2 FROM fg_comp_right WHERE y > 0) t USING (a, b)
+GROUP BY r.a, r.b
+----
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*driver-first target \+ task-local dense factor states.*
+
+query ITIII rowsort
+SELECT r.a, r.b, count(*), sum(s.x2 + 1), sum(t.y2 - 1)
+FROM (SELECT a, b, payload FROM fg_comp_driver WHERE payload > 0) r
+JOIN (SELECT a, b, x * 2 AS x2 FROM fg_comp_left WHERE x IS NOT NULL) s USING (a, b)
+JOIN (SELECT a, b, y * 3 AS y2 FROM fg_comp_right WHERE y > 0) t USING (a, b)
+GROUP BY r.a, r.b
+----
+1	one	4	24	92
+2	two	1	15	38
+
+# A deterministic projection between the joins and aggregate is inlined before source classification.
+query II
+EXPLAIN SELECT q.k, sum(q.x2), sum(q.y2)
+FROM (
+	SELECT r.k, s.x + 1 AS x2, t.y - 1 AS y2
+	FROM fg_driver r JOIN fg_left s USING (k) JOIN fg_right t USING (k)
+) q
+GROUP BY q.k
+----
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*driver-first target \+ task-local dense factor states.*
+
+query III rowsort
+SELECT q.k, sum(q.x2), sum(q.y2)
+FROM (
+	SELECT r.k, s.x + 1 AS x2, t.y - 1 AS y2
+	FROM fg_driver r JOIN fg_left s USING (k) JOIN fg_right t USING (k)
+) q
+GROUP BY q.k
+----
+1	14	48
+2	12	16
+
+# A factor longer than one vector is resumed without restarting its duplicate chain.
+statement ok
+CREATE TABLE fg_hot_driver(k BIGINT PRIMARY KEY)
+
+statement ok
+CREATE TABLE fg_hot_left(k BIGINT, x BIGINT)
+
+statement ok
+CREATE TABLE fg_hot_right(k BIGINT, y BIGINT)
+
+statement ok
+INSERT INTO fg_hot_driver VALUES (1)
+
+statement ok
+INSERT INTO fg_hot_left SELECT 1, i FROM range(4097) t(i)
+
+statement ok
+INSERT INTO fg_hot_right VALUES (1, 1), (1, 2), (1, 3)
+
+query III
+SELECT count(*), sum(s.x), sum(t.y)
+FROM fg_hot_driver r JOIN fg_hot_left s USING (k) JOIN fg_hot_right t USING (k)
+GROUP BY r.k
+----
+12291	25171968	24582
+
+# Variable-sized states are reclaimed between chunks after finalized strings have been copied to the output.
+statement ok
+CREATE TABLE fg_string_driver(k BIGINT PRIMARY KEY)
+
+statement ok
+CREATE TABLE fg_string_left(k BIGINT, label VARCHAR)
+
+statement ok
+CREATE TABLE fg_string_right(k BIGINT, label VARCHAR)
+
+statement ok
+INSERT INTO fg_string_driver SELECT i FROM range(5000) t(i)
+
+statement ok
+INSERT INTO fg_string_left SELECT i, repeat('l', 256) FROM range(5000) t(i)
+
+statement ok
+INSERT INTO fg_string_right SELECT i, repeat('r', 256) FROM range(5000) t(i)
+
+query III
+SELECT count(*), sum(length(left_min)), sum(length(right_max))
+FROM (
+	SELECT r.k, min(s.label) AS left_min, max(t.label) AS right_max
+	FROM fg_string_driver r
+	JOIN fg_string_left s USING (k)
+	JOIN fg_string_right t USING (k)
+	GROUP BY r.k
+)
+----
+5000	1280000	1280000
+
+# Multiple input chunks and parallel driver tasks own disjoint result states.
+statement ok
+SET threads = 4
+
+statement ok
+CREATE TABLE fg_parallel_driver(k BIGINT PRIMARY KEY, payload BIGINT)
+
+statement ok
+CREATE TABLE fg_parallel_left(k BIGINT, x BIGINT)
+
+statement ok
+CREATE TABLE fg_parallel_right(k BIGINT, y BIGINT)
+
+statement ok
+INSERT INTO fg_parallel_driver SELECT i, i * 2 FROM range(5000) t(i)
+
+statement ok
+INSERT INTO fg_parallel_left SELECT i, j FROM range(5000) t(i), range(3) u(j)
+
+statement ok
+INSERT INTO fg_parallel_right SELECT i, j FROM range(5000) t(i), range(5) u(j)
+
+statement ok
+SET debug_group_join_strategy = 'disabled'
+
+statement ok
+CREATE TEMP TABLE fg_parallel_baseline AS
+SELECT r.k, count(*) AS n, sum(r.payload) AS rp, sum(s.x) AS sx, sum(t.y) AS ty
+FROM fg_parallel_driver r JOIN fg_parallel_left s USING (k) JOIN fg_parallel_right t USING (k)
+GROUP BY r.k
+
+statement ok
+SET debug_group_join_strategy = 'factorized'
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM fg_parallel_baseline EXCEPT ALL
+	 SELECT r.k, count(*), sum(r.payload), sum(s.x), sum(t.y)
+	 FROM fg_parallel_driver r JOIN fg_parallel_left s USING (k) JOIN fg_parallel_right t USING (k) GROUP BY r.k)
+	UNION ALL
+	(SELECT r.k, count(*), sum(r.payload), sum(s.x), sum(t.y)
+	 FROM fg_parallel_driver r JOIN fg_parallel_left s USING (k) JOIN fg_parallel_right t USING (k) GROUP BY r.k
+	 EXCEPT ALL SELECT * FROM fg_parallel_baseline)
+) differences
+----
+0
+
+query II
+SELECT count(*), sum(n) FROM (
+	SELECT r.k, count(*) AS n
+	FROM fg_parallel_driver r JOIN fg_parallel_left s USING (k) JOIN fg_parallel_right t USING (k)
+	GROUP BY r.k
+)
+----
+5000	75000
+
+statement ok
+SET threads = 1
+
+# The conversion remains independently disableable.
+statement ok
+SET disabled_optimizers = 'group_join'
+
+query II
+EXPLAIN SELECT r.k, count(*)
+FROM fg_driver r JOIN fg_left s ON r.k = s.k JOIN fg_right t ON r.k = t.k
+GROUP BY r.k
+----
+physical_plan	<!REGEX>:.*Factorized Group Join.*
+
+statement ok
+SET disabled_optimizers = ''
+
+# AUTO rejects a hot-factor shape whose factor work cannot amortize the cache and scan cost.
+statement ok
+SET debug_group_join_strategy = 'auto'
+
+query II
+EXPLAIN SELECT r.k, count(*)
+FROM fg_hot_driver r JOIN fg_hot_left s USING (k) JOIN fg_hot_right t USING (k)
+GROUP BY r.k
+----
+physical_plan	<!REGEX>:.*Factorized Group Join.*
+
+# Reliable statistics select a sparse two-factor star only below 90% of the best existing estimated cost.
+statement ok
+CREATE TABLE fg_auto_driver(k BIGINT PRIMARY KEY, payload BIGINT)
+
+statement ok
+INSERT INTO fg_auto_driver SELECT i * 4, i % 1000 FROM range(2000) t(i)
+
+statement ok
+CREATE TABLE fg_auto_left(k BIGINT, x BIGINT)
+
+statement ok
+INSERT INTO fg_auto_left SELECT k * 4, j FROM range(20) t(k), range(16) u(j)
+
+statement ok
+INSERT INTO fg_auto_left SELECT (k % 2000) * 4 + 1, j FROM range(8000) t(k), range(16) u(j)
+
+statement ok
+CREATE TABLE fg_auto_right(k BIGINT, y BIGINT)
+
+statement ok
+INSERT INTO fg_auto_right SELECT k * 4, j FROM range(20) t(k), range(16) u(j)
+
+statement ok
+INSERT INTO fg_auto_right SELECT (k % 2000) * 4 + 2, j FROM range(8000) t(k), range(16) u(j)
+
+query II
+EXPLAIN SELECT r.k, count(*), sum(r.payload), sum(s.x), sum(s.x * s.x), sum(t.y), sum(t.y * t.y)
+FROM fg_auto_driver r JOIN fg_auto_left s USING (k) JOIN fg_auto_right t USING (k)
+GROUP BY r.k
+----
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*filter=.*cache=.*Decision: AUTO SELECTED.*driver->left=YES, driver->right=YES.*
+
+# Join ordering retains the costed driver-factor-factor shape independently of SQL join order.
+query II
+EXPLAIN SELECT r.k, count(*), sum(r.payload), sum(s.x), sum(s.x * s.x), sum(t.y), sum(t.y * t.y)
+FROM fg_auto_right t JOIN fg_auto_driver r USING (k) JOIN fg_auto_left s USING (k)
+GROUP BY r.k
+----
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*Decision: AUTO SELECTED.*
+
+query II
+SELECT count(*), sum(n) FROM (
+	SELECT r.k, count(*) AS n, sum(r.payload), sum(s.x), sum(s.x * s.x), sum(t.y), sum(t.y * t.y)
+	FROM fg_auto_driver r JOIN fg_auto_left s USING (k) JOIN fg_auto_right t USING (k)
+	GROUP BY r.k
+)
+----
+20	5120
+
+# Reusing the physical plan rebuilds runtime filters and task-local state for every execution.
+statement ok
+PREPARE fg_auto_repeat AS
+SELECT count(*), sum(n) FROM (
+	SELECT r.k, count(*) AS n, sum(r.payload), sum(s.x), sum(s.x * s.x), sum(t.y), sum(t.y * t.y)
+	FROM fg_auto_driver r JOIN fg_auto_left s USING (k) JOIN fg_auto_right t USING (k)
+	GROUP BY r.k
+)
+
+query II
+EXECUTE fg_auto_repeat
+----
+20	5120
+
+query II
+EXECUTE fg_auto_repeat
+----
+20	5120
+
+query II
+EXECUTE fg_auto_repeat
+----
+20	5120
+
+statement ok
+DEALLOCATE fg_auto_repeat
+
+# Exact factorized forcing falls back for every unsupported semantic boundary.
+statement ok
+SET debug_group_join_strategy = 'factorized'
+
+# Deterministic pseudo-random factors cover skew, duplicate chains, NULLs, misses, and parallel multi-vector input.
+statement ok
+CREATE TABLE fg_random_driver(k BIGINT PRIMARY KEY, payload BIGINT)
+
+statement ok
+INSERT INTO fg_random_driver SELECT i, (hash(i) % 10000)::BIGINT FROM range(3000) t(i)
+
+statement ok
+CREATE TABLE fg_random_left AS
+SELECT CASE WHEN i % 19 = 0 THEN NULL WHEN i % 11 = 0 THEN 0
+	            WHEN i % 7 = 0 THEN 4000 + (hash(i) % 1000) ELSE hash(i) % 3000 END::BIGINT AS k,
+	   (hash(i + 17) % 1000)::BIGINT AS x
+FROM range(25000) t(i)
+
+statement ok
+CREATE TABLE fg_random_right AS
+SELECT CASE WHEN i % 23 = 0 THEN NULL WHEN i % 13 = 0 THEN 0
+	            WHEN i % 5 = 0 THEN 5000 + (hash(i) % 1000) ELSE hash(i) % 3000 END::BIGINT AS k,
+	   (hash(i + 29) % 1000)::BIGINT AS y
+FROM range(28000) t(i)
+
+statement ok
+SET debug_group_join_strategy = 'disabled'
+
+statement ok
+CREATE TEMP TABLE fg_random_baseline AS
+SELECT r.k, count(*) AS n, sum(r.payload) AS rp, sum(s.x) AS sx, sum(t.y) AS ty, min(s.x) AS mn, max(t.y) AS mx
+FROM fg_random_driver r JOIN fg_random_left s USING (k) JOIN fg_random_right t USING (k)
+GROUP BY r.k
+
+statement ok
+SET debug_group_join_strategy = 'factorized'
+
+statement ok
+SET threads = 4
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM fg_random_baseline EXCEPT ALL
+	 SELECT r.k, count(*), sum(r.payload), sum(s.x), sum(t.y), min(s.x), max(t.y)
+	 FROM fg_random_driver r JOIN fg_random_left s USING (k) JOIN fg_random_right t USING (k) GROUP BY r.k)
+	UNION ALL
+	(SELECT r.k, count(*), sum(r.payload), sum(s.x), sum(t.y), min(s.x), max(t.y)
+	 FROM fg_random_driver r JOIN fg_random_left s USING (k) JOIN fg_random_right t USING (k) GROUP BY r.k
+	 EXCEPT ALL SELECT * FROM fg_random_baseline)
+) differences
+----
+0
+
+statement ok
+SET threads = 1
+
+statement ok
+CREATE TABLE fg_duplicate_driver(k INTEGER, payload INTEGER)
+
+statement ok
+INSERT INTO fg_duplicate_driver VALUES (1, 10), (1, 20)
+
+statement ok
+CREATE TABLE fg_nullable_driver(k INTEGER UNIQUE, payload INTEGER)
+
+statement ok
+INSERT INTO fg_nullable_driver VALUES (1, 10), (NULL, 20)
+
+# Duplicate drivers contribute their own multiplicity to both factor-local aggregate ranges.
+query II
+EXPLAIN SELECT r.k, count(*), sum(r.payload), sum(s.x), sum(t.y)
+FROM fg_duplicate_driver r JOIN fg_left s ON r.k=s.k JOIN fg_right t ON r.k=t.k GROUP BY r.k
+----
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*Driver: NON_UNIQUE.*
+
+query IIIII
+SELECT r.k, count(*), sum(r.payload), sum(s.x), sum(t.y)
+FROM fg_duplicate_driver r JOIN fg_left s ON r.k=s.k JOIN fg_right t ON r.k=t.k GROUP BY r.k
+----
+1	12	180	20	108
+
+# Complete join keys plus driver payload groups route each factor row to every driver group for that key.
+query II
+EXPLAIN SELECT r.k, r.payload, count(*), sum(s.x), sum(t.y)
+FROM fg_duplicate_driver r JOIN fg_left s ON r.k=s.k JOIN fg_right t ON r.k=t.k
+GROUP BY r.k, r.payload
+----
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*Driver: NON_UNIQUE.*Routing: ROUTED.*
+
+query IIIII rowsort
+SELECT r.k, r.payload, count(*), sum(s.x), sum(t.y)
+FROM fg_duplicate_driver r JOIN fg_left s ON r.k=s.k JOIN fg_right t ON r.k=t.k
+GROUP BY r.k, r.payload
+----
+1	10	6	10	54
+1	20	6	10	54
+
+# Routed caching aggregates once per complete join key. CACHED retains task-local fragments; EAGER merges them
+# before expanding the route to its output groups.
+statement ok
+CREATE TABLE fg_cached_left AS SELECT 1::INTEGER AS k, i::INTEGER AS x FROM range(10) t(i)
+
+statement ok
+CREATE TABLE fg_eager_right AS SELECT 1::INTEGER AS k, i::INTEGER AS y FROM range(40) t(i)
+
+statement ok
+SET debug_group_join_strategy = 'disabled'
+
+statement ok
+SET ordered_aggregate_threshold = 4
+
+statement ok
+CREATE TEMP TABLE fg_route_cache_baseline AS
+SELECT r.k, r.payload, count(*) AS n, sum(s.x) AS sx, sum(t.y) AS ty,
+	count(DISTINCT s.x) AS dsx, list(s.x ORDER BY s.x) AS ordered_s
+FROM fg_duplicate_driver r JOIN fg_cached_left s USING (k) JOIN fg_eager_right t USING (k)
+GROUP BY r.k, r.payload
+
+statement ok
+SET debug_group_join_strategy = 'factorized'
+
+query II
+EXPLAIN SELECT r.k, r.payload, count(*), sum(s.x), sum(t.y), count(DISTINCT s.x), list(s.x ORDER BY s.x)
+FROM fg_duplicate_driver r JOIN fg_cached_left s USING (k) JOIN fg_eager_right t USING (k)
+GROUP BY r.k, r.payload
+----
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*Left Mode: CACHED.*Right Mode: EAGER.*
+
+query II
+EXPLAIN ANALYZE SELECT r.k, r.payload, count(*), sum(s.x), sum(t.y)
+FROM fg_duplicate_driver r JOIN fg_cached_left s USING (k) JOIN fg_eager_right t USING (k)
+GROUP BY r.k, r.payload
+----
+analyzed_plan	<REGEX>:(?s).*Left Mode: CACHED.*Right Mode: EAGER.*Left Sample:.*drivers=2, matches=2, factor rows=10, factors=1.*Right Sample:.*drivers=2, matches=2, factor rows=40, factors=1.*
+
+# Ordered states can be cached and combined; DISTINCT branches conservatively remain LAZY.
+query I
+SELECT count(*) FROM (
+	(SELECT r.k, r.payload, count(*) AS n, sum(s.x) AS sx, sum(t.y) AS ty,
+	        list(s.x ORDER BY s.x) AS ordered_s
+	 FROM fg_duplicate_driver r JOIN fg_cached_left s USING (k) JOIN fg_eager_right t USING (k)
+	 GROUP BY r.k, r.payload
+	 EXCEPT ALL
+	 SELECT k, payload, n, sx, ty, ordered_s FROM fg_route_cache_baseline)
+	UNION ALL
+	(SELECT k, payload, n, sx, ty, ordered_s FROM fg_route_cache_baseline
+	 EXCEPT ALL
+	 SELECT r.k, r.payload, count(*), sum(s.x), sum(t.y), list(s.x ORDER BY s.x)
+	 FROM fg_duplicate_driver r JOIN fg_cached_left s USING (k) JOIN fg_eager_right t USING (k)
+	 GROUP BY r.k, r.payload)
+) differences
+----
+0
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM fg_route_cache_baseline EXCEPT ALL
+	 SELECT r.k, r.payload, count(*), sum(s.x), sum(t.y), count(DISTINCT s.x), list(s.x ORDER BY s.x)
+	 FROM fg_duplicate_driver r JOIN fg_cached_left s USING (k) JOIN fg_eager_right t USING (k)
+	 GROUP BY r.k, r.payload)
+	UNION ALL
+	(SELECT r.k, r.payload, count(*), sum(s.x), sum(t.y), count(DISTINCT s.x), list(s.x ORDER BY s.x)
+	 FROM fg_duplicate_driver r JOIN fg_cached_left s USING (k) JOIN fg_eager_right t USING (k)
+	 GROUP BY r.k, r.payload
+	 EXCEPT ALL SELECT * FROM fg_route_cache_baseline)
+) differences
+----
+0
+
+statement ok
+RESET ordered_aggregate_threshold
+
+query III rowsort
+SELECT r.k, count(DISTINCT r.payload), count(DISTINCT s.x)
+FROM fg_duplicate_driver r JOIN fg_left s ON r.k=s.k JOIN fg_right t ON r.k=t.k
+GROUP BY r.k
+----
+1	2	2
+
+query IIIII rowsort
+SELECT r.k, r.payload, count(*), sum(s.x), sum(t.y)
+FROM fg_driver r JOIN fg_left s ON r.k=s.k JOIN fg_right t ON r.k=t.k
+GROUP BY r.k, r.payload
+----
+1	10	6	10	54
+2	20	2	10	17
+
+# Driver NULLs group together, but ordinary equality never matches NULL factor keys.
+query IIIII rowsort
+SELECT r.k, count(*), sum(r.payload), sum(s.x), sum(t.y)
+FROM fg_nullable_driver r LEFT JOIN fg_left s ON r.k=s.k LEFT JOIN fg_right t ON r.k=t.k GROUP BY r.k
+----
+1	6	60	10	54
+NULL	1	20	NULL	NULL
+
+statement ok
+CREATE VIEW fg_reject_coarse_group AS
+SELECT r.payload, count(*)
+FROM fg_driver r JOIN fg_left s ON r.k=s.k JOIN fg_right t ON r.k=t.k GROUP BY r.payload
+
+statement ok
+CREATE VIEW fg_reject_cross_branch AS
+SELECT r.k, sum(s.x * t.y)
+FROM fg_driver r JOIN fg_left s ON r.k=s.k JOIN fg_right t ON r.k=t.k GROUP BY r.k
+
+statement ok
+CREATE VIEW fg_reject_driver_branch AS
+SELECT r.k, sum(r.payload + s.x)
+FROM fg_driver r JOIN fg_left s ON r.k=s.k JOIN fg_right t ON r.k=t.k GROUP BY r.k
+
+statement ok
+CREATE VIEW fg_reject_cross_filter AS
+SELECT r.k, sum(s.x) FILTER (WHERE t.y > 0)
+FROM fg_driver r JOIN fg_left s ON r.k=s.k JOIN fg_right t ON r.k=t.k GROUP BY r.k
+
+statement ok
+CREATE VIEW fg_reject_ordered AS
+SELECT r.k, list(s.x ORDER BY t.y)
+FROM fg_driver r JOIN fg_left s ON r.k=s.k JOIN fg_right t ON r.k=t.k GROUP BY r.k
+
+statement ok
+CREATE VIEW fg_reject_outer AS
+SELECT r.k, count(*)
+FROM (fg_driver r JOIN fg_right t ON r.k=t.k) RIGHT JOIN fg_left s ON r.k=s.k GROUP BY r.k
+
+statement ok
+CREATE VIEW fg_reject_preserved_factor_group AS
+SELECT s.k, count(*)
+FROM fg_driver r LEFT JOIN fg_left s ON r.k=s.k LEFT JOIN fg_right t ON r.k=t.k GROUP BY s.k
+
+statement ok
+CREATE VIEW fg_reject_nonequality AS
+SELECT r.k, count(*)
+FROM fg_driver r JOIN fg_left s ON r.k<s.k JOIN fg_right t ON r.k=t.k GROUP BY r.k
+
+statement ok
+CREATE VIEW fg_reject_residual AS
+SELECT r.k, count(*)
+FROM fg_driver r JOIN fg_left s ON r.k=s.k AND s.x>r.payload JOIN fg_right t ON r.k=t.k GROUP BY r.k
+
+statement ok
+CREATE VIEW fg_reject_four_way AS
+SELECT r.k, count(*)
+FROM fg_driver r JOIN fg_left s ON r.k=s.k JOIN fg_right t ON r.k=t.k JOIN fg_hot_left u ON r.k=u.k
+GROUP BY r.k
+
+foreach reject fg_reject_coarse_group fg_reject_cross_branch fg_reject_driver_branch fg_reject_cross_filter fg_reject_ordered fg_reject_outer fg_reject_preserved_factor_group fg_reject_nonequality fg_reject_residual fg_reject_four_way
+
+query II
+EXPLAIN SELECT * FROM {reject}
+----
+physical_plan	<!REGEX>:.*Factorized Group Join.*
+
+endloop
+
+# Explicit external modes radix-partition all three inputs and retain no raw cross-partition references.
+statement ok
+SET debug_force_external = true
+
+query II
+EXPLAIN SELECT r.k, count(*)
+FROM fg_driver r JOIN fg_left s ON r.k=s.k JOIN fg_right t ON r.k=t.k GROUP BY r.k
+----
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*Strategy: EXTERNAL.*
+
+query IIIII rowsort
+SELECT r.k, count(*), sum(r.payload), sum(s.x), sum(t.y)
+FROM fg_driver r JOIN fg_left s ON r.k=s.k JOIN fg_right t ON r.k=t.k GROUP BY r.k
+----
+1	6	60	10	54
+2	2	40	10	17
+
+statement ok
+SET debug_force_external = false
+
+statement ok
+SET debug_group_join_execution = 'external'
+
+query II
+EXPLAIN SELECT r.k, count(*)
+FROM fg_driver r JOIN fg_left s ON r.k=s.k JOIN fg_right t ON r.k=t.k GROUP BY r.k
+----
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*Strategy: EXTERNAL.*
+
+query II
+EXPLAIN ANALYZE SELECT r.k, count(*)
+FROM fg_driver r JOIN fg_left s ON r.k=s.k JOIN fg_right t ON r.k=t.k GROUP BY r.k
+----
+analyzed_plan	<REGEX>:(?s).*common-radix external partitions.*Left Matched Factor Rows: 5.*Right Matched Factor Rows: 5.*External Tasks: [1-9][0-9]*.*External Maximum Radix Bits: [4-9][0-9]*.*
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM fg_baseline EXCEPT ALL
+	 SELECT r.k, count(*), count(s.x), count(t.y), sum(r.payload), sum(s.x), sum(t.y), avg(s.x), avg(t.y),
+	        min(s.x), max(t.y), sum(s.d), sum(t.d), min(s.label), max(t.label), bool_and(s.flag), bool_or(t.flag),
+	        sum(1)
+	 FROM fg_driver r JOIN fg_left s ON r.k = s.k JOIN fg_right t ON r.k = t.k GROUP BY r.k)
+	UNION ALL
+	(SELECT r.k, count(*), count(s.x), count(t.y), sum(r.payload), sum(s.x), sum(t.y), avg(s.x), avg(t.y),
+	        min(s.x), max(t.y), sum(s.d), sum(t.d), min(s.label), max(t.label), bool_and(s.flag), bool_or(t.flag),
+	        sum(1)
+	 FROM fg_driver r JOIN fg_left s ON r.k = s.k JOIN fg_right t ON r.k = t.k GROUP BY r.k
+	 EXCEPT ALL SELECT * FROM fg_baseline)
+) differences
+----
+0
+
+query III rowsort
+SELECT r.k, count(DISTINCT coalesce(s.x, 42)), count(DISTINCT s.x)
+FROM fg_driver r LEFT JOIN fg_left s ON r.k=s.k LEFT JOIN fg_right t ON r.k=t.k
+GROUP BY r.k
+----
+1	3	2
+2	1	1
+3	1	1
+4	1	0
+5	1	0
+
+query IIIII rowsort
+SELECT r.k, r.payload, count(*), sum(s.x), sum(t.y)
+FROM fg_duplicate_driver r JOIN fg_left s ON r.k=s.k JOIN fg_right t ON r.k=t.k
+GROUP BY r.k, r.payload
+----
+1	10	6	10	54
+1	20	6	10	54
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM fg_ordered_baseline EXCEPT ALL
+	 SELECT r.k, list(s.x ORDER BY s.x), list(t.y ORDER BY t.y DESC), first(s.x ORDER BY s.x DESC),
+	        string_agg(s.label, ',' ORDER BY s.label DESC), list(DISTINCT s.x ORDER BY s.x)
+	 FROM fg_driver r JOIN fg_left s ON r.k = s.k JOIN fg_right t ON r.k = t.k GROUP BY r.k)
+	UNION ALL
+	(SELECT r.k, list(s.x ORDER BY s.x), list(t.y ORDER BY t.y DESC), first(s.x ORDER BY s.x DESC),
+	        string_agg(s.label, ',' ORDER BY s.label DESC), list(DISTINCT s.x ORDER BY s.x)
+	 FROM fg_driver r JOIN fg_left s ON r.k = s.k JOIN fg_right t ON r.k = t.k GROUP BY r.k
+	 EXCEPT ALL SELECT * FROM fg_ordered_baseline)
+) differences
+----
+0
+
+# Parallel low-memory execution keeps driver and factor rows in matching buffer-managed radix partitions.
+statement ok
+DROP TABLE fg_parallel_baseline
+
+statement ok
+DROP TABLE fg_parallel_driver
+
+statement ok
+DROP TABLE fg_parallel_left
+
+statement ok
+DROP TABLE fg_parallel_right
+
+statement ok
+DROP TABLE fg_hot_driver
+
+statement ok
+DROP TABLE fg_hot_left
+
+statement ok
+DROP TABLE fg_hot_right
+
+statement ok
+DROP TABLE fg_string_driver
+
+statement ok
+DROP TABLE fg_string_left
+
+statement ok
+DROP TABLE fg_string_right
+
+statement ok
+DROP TABLE fg_route_cache_baseline
+
+statement ok
+DROP TABLE fg_auto_driver
+
+statement ok
+DROP TABLE fg_auto_left
+
+statement ok
+DROP TABLE fg_auto_right
+
+statement ok
+DROP TABLE fg_random_baseline
+
+statement ok
+DROP TABLE fg_random_driver
+
+statement ok
+DROP TABLE fg_random_left
+
+statement ok
+DROP TABLE fg_random_right
+
+statement ok
+SET threads = 4
+
+statement ok
+SET memory_limit = '32MB'
+
+statement ok
+SET preserve_insertion_order = false
+
+statement ok
+CREATE TABLE fg_external_driver AS SELECT i::INTEGER AS k, i::BIGINT AS payload FROM range(20000) t(i)
+
+statement ok
+CREATE UNIQUE INDEX fg_external_driver_key ON fg_external_driver(k)
+
+statement ok
+CREATE TABLE fg_external_left AS SELECT i::INTEGER AS k, j::BIGINT AS x FROM range(20000) t(i), range(7) u(j)
+
+statement ok
+CREATE TABLE fg_external_right AS SELECT i::INTEGER AS k, j::BIGINT AS y FROM range(20000) t(i), range(9) u(j)
+
+query II
+SELECT count(*), sum(n) FROM (
+	SELECT r.k, count(*) AS n, sum(r.payload), sum(s.x), sum(t.y)
+	FROM fg_external_driver r JOIN fg_external_left s USING (k) JOIN fg_external_right t USING (k)
+	GROUP BY r.k
+)
+----
+20000	1260000
+
+statement ok
+RESET memory_limit
+
+statement ok
+RESET preserve_insertion_order
+
+statement ok
+SET threads = 1
+
+statement ok
+RESET debug_group_join_execution
+
+# Existing binary forcing continues to select the mature GroupJoin implementation.
+statement ok
+SET debug_group_join_strategy = 'force'
+
+query II
+EXPLAIN SELECT r.k, count(*), sum(s.x)
+FROM fg_driver r JOIN fg_left s ON r.k=s.k
+GROUP BY r.k
+----
+physical_plan	<REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT r.k, count(*), sum(s.x)
+FROM fg_driver r JOIN fg_left s ON r.k=s.k
+GROUP BY r.k
+----
+physical_plan	<!REGEX>:.*Factorized Group Join.*
+
+statement ok
+RESET debug_group_join_strategy

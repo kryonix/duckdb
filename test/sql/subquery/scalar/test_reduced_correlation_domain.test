@@ -62,7 +62,7 @@ JOIN domain_dim d ON f.k = d.k
 WHERE d.active
   AND x < (SELECT avg(v) FROM inner_fact i WHERE i.k = d.k);
 ----
-logical_opt	<REGEX>:.*"Table":\s*"memory.main.inner_fact".*"Table":\s*"memory.main.domain_dim".*"Join Type":\s*"SEMI".*
+logical_opt	<REGEX>:.*"Table":\s*"[^"]*\.main\.inner_fact".*"Table":\s*"[^"]*\.main\.domain_dim".*"Join Type":\s*"SEMI".*
 
 statement ok
 SET debug_group_join_strategy = 'force';
@@ -76,7 +76,7 @@ JOIN domain_dim d ON f.k = d.k
 WHERE d.active
   AND x < (SELECT avg(v) FROM inner_fact i WHERE i.k = d.k);
 ----
-logical_opt	<REGEX>:.*"name":\s*"GROUP_JOIN".*"Table":\s*"memory.main.domain_dim".*
+logical_opt	<REGEX>:.*"name":\s*"GROUP_JOIN".*"Table":\s*"[^"]*\.main\.domain_dim".*
 
 query I
 SELECT sum(x)
