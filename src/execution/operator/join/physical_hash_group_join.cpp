@@ -282,8 +282,9 @@ public:
 			hash_table = make_uniq<GroupedAggregateHashTable>(
 			    context, BufferAllocator::Get(context), op.grouped_aggregate_data.group_types, vector<LogicalType> {},
 			    CreateRoutingGroupJoinAggregates(), GroupedAggregateHashTable::InitialCapacity(), idx_t(0),
-			    op.null_equal || !op.unique_owner ? TupleDataValidityType::CAN_HAVE_NULL_VALUES
-			                                      : TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
+			    op.null_equal || !op.unique_owner || op.owner_keys_can_have_null
+			        ? TupleDataValidityType::CAN_HAVE_NULL_VALUES
+			        : TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 			final_hash_table = make_uniq<GroupedAggregateHashTable>(
 			    context, BufferAllocator::Get(context), op.output_group_types, op.grouped_aggregate_data.payload_types,
 			    CreateRoutedGroupJoinAggregates(op), GroupedAggregateHashTable::InitialCapacity(), idx_t(0),
@@ -2355,8 +2356,9 @@ static void ProcessExternalRoutedLookupPartition(const PhysicalHashGroupJoin &op
 	auto routing_target = make_uniq<GroupedAggregateHashTable>(
 	    context, BufferAllocator::Get(context), op.grouped_aggregate_data.group_types, vector<LogicalType> {},
 	    CreateRoutingGroupJoinAggregates(), GroupedAggregateHashTable::InitialCapacity(), idx_t(0),
-	    op.null_equal || !op.unique_owner ? TupleDataValidityType::CAN_HAVE_NULL_VALUES
-	                                      : TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
+	    op.null_equal || !op.unique_owner || op.owner_keys_can_have_null
+	        ? TupleDataValidityType::CAN_HAVE_NULL_VALUES
+	        : TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 	const auto key_count = op.grouped_aggregate_data.group_types.size();
 	vector<vector<idx_t>> route_build_rows;
 	idx_t owner_row_count = 0;
@@ -2653,7 +2655,8 @@ static void ProcessExternalHashGroupJoinPartition(const PhysicalHashGroupJoin &o
 	    context, BufferAllocator::Get(context), op.grouped_aggregate_data.group_types,
 	    CreateGlobalGroupJoinPayloadTypes(op), CreateGlobalGroupJoinAggregates(op),
 	    GroupedAggregateHashTable::InitialCapacity(), idx_t(0),
-	    op.null_equal ? TupleDataValidityType::CAN_HAVE_NULL_VALUES : TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
+	    op.null_equal || op.owner_keys_can_have_null ? TupleDataValidityType::CAN_HAVE_NULL_VALUES
+	                                                 : TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 	AggregateHTUpdateState update_state(*target);
 	const auto key_count = op.grouped_aggregate_data.group_types.size();
 	vector<data_ptr_t> group_addresses;

@@ -1566,6 +1566,44 @@ GROUP BY p.k
 ----
 1	1	20
 
+# A requested perfect specialization must fall back to the nullable hash layout.
+statement ok
+SET debug_group_join_strategy = 'perfect'
+
+query III rowsort
+WITH o AS (SELECT k FROM gj_nullable_group_owner GROUP BY k)
+SELECT o.k, count(*), sum(p.v)
+FROM o JOIN gj_nullable_group_probe p USING (k)
+GROUP BY o.k
+----
+1	1	20
+
+statement ok
+SET debug_group_join_strategy = 'force'
+
+statement ok
+CREATE TABLE gj_nullable_group_dimension(k INTEGER PRIMARY KEY, label VARCHAR)
+
+statement ok
+INSERT INTO gj_nullable_group_dimension VALUES (-2147483648, 'min'), (1, 'one')
+
+statement ok
+INSERT INTO gj_nullable_group_owner VALUES (-2147483648)
+
+statement ok
+INSERT INTO gj_nullable_group_probe VALUES (-2147483648, 5)
+
+query TII rowsort
+WITH owner AS (SELECT k FROM gj_nullable_group_owner GROUP BY k),
+     enriched AS (SELECT o.k, d.label FROM owner o LEFT JOIN gj_nullable_group_dimension d USING (k))
+SELECT e.label, count(p.v), sum(p.v)
+FROM enriched e LEFT JOIN gj_nullable_group_probe p USING (k)
+GROUP BY e.label
+----
+NULL	0	NULL
+min	1	5
+one	1	20
+
 statement ok
 RESET debug_group_join_strategy
 

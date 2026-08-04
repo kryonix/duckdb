@@ -112,6 +112,47 @@ SELECT count(*), sum(n), sum(s) FROM (
 statement ok
 PRAGMA disable_profiling
 
+# Aggregate-derived unique keys retain NULL validity when external partitions rebuild the owner directory.
+statement ok
+CREATE TABLE external_nullable_owner(k INTEGER)
+
+statement ok
+INSERT INTO external_nullable_owner VALUES (NULL), (-2147483648), (1), (1)
+
+statement ok
+CREATE TABLE external_nullable_probe(k INTEGER, v INTEGER)
+
+statement ok
+INSERT INTO external_nullable_probe VALUES (NULL, 99), (-2147483648, 5), (1, 10)
+
+query III rowsort
+WITH owner AS (SELECT k FROM external_nullable_owner GROUP BY k)
+SELECT o.k, count(p.v), sum(p.v)
+FROM owner o LEFT JOIN external_nullable_probe p USING (k)
+GROUP BY o.k
+----
+-2147483648	1	5
+1	1	10
+NULL	0	NULL
+
+# The same nullable key remains valid through a key-preserving join and a routed external owner directory.
+statement ok
+CREATE TABLE external_nullable_dimension(k INTEGER PRIMARY KEY, label VARCHAR)
+
+statement ok
+INSERT INTO external_nullable_dimension VALUES (-2147483648, 'min'), (1, 'one')
+
+query TII rowsort
+WITH owner AS (SELECT k FROM external_nullable_owner GROUP BY k),
+     enriched AS (SELECT o.k, d.label FROM owner o LEFT JOIN external_nullable_dimension d USING (k))
+SELECT e.label, count(p.v), sum(p.v)
+FROM enriched e LEFT JOIN external_nullable_probe p USING (k)
+GROUP BY e.label
+----
+NULL	0	NULL
+min	1	5
+one	1	10
+
 statement ok
 RESET memory_limit
 
