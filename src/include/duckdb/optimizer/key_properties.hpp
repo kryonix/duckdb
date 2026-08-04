@@ -15,7 +15,7 @@ namespace duckdb {
 class LogicalGet;
 class LogicalOperator;
 
-enum class UniqueKeyProof : uint8_t { PRIMARY_KEY, UNIQUE_NOT_NULL, AGGREGATE_GROUP };
+enum class UniqueKeyProof : uint8_t { PRIMARY_KEY, UNIQUE_NOT_NULL, AGGREGATE_GROUP, KEY_PRESERVING_JOIN };
 
 struct UniqueKeyProperty {
 	UniqueKeyProof proof;

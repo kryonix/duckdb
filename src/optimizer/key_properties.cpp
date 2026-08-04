@@ -11,8 +11,19 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 
 namespace duckdb {
+
+static optional_idx FindBinding(const ColumnBinding &binding, LogicalOperator &input) {
+	auto bindings = input.GetColumnBindings();
+	for (idx_t index = 0; index < bindings.size(); index++) {
+		if (bindings[index] == binding) {
+			return optional_idx(index);
+		}
+	}
+	return optional_idx();
+}
 
 static optional_idx GetKeyPropertyDirectReferenceIndex(const Expression &expression, LogicalOperator &input) {
 	if (expression.GetExpressionClass() == ExpressionClass::BOUND_REF) {
@@ -154,6 +165,85 @@ optional<UniqueKeyProperty> GetUniqueKeyProperty(LogicalOperator &owner, const v
 		}
 		return UniqueKeyProperty {UniqueKeyProof::AGGREGATE_GROUP, nullptr};
 	}
+	if (current.get().type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = current.get().Cast<LogicalComparisonJoin>();
+		if (join.children.size() != 2 || join.conditions.empty() || join.HasArbitraryConditions()) {
+			return nullopt;
+		}
+		auto output_bindings = join.GetColumnBindings();
+		idx_t key_child = DConstants::INVALID_INDEX;
+		vector<idx_t> child_columns;
+		for (auto column : logical_columns) {
+			if (column >= output_bindings.size()) {
+				return nullopt;
+			}
+			optional_idx child_column;
+			for (idx_t child_idx = 0; child_idx < 2; child_idx++) {
+				auto candidate = FindBinding(output_bindings[column], *join.children[child_idx]);
+				if (!candidate.IsValid()) {
+					continue;
+				}
+				if (key_child != DConstants::INVALID_INDEX && key_child != child_idx) {
+					return nullopt;
+				}
+				key_child = child_idx;
+				child_column = candidate;
+				break;
+			}
+			if (!child_column.IsValid()) {
+				return nullopt;
+			}
+			child_columns.push_back(child_column.GetIndex());
+		}
+		if (key_child == DConstants::INVALID_INDEX ||
+		    !GetUniqueKeyProperty(*join.children[key_child], child_columns)) {
+			return nullopt;
+		}
+
+		bool preserves_key = false;
+		switch (join.join_type) {
+		case JoinType::SEMI:
+		case JoinType::ANTI:
+		case JoinType::MARK:
+		case JoinType::SINGLE:
+			preserves_key = key_child == 0;
+			break;
+		case JoinType::RIGHT_SEMI:
+		case JoinType::RIGHT_ANTI:
+			preserves_key = key_child == 1;
+			break;
+		case JoinType::INNER:
+		case JoinType::LEFT:
+		case JoinType::RIGHT: {
+			if ((join.join_type == JoinType::LEFT && key_child != 0) ||
+			    (join.join_type == JoinType::RIGHT && key_child != 1)) {
+				break;
+			}
+			const auto other_child = 1 - key_child;
+			vector<idx_t> other_columns;
+			for (auto &condition : join.conditions) {
+				if (!condition.IsComparison() || condition.GetComparisonType() != ExpressionType::COMPARE_EQUAL ||
+				    condition.GetLHS().GetReturnType() != condition.GetRHS().GetReturnType()) {
+					return nullopt;
+				}
+				auto left = GetKeyPropertyDirectReferenceIndex(condition.GetLHS(), *join.children[0]);
+				auto right = GetKeyPropertyDirectReferenceIndex(condition.GetRHS(), *join.children[1]);
+				if (!left.IsValid() || !right.IsValid()) {
+					return nullopt;
+				}
+				other_columns.push_back(other_child == 0 ? left.GetIndex() : right.GetIndex());
+			}
+			preserves_key = GetUniqueKeyProperty(*join.children[other_child], other_columns).has_value();
+			break;
+		}
+		default:
+			break;
+		}
+		if (!preserves_key) {
+			return nullopt;
+		}
+		return UniqueKeyProperty {UniqueKeyProof::KEY_PRESERVING_JOIN, nullptr};
+	}
 
 	logical_columns = output_columns;
 	optional_ptr<LogicalGet> base_scan;
@@ -257,7 +347,7 @@ bool HasForeignKeyProperty(LogicalOperator &foreign, const vector<idx_t> &foreig
 }
 
 bool UniqueKeyProperty::FunctionallyDetermines(LogicalOperator &owner, idx_t output_column) const {
-	if (proof == UniqueKeyProof::AGGREGATE_GROUP) {
+	if (proof == UniqueKeyProof::AGGREGATE_GROUP || proof == UniqueKeyProof::KEY_PRESERVING_JOIN) {
 		return output_column < owner.GetColumnBindings().size();
 	}
 	vector<idx_t> columns {output_column};

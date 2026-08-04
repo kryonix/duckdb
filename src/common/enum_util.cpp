@@ -6631,19 +6631,20 @@ const StringUtil::EnumStringLiteral *GetUniqueKeyProofValues() {
 	static constexpr StringUtil::EnumStringLiteral values[] {
 		{ static_cast<uint32_t>(UniqueKeyProof::PRIMARY_KEY), "PRIMARY_KEY" },
 		{ static_cast<uint32_t>(UniqueKeyProof::UNIQUE_NOT_NULL), "UNIQUE_NOT_NULL" },
-		{ static_cast<uint32_t>(UniqueKeyProof::AGGREGATE_GROUP), "AGGREGATE_GROUP" }
+		{ static_cast<uint32_t>(UniqueKeyProof::AGGREGATE_GROUP), "AGGREGATE_GROUP" },
+		{ static_cast<uint32_t>(UniqueKeyProof::KEY_PRESERVING_JOIN), "KEY_PRESERVING_JOIN" }
 	};
 	return values;
 }
 
 template<>
 const char* EnumUtil::ToChars<UniqueKeyProof>(UniqueKeyProof value) {
-	return StringUtil::EnumToString(GetUniqueKeyProofValues(), 3, "UniqueKeyProof", static_cast<uint32_t>(value));
+	return StringUtil::EnumToString(GetUniqueKeyProofValues(), 4, "UniqueKeyProof", static_cast<uint32_t>(value));
 }
 
 template<>
 UniqueKeyProof EnumUtil::FromString<UniqueKeyProof>(const char *value) {
-	return static_cast<UniqueKeyProof>(StringUtil::StringToEnum(GetUniqueKeyProofValues(), 3, "UniqueKeyProof", value));
+	return static_cast<UniqueKeyProof>(StringUtil::StringToEnum(GetUniqueKeyProofValues(), 4, "UniqueKeyProof", value));
 }
 
 const StringUtil::EnumStringLiteral *GetVacuumIndexStrategyValues() {

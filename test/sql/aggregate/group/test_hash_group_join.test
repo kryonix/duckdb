@@ -1850,6 +1850,59 @@ GROUP BY p.id
 ----
 5	20000
 
+# A key-preserving owner join remains unique when the opposite join key is unique.
+statement ok
+CREATE TABLE gj_auto_index_dimension(dim_id BIGINT PRIMARY KEY, label VARCHAR)
+
+statement ok
+INSERT INTO gj_auto_index_dimension VALUES (7, 'seven')
+
+statement ok
+CREATE TABLE gj_auto_index_order(id BIGINT PRIMARY KEY, dim_id BIGINT NOT NULL, payload BIGINT)
+
+statement ok
+INSERT INTO gj_auto_index_order VALUES (1, 7, 42)
+
+query II
+EXPLAIN SELECT o.id, o.payload, d.label, count(*), sum(p.value)
+FROM gj_auto_index_probe p
+JOIN (gj_auto_index_order o JOIN gj_auto_index_dimension d USING (dim_id)) ON p.id = o.id
+GROUP BY o.id, o.payload, d.label
+----
+physical_plan	<REGEX>:.*Index Group Join.*gj_auto_probe_art.*
+
+query II
+SELECT count(*), sum(p.value)
+FROM gj_auto_index_probe p
+JOIN (gj_auto_index_order o JOIN gj_auto_index_dimension d USING (dim_id)) ON p.id = o.id
+GROUP BY o.id, o.payload, d.label
+----
+5	20000
+
+# A LEFT owner join also preserves its key when the right side cannot duplicate it.
+query II
+EXPLAIN SELECT o.id, count(*), sum(p.value)
+FROM gj_auto_index_probe p
+JOIN (gj_auto_index_order o LEFT JOIN gj_auto_index_dimension d USING (dim_id)) ON p.id = o.id
+GROUP BY o.id
+----
+physical_plan	<REGEX>:.*Index Group Join.*gj_auto_probe_art.*
+
+# A duplicate-producing owner join does not preserve the key.
+statement ok
+CREATE TABLE gj_auto_index_duplicate_dimension(dim_id BIGINT, label VARCHAR)
+
+statement ok
+INSERT INTO gj_auto_index_duplicate_dimension VALUES (7, 'first'), (7, 'second')
+
+query II
+EXPLAIN SELECT o.id, count(*), sum(p.value)
+FROM gj_auto_index_probe p
+JOIN (gj_auto_index_order o JOIN gj_auto_index_duplicate_dimension d USING (dim_id)) ON p.id = o.id
+GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Index Group Join.*
+
 # Grouped owner domains are unique on their complete grouping key without declared constraints.
 query II
 EXPLAIN SELECT p.id, count(*), sum(p.value)
@@ -2213,7 +2266,7 @@ EXPLAIN SELECT o.id, count(*), sum(p.value)
 FROM (gj_order_owner o JOIN gj_order_dimension d USING (dimension_id)) JOIN gj_order_probe p USING (id)
 GROUP BY o.id
 ----
-physical_plan	<REGEX>:(?s).*Hash Group Join.*EAGER_HASH.*MATERIALIZED_OWNER.*EXPORT_STATE.*
+physical_plan	<REGEX>:(?s).*Hash Group Join.*EAGER_HASH.*STREAMING_OWNER.*INLINE.*PARALLEL_COMMON_RADIX.*
 
 query III
 SELECT count(*), sum(n), sum(s) FROM (
