@@ -228,6 +228,19 @@ void Executor::Initialize(PhysicalOperator &plan) {
 	InitializeInternal(plan);
 }
 
+void Executor::ResolvePipelineTopology(PhysicalOperator &plan) {
+	Reset();
+	auto &scheduler = TaskScheduler::GetScheduler(context);
+	lock_guard<mutex> elock(executor_lock);
+	physical_plan = plan;
+	profiler = ClientData::Get(context).profiler;
+	producer = scheduler.CreateProducer();
+
+	PipelineBuildState state;
+	auto root_pipeline = make_shared_ptr<MetaPipeline>(*this, state, nullptr);
+	root_pipeline->Build(plan);
+}
+
 void Executor::InitializeInternal(PhysicalOperator &plan) {
 	auto &scheduler = TaskScheduler::GetScheduler(context);
 	{

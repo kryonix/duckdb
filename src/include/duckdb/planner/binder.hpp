@@ -306,6 +306,9 @@ public:
 
 	//! Generates an unused index for a table
 	TableIndex GenerateTableIndex();
+	//! Checkpoint helpers for speculative optimizer plans that must not consume permanent table indexes.
+	idx_t GetTableIndexCount() const;
+	void RestoreTableIndexCount(idx_t table_index_count);
 
 	optional_ptr<CatalogEntry> GetCatalogEntry(const Identifier &catalog, const Identifier &schema,
 	                                           const EntryLookupInfo &lookup_info, OnEntryNotFound on_entry_not_found);

@@ -53,6 +53,8 @@ public:
 
 	void Initialize(PhysicalOperator &physical_plan);
 	void Initialize(unique_ptr<PhysicalOperator> physical_plan);
+	//! Builds the pipeline graph to resolve plan-dependent properties without scheduling execution.
+	void ResolvePipelineTopology(PhysicalOperator &physical_plan);
 
 	void CancelTasks();
 	PendingExecutionResult ExecuteTask(bool dry_run = false);

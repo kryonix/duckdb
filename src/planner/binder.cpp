@@ -231,6 +231,15 @@ TableIndex Binder::GenerateTableIndex() {
 	return TableIndex(global_binder_state->bound_tables++);
 }
 
+idx_t Binder::GetTableIndexCount() const {
+	return global_binder_state->bound_tables;
+}
+
+void Binder::RestoreTableIndexCount(idx_t table_index_count) {
+	D_ASSERT(table_index_count <= global_binder_state->bound_tables);
+	global_binder_state->bound_tables = table_index_count;
+}
+
 StatementProperties &Binder::GetStatementProperties() {
 	return global_binder_state->prop;
 }

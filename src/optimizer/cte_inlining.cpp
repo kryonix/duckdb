@@ -1,202 +1,117 @@
 #include "duckdb/optimizer/cte_inlining.hpp"
 
-#include "duckdb/common/reference_map.hpp"
+#include "duckdb/common/map.hpp"
 #include "duckdb/common/set.hpp"
-#include "duckdb/common/type_visitor.hpp"
-#include "duckdb/common/types/row/tuple_data_layout.hpp"
-#include "duckdb/optimizer/column_binding_replacer.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/optimizer/cte_filter_pusher.hpp"
 #include "duckdb/optimizer/filter_pushdown.hpp"
 #include "duckdb/optimizer/join_order/join_order_optimizer.hpp"
-#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/optimizer/statistics_propagator.hpp"
 #include "duckdb/planner/expression/list.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
-#include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/logical_operator_deep_copy.hpp"
 #include "duckdb/planner/operator/logical_prepare.hpp"
 
-#include "duckdb/function/scalar/generic_functions.hpp"
-
 namespace duckdb {
 
 static constexpr double CTE_COST_IMPROVEMENT_THRESHOLD = 0.1;
-static constexpr double CTE_DIRECT_FANOUT_COST_PER_ROW = 1.0;
+static constexpr idx_t CTE_CANDIDATE_BUDGET = 32;
 
-struct CTEPlanEstimate {
-	double processed_bytes = 0;
-	double output_rows = 0;
-	double row_width = 0;
-	bool reliable = false;
+class TableIndexCheckpoint {
+public:
+	explicit TableIndexCheckpoint(Binder &binder_p)
+	    : binder(binder_p), table_index_count(binder_p.GetTableIndexCount()) {
+	}
+
+	~TableIndexCheckpoint() {
+		binder.get().RestoreTableIndexCount(table_index_count);
+	}
+
+private:
+	reference<Binder> binder;
+	idx_t table_index_count;
 };
-
-enum class CTEConsumerExchangeMode : uint8_t { DIRECT, BUFFERED, MATERIALIZED };
 
 struct CTEConsumerInfo {
 	reference<unique_ptr<LogicalOperator>> owner;
-	optional_ptr<LogicalOperator> filter;
+	bool filtered;
 	bool below_delim_join;
-	CTEConsumerExchangeMode exchange_mode;
 };
-
-using CTEReferenceCountMap = reference_map_t<const LogicalOperator, idx_t>;
-
-static idx_t CountCTEReferences(const LogicalOperator &op, TableIndex cte_index,
-                                optional_ptr<CTEReferenceCountMap> reference_counts = nullptr);
 
 static bool IsCTEReference(const LogicalOperator &op, TableIndex cte_index) {
 	return op.type == LogicalOperatorType::LOGICAL_CTE_REF && op.Cast<LogicalCTERef>().cte_index == cte_index;
 }
 
-static bool MaterializesLocalCTEConsumer(LogicalOperatorType type) {
-	switch (type) {
-	case LogicalOperatorType::LOGICAL_JOIN:
-	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
-	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
-	case LogicalOperatorType::LOGICAL_ANY_JOIN:
-	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
-	case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN:
-	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
-	case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
-	case LogicalOperatorType::LOGICAL_ORDER_BY:
-	case LogicalOperatorType::LOGICAL_TOP_N:
-		return true;
-	default:
-		return false;
-	}
-}
-
-static void FindCTEConsumers(unique_ptr<LogicalOperator> &op, TableIndex cte_index,
-                             const CTEReferenceCountMap &reference_counts, vector<CTEConsumerInfo> &consumers,
-                             bool below_delim_join = false,
-                             CTEConsumerExchangeMode exchange_mode = CTEConsumerExchangeMode::DIRECT) {
-	auto reference_count = reference_counts.find(*op);
-	D_ASSERT(reference_count != reference_counts.end());
-	if (reference_count->second == 1) {
-		if (MaterializesLocalCTEConsumer(op->type)) {
-			exchange_mode = CTEConsumerExchangeMode::MATERIALIZED;
-		} else if (op->type == LogicalOperatorType::LOGICAL_LIMIT && exchange_mode == CTEConsumerExchangeMode::DIRECT) {
-			exchange_mode = CTEConsumerExchangeMode::BUFFERED;
-		}
-	}
-	if (IsCTEReference(*op, cte_index)) {
-		consumers.push_back({op, nullptr, below_delim_join, exchange_mode});
-		return;
-	}
+static void FindCTEConsumers(unique_ptr<LogicalOperator> &op, TableIndex cte_index, vector<CTEConsumerInfo> &consumers,
+                             bool below_delim_join = false) {
 	const bool child_below_delim_join = below_delim_join || op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN;
 	if (op->type == LogicalOperatorType::LOGICAL_FILTER && op->children.size() == 1 &&
 	    IsCTEReference(*op->children[0], cte_index)) {
-		consumers.push_back({op->children[0], *op, child_below_delim_join, exchange_mode});
+		consumers.push_back({op, true, child_below_delim_join});
+		return;
+	}
+	if (IsCTEReference(*op, cte_index)) {
+		consumers.push_back({op, false, below_delim_join});
 		return;
 	}
 	for (auto &child : op->children) {
-		FindCTEConsumers(child, cte_index, reference_counts, consumers, child_below_delim_join, exchange_mode);
+		FindCTEConsumers(child, cte_index, consumers, child_below_delim_join);
 	}
 }
 
-static double EstimateRowWidth(const vector<LogicalType> &types) {
-	if (types.empty()) {
-		return 1;
-	}
-	TupleDataLayout tuple_layout;
-	tuple_layout.Initialize(types, TupleDataValidityType::CAN_HAVE_NULL_VALUES);
-	double row_width = static_cast<double>(tuple_layout.GetRowWidth());
-	for (const auto &type : types) {
-		TypeVisitor::VisitReplace(type, [&](const LogicalType &visited_type) {
-			switch (visited_type.InternalType()) {
-			case PhysicalType::VARCHAR:
-				row_width += 8;
-				break;
-			case PhysicalType::LIST:
-			case PhysicalType::ARRAY:
-				row_width += 32;
-				break;
-			default:
-				break;
-			}
-			row_width += 2;
-			return visited_type;
-		});
-	}
-	return row_width;
-}
-
-static bool CostEstimateSupported(const LogicalOperator &op) {
+static bool CostEstimateSupported(const LogicalOperator &op, TableIndex target_cte_index) {
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR:
 	case LogicalOperatorType::LOGICAL_RECURSIVE_CTE:
-	case LogicalOperatorType::LOGICAL_CTE_REF:
 	case LogicalOperatorType::LOGICAL_DELIM_GET:
 	case LogicalOperatorType::LOGICAL_INSERT:
 	case LogicalOperatorType::LOGICAL_DELETE:
 	case LogicalOperatorType::LOGICAL_UPDATE:
 	case LogicalOperatorType::LOGICAL_MERGE_INTO:
 		return false;
+	case LogicalOperatorType::LOGICAL_CTE_REF:
+		if (op.Cast<LogicalCTERef>().cte_index != target_cte_index) {
+			return false;
+		}
+		break;
 	default:
 		break;
 	}
 	for (auto &child : op.children) {
-		if (!CostEstimateSupported(*child)) {
+		if (!CostEstimateSupported(*child, target_cte_index)) {
 			return false;
 		}
 	}
 	return true;
 }
 
-static double EstimateProcessedBytes(LogicalOperator &op, ClientContext &context) {
-	double result = 0;
+static void ResetEstimatedCardinalities(LogicalOperator &op) {
+	op.has_estimated_cardinality = false;
 	for (auto &child : op.children) {
-		result += EstimateProcessedBytes(*child, context);
+		ResetEstimatedCardinalities(*child);
 	}
-	const auto cardinality = op.has_estimated_cardinality ? op.estimated_cardinality : op.EstimateCardinality(context);
-	result += static_cast<double>(cardinality) * EstimateRowWidth(op.types);
-	return result;
 }
 
-static CTEPlanEstimate EstimateCTEPlan(Optimizer &optimizer, optional_ptr<bound_parameter_map_t> parameter_data,
-                                       unique_ptr<LogicalOperator> &definition,
-                                       const vector<reference<LogicalOperator>> &filters) {
-	CTEPlanEstimate result;
-	if (!CostEstimateSupported(*definition)) {
-		return result;
-	}
-
-	unique_ptr<LogicalOperator> plan;
-	try {
-		// Preserve table indexes so rejected estimates do not consume binder state.
-		plan = definition->Copy(optimizer.context);
-		unordered_map<TableIndex, TableIndex> table_idx_replacements;
-		TableBindingReplacer replacer(table_idx_replacements, parameter_data);
-		replacer.VisitOperator(*plan);
-	} catch (NotImplementedException &ex) {
-		return result;
-	}
-
-	if (!filters.empty()) {
-		auto filter_expression = CTEFilterPusher::BuildFilterExpression(*plan, filters);
-		auto filter = make_uniq_base<LogicalOperator, LogicalFilter>(std::move(filter_expression));
-		LogicalFilter::SplitPredicates(filter->Cast<LogicalFilter>().expressions);
-		optimizer.rewriter.VisitOperator(*filter);
-		filter->children.push_back(std::move(plan));
-
-		FilterPushdown pushdown(optimizer, true, FilterPushdown::ProjectionMode::PRESERVE_COMPUTED_EXPRESSIONS);
-		plan = pushdown.Rewrite(std::move(filter));
-	}
-
+static unique_ptr<LogicalOperator> OptimizeCandidate(Optimizer &optimizer, unique_ptr<LogicalOperator> plan) {
+	ResetEstimatedCardinalities(*plan);
+	CTEFilterPusher cte_filter_pusher(optimizer);
+	plan = cte_filter_pusher.Optimize(std::move(plan));
+	FilterPushdown pushdown(optimizer, true, FilterPushdown::ProjectionMode::PRESERVE_COMPUTED_EXPRESSIONS);
+	plan = pushdown.Rewrite(std::move(plan));
 	JoinOrderOptimizer join_order(optimizer.context);
 	plan = join_order.Optimize(std::move(plan));
-	plan->ResolveOperatorTypes();
-	result.output_rows = static_cast<double>(plan->EstimateCardinality(optimizer.context));
-	result.row_width = EstimateRowWidth(plan->types);
-	result.processed_bytes = EstimateProcessedBytes(*plan, optimizer.context);
-	result.reliable = true;
-	return result;
+	StatisticsPropagator propagator(optimizer, *plan);
+	propagator.PropagateStatistics(plan);
+	return plan;
 }
 
-CTEInlining::CTEInlining(Optimizer &optimizer_p) : optimizer(optimizer_p) {
+CTEInlining::CTEInlining(Optimizer &optimizer_p, optional_ptr<set<TableIndex>> processed_ctes_p)
+    : optimizer(optimizer_p), processed_ctes(processed_ctes_p) {
 }
 
 unique_ptr<LogicalOperator> CTEInlining::OptimizeStructural(unique_ptr<LogicalOperator> op) {
@@ -227,8 +142,7 @@ static idx_t CountBaseTableReferences(const LogicalOperator &op) {
 	return number_of_references;
 }
 
-static idx_t CountCTEReferences(const LogicalOperator &op, TableIndex cte_index,
-                                optional_ptr<CTEReferenceCountMap> reference_counts) {
+static idx_t CountCTEReferences(const LogicalOperator &op, TableIndex cte_index) {
 	idx_t number_of_references = 0;
 	if (op.type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &cte = op.Cast<LogicalCTERef>();
@@ -237,10 +151,7 @@ static idx_t CountCTEReferences(const LogicalOperator &op, TableIndex cte_index,
 		}
 	}
 	for (auto &child : op.children) {
-		number_of_references += CountCTEReferences(*child, cte_index, reference_counts);
-	}
-	if (reference_counts) {
-		(*reference_counts)[op] = number_of_references;
+		number_of_references += CountCTEReferences(*child, cte_index);
 	}
 
 	return number_of_references;
@@ -439,113 +350,35 @@ void CTEInlining::TryInlining(unique_ptr<LogicalOperator> &op, bool cost_aware) 
 
 bool CTEInlining::TryCostAwareInlining(unique_ptr<LogicalOperator> &op) {
 	auto &cte = op->Cast<LogicalMaterializedCTE>();
-	CTEReferenceCountMap reference_counts;
-	CountCTEReferences(*op->children[1], cte.table_index, reference_counts);
 	vector<CTEConsumerInfo> consumers;
-	FindCTEConsumers(op->children[1], cte.table_index, reference_counts, consumers);
-	if (consumers.size() < 2 || consumers.size() > 63) {
+	FindCTEConsumers(op->children[1], cte.table_index, consumers);
+	if (consumers.size() < 2) {
+		return false;
+	}
+	if (processed_ctes && !processed_ctes->insert(cte.table_index).second) {
+		return true;
+	}
+	if (optimizer.OptimizerDisabled(OptimizerType::EXPRESSION_REWRITER) ||
+	    optimizer.OptimizerDisabled(OptimizerType::CTE_FILTER_PUSHER) ||
+	    optimizer.OptimizerDisabled(OptimizerType::FILTER_PUSHDOWN) ||
+	    optimizer.OptimizerDisabled(OptimizerType::JOIN_ORDER) ||
+	    optimizer.OptimizerDisabled(OptimizerType::STATISTICS_PROPAGATION)) {
+		return false;
+	}
+	if (!CostEstimateSupported(*op, cte.table_index)) {
 		return false;
 	}
 
 	const idx_t consumer_count = consumers.size();
-	const uint64_t all_consumers = (uint64_t(1) << consumer_count) - 1;
-	uint64_t mandatory_materialized = 0;
+	set<idx_t> all_consumers;
+	set<idx_t> mandatory_materialized;
 	const bool producer_contains_delim_get = ContainsDelimGet(*cte.children[0]);
 	for (idx_t consumer_idx = 0; consumer_idx < consumer_count; consumer_idx++) {
+		all_consumers.insert(consumer_idx);
 		if (producer_contains_delim_get && consumers[consumer_idx].below_delim_join) {
-			mandatory_materialized |= uint64_t(1) << consumer_idx;
+			mandatory_materialized.insert(consumer_idx);
 		}
 	}
-	bool has_materialized_consumer = false;
-	for (auto &consumer : consumers) {
-		if (consumer.exchange_mode == CTEConsumerExchangeMode::MATERIALIZED) {
-			has_materialized_consumer = true;
-			break;
-		}
-	}
-	if (!has_materialized_consumer) {
-		return false;
-	}
-
-	vector<CTEPlanEstimate> inline_estimates;
-	inline_estimates.reserve(consumer_count);
-	for (auto &consumer : consumers) {
-		vector<reference<LogicalOperator>> filters;
-		if (consumer.filter) {
-			filters.push_back(*consumer.filter);
-		}
-		auto estimate = EstimateCTEPlan(optimizer, parameter_data, cte.children[0], filters);
-		if (!estimate.reliable) {
-			return false;
-		}
-		inline_estimates.push_back(estimate);
-	}
-
-	unordered_map<uint64_t, CTEPlanEstimate> residual_estimates;
-	auto get_residual_estimate = [&](uint64_t inline_mask) -> CTEPlanEstimate & {
-		auto entry = residual_estimates.find(inline_mask);
-		if (entry != residual_estimates.end()) {
-			return entry->second;
-		}
-		vector<reference<LogicalOperator>> filters;
-		bool all_materialized_consumers_are_filtered = true;
-		for (idx_t consumer_idx = 0; consumer_idx < consumer_count; consumer_idx++) {
-			if (inline_mask & (uint64_t(1) << consumer_idx)) {
-				continue;
-			}
-			if (!consumers[consumer_idx].filter) {
-				all_materialized_consumers_are_filtered = false;
-				break;
-			}
-			filters.push_back(*consumers[consumer_idx].filter);
-		}
-		if (!all_materialized_consumers_are_filtered) {
-			filters.clear();
-		}
-		auto estimate = EstimateCTEPlan(optimizer, parameter_data, cte.children[0], filters);
-		return residual_estimates.emplace(inline_mask, estimate).first->second;
-	};
-
-	auto estimate_subset = [&](uint64_t inline_mask, bool &reliable) {
-		double cost = 0;
-		idx_t materialized_count = 0;
-		idx_t direct_count = 0;
-		idx_t buffered_count = 0;
-		for (idx_t consumer_idx = 0; consumer_idx < consumer_count; consumer_idx++) {
-			if (inline_mask & (uint64_t(1) << consumer_idx)) {
-				cost += inline_estimates[consumer_idx].processed_bytes;
-			} else {
-				switch (consumers[consumer_idx].exchange_mode) {
-				case CTEConsumerExchangeMode::DIRECT:
-					direct_count++;
-					break;
-				case CTEConsumerExchangeMode::BUFFERED:
-					buffered_count++;
-					break;
-				case CTEConsumerExchangeMode::MATERIALIZED:
-					materialized_count++;
-					break;
-				}
-			}
-		}
-		const auto residual_count = direct_count + buffered_count + materialized_count;
-		if (residual_count > 0) {
-			auto &residual = get_residual_estimate(inline_mask);
-			if (!residual.reliable) {
-				reliable = false;
-				return 0.0;
-			}
-			const auto output_bytes = residual.output_rows * residual.row_width;
-			cost += residual.processed_bytes;
-			cost += residual.output_rows * static_cast<double>(direct_count) * CTE_DIRECT_FANOUT_COST_PER_ROW;
-			cost += output_bytes * static_cast<double>(buffered_count);
-			if (materialized_count > 0) {
-				cost += output_bytes * static_cast<double>(materialized_count + 1);
-			}
-		}
-		reliable = true;
-		return cost;
-	};
 
 	bool legacy_inline = false;
 	if (!EndsInAggregateOrDistinct(*cte.children[0])) {
@@ -557,188 +390,232 @@ bool CTEInlining::TryCostAwareInlining(unique_ptr<LogicalOperator> &op) {
 		    !cheap && base_table_references > 2 && base_table_references * consumer_count > 10;
 		legacy_inline = !too_expensive_to_copy && (cheap || ContainsLimit(*cte.children[1]));
 	}
-	const uint64_t legacy_mask = legacy_inline ? all_consumers : 0;
-
-	bool legacy_reliable;
-	const auto legacy_cost = estimate_subset(legacy_mask, legacy_reliable);
-	if (!legacy_reliable) {
+	const set<idx_t> legacy_set = legacy_inline ? all_consumers : set<idx_t>();
+	auto valid_subset = [&](const set<idx_t> &inline_set) {
+		for (auto consumer_idx : mandatory_materialized) {
+			if (inline_set.find(consumer_idx) != inline_set.end()) {
+				return false;
+			}
+		}
+		const auto residual_count = consumer_count - inline_set.size();
+		if (residual_count != 1) {
+			return true;
+		}
+		for (idx_t consumer_idx = 0; consumer_idx < consumer_count; consumer_idx++) {
+			if (inline_set.find(consumer_idx) == inline_set.end()) {
+				return mandatory_materialized.find(consumer_idx) != mandatory_materialized.end();
+			}
+		}
 		return false;
-	}
-	double best_cost = legacy_cost;
-	uint64_t best_mask = legacy_mask;
-	auto valid_subset = [&](uint64_t inline_mask) {
-		if (inline_mask & mandatory_materialized) {
+	};
+
+	auto apply_set = [&](unique_ptr<LogicalOperator> &candidate, const set<idx_t> &inline_set) {
+		if (inline_set.empty()) {
+			return true;
+		}
+		auto &candidate_cte = candidate->Cast<LogicalMaterializedCTE>();
+		vector<CTEConsumerInfo> candidate_consumers;
+		FindCTEConsumers(candidate_cte.children[1], candidate_cte.table_index, candidate_consumers);
+		if (candidate_consumers.size() != consumer_count) {
 			return false;
 		}
-		const auto materialized_mask = all_consumers & ~inline_mask;
-		if (materialized_mask && (materialized_mask & (materialized_mask - 1)) == 0 &&
-		    !(materialized_mask & mandatory_materialized)) {
-			return false;
+		candidate_cte.children[0]->ResolveOperatorTypes();
+		vector<unique_ptr<LogicalOperator>> replacements;
+		replacements.reserve(inline_set.size());
+		for (auto consumer_idx : inline_set) {
+			auto &consumer = candidate_consumers[consumer_idx];
+			auto &consumer_op = *consumer.owner.get();
+			auto &cteref =
+			    consumer.filtered ? consumer_op.children[0]->Cast<LogicalCTERef>() : consumer_op.Cast<LogicalCTERef>();
+			LogicalOperatorDeepCopy deep_copy(optimizer.binder, parameter_data);
+			unique_ptr<LogicalOperator> definition_copy;
+			try {
+				definition_copy = deep_copy.DeepCopy(candidate_cte.children[0]);
+			} catch (NotImplementedException &ex) {
+				return false;
+			}
+			if (consumer.filtered) {
+				vector<reference<LogicalOperator>> filters {consumer_op};
+				auto filter_expression = CTEFilterPusher::BuildFilterExpression(*definition_copy, filters);
+				auto filter = make_uniq_base<LogicalOperator, LogicalFilter>(std::move(filter_expression));
+				LogicalFilter::SplitPredicates(filter->Cast<LogicalFilter>().expressions);
+				optimizer.rewriter.VisitOperator(*filter);
+				filter->children.push_back(std::move(definition_copy));
+				FilterPushdown pushdown(optimizer, true, FilterPushdown::ProjectionMode::PRESERVE_COMPUTED_EXPRESSIONS);
+				definition_copy = pushdown.Rewrite(std::move(filter));
+			}
+			vector<unique_ptr<Expression>> projection_expressions;
+			auto bindings = definition_copy->GetColumnBindings();
+			for (idx_t column_idx = 0; column_idx < bindings.size(); column_idx++) {
+				projection_expressions.push_back(make_uniq<BoundColumnRefExpression>(
+				    candidate_cte.children[0]->types[column_idx], bindings[column_idx]));
+			}
+			auto projection = make_uniq<LogicalProjection>(cteref.table_index, std::move(projection_expressions));
+			projection->children.push_back(std::move(definition_copy));
+			replacements.push_back(std::move(projection));
+		}
+
+		idx_t replacement_idx = 0;
+		for (auto consumer_idx : inline_set) {
+			candidate_consumers[consumer_idx].owner.get() = std::move(replacements[replacement_idx++]);
+		}
+		if (inline_set.size() == consumer_count) {
+			candidate = std::move(candidate_cte.children[1]);
 		}
 		return true;
 	};
 
-	set<uint64_t> candidates;
-	candidates.insert(legacy_mask);
+	map<set<idx_t>, double> costs;
+	idx_t evaluated_candidates = 0;
+	bool legacy_all_direct = false;
+	auto estimate_subset = [&](const set<idx_t> &inline_set) -> optional<double> {
+		auto existing = costs.find(inline_set);
+		if (existing != costs.end()) {
+			return existing->second;
+		}
+		if (evaluated_candidates >= CTE_CANDIDATE_BUDGET) {
+			return optional<double>();
+		}
+		evaluated_candidates++;
+		TableIndexCheckpoint checkpoint(optimizer.binder);
+		try {
+			auto candidate = op->Copy(optimizer.context);
+			if (!apply_set(candidate, inline_set)) {
+				return optional<double>();
+			}
+			candidate = OptimizeCandidate(optimizer, std::move(candidate));
+			auto estimate =
+			    PhysicalPlanGenerator::EstimateCandidateCost(optimizer.context, std::move(candidate), cte.table_index);
+			if (estimate) {
+				if (inline_set == legacy_set && estimate->target_cte_found) {
+					legacy_all_direct = estimate->direct_cte_consumers == consumer_count &&
+					                    estimate->buffered_cte_consumers == 0 &&
+					                    estimate->materialized_cte_consumers == 0;
+				}
+				costs.emplace(inline_set, estimate->cost);
+				return estimate->cost;
+			}
+			return optional<double>();
+		} catch (NotImplementedException &ex) {
+			return optional<double>();
+		}
+	};
+
+	auto legacy_cost = estimate_subset(legacy_set);
+	if (!legacy_cost) {
+		return false;
+	}
+	if (legacy_set.empty() && legacy_all_direct) {
+		return true;
+	}
+	estimate_subset(set<idx_t>());
+	if (valid_subset(all_consumers)) {
+		estimate_subset(all_consumers);
+	}
+
+	set<set<idx_t>> candidates;
+	candidates.insert(legacy_set);
+	candidates.insert(set<idx_t>());
+	if (valid_subset(all_consumers)) {
+		candidates.insert(all_consumers);
+	}
 	if (consumer_count <= 4) {
-		for (uint64_t inline_mask = 0; inline_mask <= all_consumers; inline_mask++) {
-			if (valid_subset(inline_mask)) {
-				candidates.insert(inline_mask);
+		const auto subset_count = uint64_t(1) << consumer_count;
+		for (uint64_t mask = 0; mask < subset_count; mask++) {
+			set<idx_t> inline_set;
+			for (idx_t consumer_idx = 0; consumer_idx < consumer_count; consumer_idx++) {
+				if (mask & (uint64_t(1) << consumer_idx)) {
+					inline_set.insert(consumer_idx);
+				}
+			}
+			if (valid_subset(inline_set)) {
+				candidates.insert(std::move(inline_set));
 			}
 		}
 	} else {
-		uint64_t current_mask = 0;
-		while (true) {
-			candidates.insert(current_mask);
+		set<idx_t> current_set;
+		while (current_set.size() < consumer_count) {
+			candidates.insert(current_set);
 			optional_idx best_consumer;
 			double best_next_cost = NumericLimits<double>::Maximum();
 			for (idx_t consumer_idx = 0; consumer_idx < consumer_count; consumer_idx++) {
-				const auto bit = uint64_t(1) << consumer_idx;
-				if ((current_mask & bit) || (mandatory_materialized & bit)) {
+				if (current_set.find(consumer_idx) != current_set.end() ||
+				    mandatory_materialized.find(consumer_idx) != mandatory_materialized.end()) {
 					continue;
 				}
-				const auto next_mask = current_mask | bit;
-				if (!valid_subset(next_mask)) {
+				auto next_set = current_set;
+				next_set.insert(consumer_idx);
+				if (!valid_subset(next_set)) {
 					continue;
 				}
-				bool reliable;
-				const auto cost = estimate_subset(next_mask, reliable);
-				if (!reliable) {
-					return false;
-				}
-				if (cost < best_next_cost) {
-					best_next_cost = cost;
+				auto cost = estimate_subset(next_set);
+				if (cost && *cost < best_next_cost) {
+					best_next_cost = *cost;
 					best_consumer = consumer_idx;
 				}
 			}
 			if (!best_consumer.IsValid()) {
 				break;
 			}
-			current_mask |= uint64_t(1) << best_consumer.GetIndex();
+			current_set.insert(best_consumer.GetIndex());
 		}
 
-		current_mask = all_consumers & ~mandatory_materialized;
-		if (mandatory_materialized == 0) {
-			uint64_t best_seed = current_mask;
-			double best_seed_cost = NumericLimits<double>::Maximum();
-			vector<idx_t> seed_candidates;
-			for (idx_t consumer_idx = 0; consumer_idx < consumer_count; consumer_idx++) {
-				seed_candidates.push_back(consumer_idx);
+		current_set.clear();
+		for (idx_t consumer_idx = 0; consumer_idx < consumer_count; consumer_idx++) {
+			if (mandatory_materialized.find(consumer_idx) == mandatory_materialized.end()) {
+				current_set.insert(consumer_idx);
 			}
-			std::sort(seed_candidates.begin(), seed_candidates.end(), [&](idx_t left, idx_t right) {
-				return inline_estimates[left].processed_bytes > inline_estimates[right].processed_bytes;
-			});
-			seed_candidates.resize(MinValue<idx_t>(seed_candidates.size(), 8));
-			for (idx_t left_pos = 0; left_pos < seed_candidates.size(); left_pos++) {
-				for (idx_t right_pos = left_pos + 1; right_pos < seed_candidates.size(); right_pos++) {
-					const auto left_idx = seed_candidates[left_pos];
-					const auto right_idx = seed_candidates[right_pos];
-					const auto seed_mask = current_mask & ~(uint64_t(1) << left_idx) & ~(uint64_t(1) << right_idx);
-					bool reliable;
-					const auto cost = estimate_subset(seed_mask, reliable);
-					if (!reliable) {
-						return false;
-					}
-					if (cost < best_seed_cost) {
-						best_seed_cost = cost;
-						best_seed = seed_mask;
-					}
-				}
-			}
-			candidates.insert(current_mask);
-			current_mask = best_seed;
 		}
-		while (true) {
-			if (valid_subset(current_mask)) {
-				candidates.insert(current_mask);
+		while (!current_set.empty()) {
+			if (valid_subset(current_set)) {
+				candidates.insert(current_set);
 			}
 			optional_idx best_consumer;
 			double best_next_cost = NumericLimits<double>::Maximum();
-			for (idx_t consumer_idx = 0; consumer_idx < consumer_count; consumer_idx++) {
-				const auto bit = uint64_t(1) << consumer_idx;
-				if (!(current_mask & bit)) {
+			for (auto consumer_idx : current_set) {
+				auto next_set = current_set;
+				next_set.erase(consumer_idx);
+				if (!valid_subset(next_set)) {
 					continue;
 				}
-				const auto next_mask = current_mask & ~bit;
-				if (!valid_subset(next_mask)) {
-					continue;
-				}
-				bool reliable;
-				const auto cost = estimate_subset(next_mask, reliable);
-				if (!reliable) {
-					return false;
-				}
-				if (cost < best_next_cost) {
-					best_next_cost = cost;
+				auto cost = estimate_subset(next_set);
+				if (cost && *cost < best_next_cost) {
+					best_next_cost = *cost;
 					best_consumer = consumer_idx;
 				}
 			}
 			if (!best_consumer.IsValid()) {
 				break;
 			}
-			current_mask &= ~(uint64_t(1) << best_consumer.GetIndex());
+			current_set.erase(best_consumer.GetIndex());
 		}
 	}
 
-	for (auto inline_mask : candidates) {
-		if (!valid_subset(inline_mask) && inline_mask != legacy_mask) {
+	double best_cost = *legacy_cost;
+	set<idx_t> best_set = legacy_set;
+	for (const auto &inline_set : candidates) {
+		if (!valid_subset(inline_set) && inline_set != legacy_set) {
 			continue;
 		}
-		bool reliable;
-		const auto cost = estimate_subset(inline_mask, reliable);
-		if (!reliable) {
-			return false;
+		auto cost = estimate_subset(inline_set);
+		if (inline_set != legacy_set && (inline_set.empty() || inline_set.size() == consumer_count)) {
+			continue;
 		}
-		if (cost < best_cost) {
-			best_cost = cost;
-			best_mask = inline_mask;
+		if (cost && *cost < best_cost) {
+			best_cost = *cost;
+			best_set = inline_set;
 		}
 	}
 
-	uint64_t selected_mask = legacy_mask;
-	const bool mixed_plan = best_mask != 0 && best_mask != all_consumers;
-	if (mixed_plan && best_mask != legacy_mask && best_cost <= legacy_cost * (1.0 - CTE_COST_IMPROVEMENT_THRESHOLD)) {
-		selected_mask = best_mask;
+	set<idx_t> selected_set = legacy_set;
+	if (best_set != legacy_set && best_cost <= *legacy_cost * (1.0 - CTE_COST_IMPROVEMENT_THRESHOLD)) {
+		selected_set = std::move(best_set);
 	}
-	if (selected_mask == 0) {
+	if (selected_set.empty()) {
 		return true;
 	}
-
-	cte.children[0]->ResolveOperatorTypes();
-	vector<unique_ptr<LogicalOperator>> replacements;
-	replacements.reserve(consumer_count);
-	for (idx_t consumer_idx = 0; consumer_idx < consumer_count; consumer_idx++) {
-		if (!(selected_mask & (uint64_t(1) << consumer_idx))) {
-			continue;
-		}
-		auto &cteref = consumers[consumer_idx].owner.get()->Cast<LogicalCTERef>();
-		LogicalOperatorDeepCopy deep_copy(optimizer.binder, parameter_data);
-		unique_ptr<LogicalOperator> copy;
-		try {
-			copy = deep_copy.DeepCopy(cte.children[0]);
-		} catch (NotImplementedException &ex) {
-			return false;
-		}
-
-		vector<unique_ptr<Expression>> projection_expressions;
-		auto bindings = copy->GetColumnBindings();
-		for (idx_t column_idx = 0; column_idx < bindings.size(); column_idx++) {
-			projection_expressions.push_back(
-			    make_uniq<BoundColumnRefExpression>(cte.children[0]->types[column_idx], bindings[column_idx]));
-		}
-		auto projection = make_uniq<LogicalProjection>(cteref.table_index, std::move(projection_expressions));
-		projection->children.push_back(std::move(copy));
-		replacements.push_back(std::move(projection));
-	}
-
-	idx_t replacement_idx = 0;
-	for (idx_t consumer_idx = 0; consumer_idx < consumer_count; consumer_idx++) {
-		if (selected_mask & (uint64_t(1) << consumer_idx)) {
-			consumers[consumer_idx].owner.get() = std::move(replacements[replacement_idx++]);
-		}
-	}
-	if (selected_mask == all_consumers) {
-		op = std::move(cte.children[1]);
+	if (!apply_set(op, selected_set)) {
+		return false;
 	}
 	has_changes = true;
 	return true;

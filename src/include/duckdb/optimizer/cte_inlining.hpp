@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/common/insertion_order_preserving_map.hpp"
+#include "duckdb/common/set.hpp"
 #include "duckdb/planner/bound_parameter_map.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/expression/list.hpp"
@@ -23,7 +24,7 @@ struct BoundParameterData;
 
 class CTEInlining {
 public:
-	explicit CTEInlining(Optimizer &optimizer);
+	explicit CTEInlining(Optimizer &optimizer, optional_ptr<set<TableIndex>> processed_ctes = nullptr);
 	unique_ptr<LogicalOperator> OptimizeStructural(unique_ptr<LogicalOperator> op);
 	unique_ptr<LogicalOperator> OptimizeCostAware(unique_ptr<LogicalOperator> op);
 	bool HasChanges() const;
@@ -37,6 +38,7 @@ private:
 private:
 	//! The optimizer
 	Optimizer &optimizer;
+	optional_ptr<set<TableIndex>> processed_ctes;
 
 	optional_ptr<bound_parameter_map_t> parameter_data;
 	bool has_changes = false;

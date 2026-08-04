@@ -287,10 +287,10 @@ void Optimizer::RunBuiltInOptimizers() {
 		plan = window_self_join_optimizer.Optimize(std::move(plan));
 	});
 
-	// choose the execution strategy for default multi-reader CTEs after all early CTE-producing rewrites
+	set<TableIndex> costed_ctes;
 	bool cost_aware_cte_changed = false;
 	RunOptimizer(OptimizerType::CTE_INLINING, [&]() {
-		CTEInlining cte_inlining(*this);
+		CTEInlining cte_inlining(*this, costed_ctes);
 		plan = cte_inlining.OptimizeCostAware(std::move(plan));
 		cost_aware_cte_changed = cte_inlining.HasChanges();
 	});
@@ -385,6 +385,29 @@ void Optimizer::RunBuiltInOptimizers() {
 			CommonSubplanOptimizer common_subplan_optimizer(*this);
 			plan = common_subplan_optimizer.Optimize(std::move(plan));
 		});
+
+		cost_aware_cte_changed = false;
+		RunOptimizer(OptimizerType::CTE_INLINING, [&]() {
+			CTEInlining cte_inlining(*this, costed_ctes);
+			plan = cte_inlining.OptimizeCostAware(std::move(plan));
+			cost_aware_cte_changed = cte_inlining.HasChanges();
+		});
+		if (cost_aware_cte_changed) {
+			RunOptimizer(OptimizerType::CTE_FILTER_PUSHER, [&]() {
+				CTEFilterPusher cte_filter_pusher(*this);
+				plan = cte_filter_pusher.Optimize(std::move(plan));
+			});
+			RunOptimizer(OptimizerType::FILTER_PUSHDOWN, [&]() {
+				FilterPushdown filter_pushdown(*this);
+				unordered_set<TableIndex> top_bindings;
+				filter_pushdown.CheckMarkToSemi(*plan, top_bindings);
+				plan = filter_pushdown.Rewrite(std::move(plan));
+			});
+			RunOptimizer(OptimizerType::JOIN_ORDER, [&]() {
+				JoinOrderOptimizer optimizer(context);
+				plan = optimizer.Optimize(std::move(plan));
+			});
+		}
 	}
 
 	// pushes LIMIT below PROJECTION

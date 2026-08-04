@@ -17,6 +17,8 @@
 #include "duckdb/catalog/dependency_list.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "duckdb/common/optional.hpp"
+#include "duckdb/common/optional_idx.hpp"
 
 namespace duckdb {
 class ClientContext;
@@ -29,6 +31,14 @@ struct RecursiveCTEPlanningInfo {
 	vector<idx_t> distinct_indices;
 	vector<idx_t> payload_indices;
 	vector<reference<PhysicalRecursiveCTEStateScan>> state_scans;
+};
+
+struct PhysicalPlanCostEstimate {
+	double cost = 0;
+	idx_t direct_cte_consumers = 0;
+	idx_t buffered_cte_consumers = 0;
+	idx_t materialized_cte_consumers = 0;
+	bool target_cte_found = false;
 };
 
 class PhysicalPlan {
@@ -101,6 +111,9 @@ public:
 	//! Creates and returns the physical plan from the logical operator.
 	//! Performs a verification pass.
 	unique_ptr<PhysicalPlan> Plan(unique_ptr<LogicalOperator> logical);
+	//! Physically plans a candidate without executing it and returns a pipeline-aware byte-work estimate.
+	static optional<PhysicalPlanCostEstimate>
+	EstimateCandidateCost(ClientContext &context, unique_ptr<LogicalOperator> logical, TableIndex target_cte_index);
 	PhysicalOperator &CreatePlan(LogicalOperator &op);
 
 	//! Whether or not we can (or should) use a batch-index based operator for executing the given sink
