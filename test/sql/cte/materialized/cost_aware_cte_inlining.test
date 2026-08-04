@@ -15,6 +15,12 @@ statement ok
 CREATE TABLE cte_cost_c AS SELECT i FROM range(100000) t(i)
 
 statement ok
+CREATE TABLE cte_cost_corr_a AS SELECT i, i % 7 AS g FROM range(1000) t(i)
+
+statement ok
+CREATE TABLE cte_cost_corr_b AS SELECT i FROM range(750, 1000) t(i)
+
+statement ok
 ANALYZE
 
 # The selective join reader would be materialized by the exchange, so it is inlined while both direct readers share
@@ -105,6 +111,27 @@ SELECT (SELECT sum(g) FROM cte),
        (SELECT g FROM cte LIMIT 1) IS NOT NULL
 ----
 4950000	10000000	1
+
+# An internally generated correlated CTE can depend on bindings above its wrapper. Speculative physical planning
+# falls back without aborting the query.
+query III
+SELECT g, count(*), sum(i)
+FROM (
+	SELECT cte_cost_corr_a.i % 7 AS g, cte_cost_corr_a.i
+	FROM cte_cost_corr_a
+	WHERE cte_cost_corr_a.i > (SELECT avg(i) FROM cte_cost_corr_a WHERE i > 0)
+	  AND NOT EXISTS (SELECT * FROM cte_cost_corr_b WHERE cte_cost_corr_b.i = cte_cost_corr_a.i)
+) grouped
+GROUP BY g
+ORDER BY g
+----
+0	36	22554
+1	35	21840
+2	35	21875
+3	35	21910
+4	36	22446
+5	36	22482
+6	36	22518
 
 # The corresponding materialized plan uses one buffered and two direct exchange consumers.
 query II

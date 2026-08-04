@@ -102,6 +102,8 @@ optional<PhysicalPlanCostEstimate> PhysicalPlanGenerator::EstimateCandidateCost(
 		return estimate;
 	} catch (NotImplementedException &) {
 		return optional<PhysicalPlanCostEstimate>();
+	} catch (InternalException &) {
+		return optional<PhysicalPlanCostEstimate>();
 	}
 }
 
