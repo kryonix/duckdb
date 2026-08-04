@@ -110,8 +110,7 @@ static unique_ptr<LogicalOperator> OptimizeCandidate(Optimizer &optimizer, uniqu
 	return plan;
 }
 
-CTEInlining::CTEInlining(Optimizer &optimizer_p, optional_ptr<set<TableIndex>> processed_ctes_p)
-    : optimizer(optimizer_p), processed_ctes(processed_ctes_p) {
+CTEInlining::CTEInlining(Optimizer &optimizer_p) : optimizer(optimizer_p) {
 }
 
 unique_ptr<LogicalOperator> CTEInlining::OptimizeStructural(unique_ptr<LogicalOperator> op) {
@@ -376,9 +375,6 @@ bool CTEInlining::TryCostAwareInlining(unique_ptr<LogicalOperator> &op) {
 	FindCTEConsumers(op->children[1], cte.table_index, consumers);
 	if (consumers.size() < 2) {
 		return false;
-	}
-	if (processed_ctes && !processed_ctes->insert(cte.table_index).second) {
-		return true;
 	}
 	if (optimizer.OptimizerDisabled(OptimizerType::EXPRESSION_REWRITER) ||
 	    optimizer.OptimizerDisabled(OptimizerType::CTE_FILTER_PUSHER) ||
