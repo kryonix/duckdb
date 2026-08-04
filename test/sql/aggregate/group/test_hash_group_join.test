@@ -1835,6 +1835,38 @@ GROUP BY o.id
 ----
 physical_plan	<REGEX>:.*Index Group Join.*gj_auto_probe_art.*
 
+# A SEMI join can use the same owner-driven lookup when its right side is the proven unique owner.
+query II
+EXPLAIN SELECT p.id, count(*), sum(p.value)
+FROM gj_auto_index_probe p SEMI JOIN gj_auto_index_owner o USING (id)
+GROUP BY p.id
+----
+physical_plan	<REGEX>:.*Index Group Join.*gj_auto_probe_art.*
+
+query II
+SELECT count(*), sum(p.value)
+FROM gj_auto_index_probe p SEMI JOIN gj_auto_index_owner o USING (id)
+GROUP BY p.id
+----
+5	20000
+
+# Grouped owner domains are unique on their complete grouping key without declared constraints.
+query II
+EXPLAIN SELECT p.id, count(*), sum(p.value)
+FROM gj_auto_index_probe p
+SEMI JOIN (SELECT id FROM (VALUES (1::BIGINT), (1::BIGINT)) domain(id) GROUP BY id) o USING (id)
+GROUP BY p.id
+----
+physical_plan	<REGEX>:.*Index Group Join.*gj_auto_probe_art.*
+
+query II
+SELECT count(*), sum(p.value)
+FROM gj_auto_index_probe p
+SEMI JOIN (SELECT id FROM (VALUES (1::BIGINT), (1::BIGINT)) domain(id) GROUP BY id) o USING (id)
+GROUP BY p.id
+----
+5	20000
+
 statement ok
 SET debug_group_join_strategy = 'auto'
 
@@ -1842,6 +1874,14 @@ query II
 EXPLAIN SELECT o.id, count(*), sum(p.value)
 FROM gj_auto_index_owner o JOIN gj_auto_index_probe p USING (id)
 GROUP BY o.id
+----
+physical_plan	<REGEX>:.*Index Group Join.*gj_auto_probe_art.*
+
+query II
+EXPLAIN SELECT p.id, count(*), sum(p.value)
+FROM gj_auto_index_probe p
+SEMI JOIN (SELECT id FROM (VALUES (1::BIGINT), (1::BIGINT)) domain(id) GROUP BY id) o USING (id)
+GROUP BY p.id
 ----
 physical_plan	<REGEX>:.*Index Group Join.*gj_auto_probe_art.*
 
@@ -1853,6 +1893,20 @@ SELECT count(*), sum(n), sum(s) FROM (
 )
 ----
 1	5	20000
+
+# AUTO rejects indexed lookup when the owner domain is more than 0.5% of the probe.
+statement ok
+CREATE TABLE gj_auto_index_broad_owner(id BIGINT PRIMARY KEY)
+
+statement ok
+INSERT INTO gj_auto_index_broad_owner SELECT i FROM range(100) t(i)
+
+query II
+EXPLAIN SELECT o.id, count(*), sum(p.value)
+FROM gj_auto_index_broad_owner o JOIN gj_auto_index_probe p USING (id)
+GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Index Group Join.*
 
 statement ok
 RESET debug_group_join_strategy

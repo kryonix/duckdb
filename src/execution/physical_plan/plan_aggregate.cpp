@@ -66,7 +66,25 @@ static optional<IndexGroupJoinInfo> TryGetIndexGroupJoinInfo(ClientContext &cont
 	}
 	vector<unique_ptr<Expression>> residual_filters;
 	reference<PhysicalOperator> probe_child(probe);
-	while (probe_child.get().type == PhysicalOperatorType::FILTER) {
+	while (probe_child.get().type == PhysicalOperatorType::FILTER ||
+	       probe_child.get().type == PhysicalOperatorType::PROJECTION) {
+		if (probe_child.get().type == PhysicalOperatorType::PROJECTION) {
+			auto &projection = probe_child.get().Cast<PhysicalProjection>();
+			if (projection.children.size() != 1 ||
+			    projection.select_list.size() != projection.children[0].get().GetTypes().size() ||
+			    projection.GetTypes() != projection.children[0].get().GetTypes()) {
+				return nullopt;
+			}
+			for (idx_t column_idx = 0; column_idx < projection.select_list.size(); column_idx++) {
+				auto &expression = projection.select_list[column_idx];
+				if (expression->GetExpressionClass() != ExpressionClass::BOUND_REF ||
+				    expression->Cast<BoundReferenceExpression>().Index() != column_idx) {
+					return nullopt;
+				}
+			}
+			probe_child = projection.children[0];
+			continue;
+		}
 		auto &filter = probe_child.get().Cast<PhysicalFilter>();
 		if (filter.expression->IsVolatile() || filter.children.size() != 1) {
 			return nullopt;

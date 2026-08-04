@@ -357,7 +357,7 @@ struct AutoHashGroupJoinCostModel {
 	static constexpr double MIN_OWNERSHIP_FANOUT = 12;
 	static constexpr double MAX_FANOUT = 32;
 	static constexpr double MAX_COST_RATIO = 0.9;
-	static constexpr double MAX_INDEX_OWNER_PROBE_RATIO = 0.0001;
+	static constexpr double MAX_INDEX_OWNER_PROBE_RATIO = 0.005;
 	static constexpr double MAX_INDEX_RETENTION = 0.25;
 	static constexpr double MAX_EAGER_MATERIALIZATION_PENALTY = 0.75;
 	static constexpr double EAGER_DISTINCT_KEY_PENALTY = 8;
@@ -396,7 +396,25 @@ static bool HasAutoHashGroupJoinART(LogicalComparisonJoin &join, const HashGroup
                                     ClientContext &context) {
 	vector<idx_t> probe_columns = candidate.probe_key_indices;
 	reference<LogicalOperator> probe(*join.children[candidate.probe_child]);
-	while (probe.get().type == LogicalOperatorType::LOGICAL_FILTER) {
+	while (probe.get().type == LogicalOperatorType::LOGICAL_FILTER ||
+	       probe.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		if (probe.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			auto &projection = probe.get().Cast<LogicalProjection>();
+			if (projection.children.size() != 1 ||
+			    projection.expressions.size() != projection.children[0]->GetColumnBindings().size()) {
+				return false;
+			}
+			for (idx_t column_idx = 0; column_idx < projection.expressions.size(); column_idx++) {
+				auto &expression = projection.expressions[column_idx];
+				auto child_index = GetDirectReferenceIndex(*expression, *projection.children[0]);
+				if (!child_index.IsValid() || child_index.GetIndex() != column_idx ||
+				    expression->GetReturnType() != projection.children[0]->types[column_idx]) {
+					return false;
+				}
+			}
+			probe = *projection.children[0];
+			continue;
+		}
 		auto &filter = probe.get().Cast<LogicalFilter>();
 		for (auto &expression : filter.expressions) {
 			if (expression->IsVolatile()) {
@@ -623,6 +641,9 @@ HashGroupJoinCostEstimate EstimateHashGroupJoinCost(LogicalAggregate &aggregate,
 	    TryGetPerfectGroupJoinBounds(aggregate, join, candidate, context, perfect_min, perfect_max, perfect_range);
 	const auto direct_inner = join.join_type == JoinType::INNER && !candidate.routed && candidate.unique_owner &&
 	                          candidate.unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD;
+	const auto index_compatible = (direct_inner || candidate.single_match) && !candidate.routed &&
+	                              candidate.unique_owner &&
+	                              candidate.unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD;
 	result = EstimateHashGroupJoinAlternatives(
 	    join.children[candidate.owner_child]->estimated_cardinality,
 	    join.children[candidate.probe_child]->estimated_cardinality, join.estimated_cardinality,
@@ -636,8 +657,8 @@ HashGroupJoinCostEstimate EstimateHashGroupJoinCost(LogicalAggregate &aggregate,
 		result.physical_eager_selected = false;
 		result.perfect_selected = false;
 	}
-	result.index_available = direct_inner && HasAutoHashGroupJoinART(join, candidate, context);
-	if (auto_aggregates_supported && direct_inner && result.probe_rows != 0 &&
+	result.index_available = index_compatible && HasAutoHashGroupJoinART(join, candidate, context);
+	if (auto_aggregates_supported && index_compatible && result.probe_rows != 0 &&
 	    static_cast<double>(result.owner_rows) <=
 	        AutoHashGroupJoinCostModel::MAX_INDEX_OWNER_PROBE_RATIO * static_cast<double>(result.probe_rows) &&
 	    static_cast<double>(result.match_rows) <=

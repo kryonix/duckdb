@@ -10,6 +10,7 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
 
 namespace duckdb {
 
@@ -95,6 +96,66 @@ optional<UniqueKeyProperty> GetUniqueKeyProperty(LogicalOperator &owner, const v
 		return nullopt;
 	}
 	auto logical_columns = output_columns;
+	reference<LogicalOperator> current(owner);
+	while (current.get().type == LogicalOperatorType::LOGICAL_FILTER ||
+	       current.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		if (current.get().children.size() != 1) {
+			return nullopt;
+		}
+		if (current.get().type == LogicalOperatorType::LOGICAL_FILTER) {
+			auto &filter = current.get().Cast<LogicalFilter>();
+			if (!filter.projection_map.empty()) {
+				for (auto &index : logical_columns) {
+					if (index >= filter.projection_map.size()) {
+						return nullopt;
+					}
+					index = filter.projection_map[index].GetIndex();
+				}
+			}
+		} else {
+			auto &projection = current.get().Cast<LogicalProjection>();
+			for (auto &index : logical_columns) {
+				if (index >= projection.expressions.size()) {
+					return nullopt;
+				}
+				auto child_index =
+				    GetKeyPropertyDirectReferenceIndex(*projection.expressions[index], *current.get().children[0]);
+				if (!child_index.IsValid()) {
+					return nullopt;
+				}
+				index = child_index.GetIndex();
+			}
+		}
+		current = *current.get().children[0];
+	}
+	if (current.get().type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		auto &aggregate = current.get().Cast<LogicalAggregate>();
+		if (aggregate.groups.empty() || !aggregate.grouping_functions.empty() || aggregate.grouping_sets.size() > 1 ||
+		    logical_columns.size() != aggregate.groups.size()) {
+			return nullopt;
+		}
+		if (!aggregate.grouping_sets.empty()) {
+			auto &grouping_set = aggregate.grouping_sets[0];
+			if (grouping_set.size() != aggregate.groups.size()) {
+				return nullopt;
+			}
+			for (idx_t group_idx = 0; group_idx < aggregate.groups.size(); group_idx++) {
+				if (grouping_set.find(ProjectionIndex(group_idx)) == grouping_set.end()) {
+					return nullopt;
+				}
+			}
+		}
+		vector<bool> matched_groups(aggregate.groups.size(), false);
+		for (auto column : logical_columns) {
+			if (column >= aggregate.groups.size() || matched_groups[column]) {
+				return nullopt;
+			}
+			matched_groups[column] = true;
+		}
+		return UniqueKeyProperty {UniqueKeyProof::AGGREGATE_GROUP, nullptr};
+	}
+
+	logical_columns = output_columns;
 	optional_ptr<LogicalGet> base_scan;
 	if (!TraceBaseColumns(owner, logical_columns, base_scan) || !base_scan) {
 		return nullopt;
@@ -196,6 +257,9 @@ bool HasForeignKeyProperty(LogicalOperator &foreign, const vector<idx_t> &foreig
 }
 
 bool UniqueKeyProperty::FunctionallyDetermines(LogicalOperator &owner, idx_t output_column) const {
+	if (proof == UniqueKeyProof::AGGREGATE_GROUP) {
+		return output_column < owner.GetColumnBindings().size();
+	}
 	vector<idx_t> columns {output_column};
 	optional_ptr<LogicalGet> dependent_scan;
 	return TraceBaseColumns(owner, columns, dependent_scan) && dependent_scan && dependent_scan == base_scan;
