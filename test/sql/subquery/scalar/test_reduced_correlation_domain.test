@@ -108,6 +108,98 @@ WHERE d.active
 ----
 7
 
+# Correlation bindings spanning both join inputs retain the complete deduplication key.
+# The reduced domain may remove the outer filter, but it must still include both join inputs.
+query II
+EXPLAIN (FORMAT JSON)
+SELECT sum(x)
+FROM outer_fact f
+JOIN domain_dim d ON f.k = d.k
+WHERE d.active
+  AND x < (SELECT avg(v) FROM inner_fact i WHERE i.k = d.k AND i.v > f.x);
+----
+logical_opt	<!REGEX>:.*"name":\s*"CTE".*
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT sum(x)
+FROM outer_fact f
+JOIN domain_dim d ON f.k = d.k
+WHERE d.active
+  AND x < (SELECT avg(v) FROM inner_fact i WHERE i.k = d.k AND i.v > f.x);
+----
+logical_opt	<REGEX>:.*"Groups":\s*\[\s*"#\[[0-9]+\.[0-9]+\]",\s*"#\[[0-9]+\.[0-9]+\]"\s*\].*
+
+query I
+SELECT sum(x)
+FROM outer_fact f
+JOIN domain_dim d ON f.k = d.k
+WHERE d.active
+  AND x < (SELECT avg(v) FROM inner_fact i WHERE i.k = d.k AND i.v > f.x);
+----
+22
+
+# An outer join can synthesize the correlated value, so its input cannot replace the exact outer-row domain.
+query II
+EXPLAIN (FORMAT JSON)
+SELECT sum(x)
+FROM outer_fact f
+LEFT JOIN domain_dim d ON f.k = d.k AND d.active
+WHERE x < (SELECT avg(v) FROM inner_fact i WHERE i.k = d.k);
+----
+logical_opt	<REGEX>:.*"name":\s*"CTE".*
+
+query I
+SELECT sum(x)
+FROM outer_fact f
+LEFT JOIN domain_dim d ON f.k = d.k AND d.active
+WHERE x < (SELECT avg(v) FROM inner_fact i WHERE i.k = d.k);
+----
+7
+
+# A computed correlation key can use a reduced domain containing all base-table inputs,
+# but it is not an exact GroupJoin key.
+query II
+EXPLAIN (FORMAT JSON)
+SELECT sum(x)
+FROM outer_fact f
+JOIN domain_dim d ON f.k = d.k
+WHERE d.active
+  AND x < (
+    SELECT avg(v)
+    FROM inner_fact i
+    WHERE i.k = d.k + CAST(d.active AS INTEGER) - 1
+  );
+----
+logical_opt	<!REGEX>:.*"name":\s*"CTE".*
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT sum(x)
+FROM outer_fact f
+JOIN domain_dim d ON f.k = d.k
+WHERE d.active
+  AND x < (
+    SELECT avg(v)
+    FROM inner_fact i
+    WHERE i.k = d.k + CAST(d.active AS INTEGER) - 1
+  );
+----
+logical_opt	<!REGEX>:.*"name":\s*"GROUP_JOIN".*
+
+query I
+SELECT sum(x)
+FROM outer_fact f
+JOIN domain_dim d ON f.k = d.k
+WHERE d.active
+  AND x < (
+    SELECT avg(v)
+    FROM inner_fact i
+    WHERE i.k = d.k + CAST(d.active AS INTEGER) - 1
+  );
+----
+7
+
 # A volatile correlated subtree must likewise retain the exact materialized correlation domain.
 query II
 EXPLAIN (FORMAT JSON)
