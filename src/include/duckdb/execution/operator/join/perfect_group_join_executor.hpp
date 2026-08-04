@@ -19,7 +19,7 @@ public:
 	PerfectGroupJoinExecutor(LogicalType key_type, Value minimum, Value maximum, idx_t range);
 
 	//! Publishes a unique owner chunk. Returns false when a key is outside the planned bounds.
-	bool Sink(Vector &keys, Vector &addresses, Vector &group_ids);
+	bool Sink(Vector &keys, Vector &addresses, Vector &group_ids, bool ignore_nulls = false);
 	//! Stores matching row addresses at input positions and returns a stable input-order selection of matches.
 	idx_t Lookup(Vector &keys, Vector &addresses, Vector &group_ids, SelectionVector &found) const;
 
@@ -29,7 +29,7 @@ public:
 
 private:
 	template <class T>
-	bool SinkInternal(Vector &keys, Vector &addresses, Vector &group_ids);
+	bool SinkInternal(Vector &keys, Vector &addresses, Vector &group_ids, bool ignore_nulls);
 	template <class T>
 	idx_t LookupInternal(Vector &keys, Vector &addresses, Vector &group_ids, SelectionVector &found) const;
 

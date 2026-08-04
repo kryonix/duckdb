@@ -21,7 +21,7 @@ PerfectGroupJoinExecutor::PerfectGroupJoinExecutor(LogicalType key_type_p, Value
 }
 
 template <class T>
-bool PerfectGroupJoinExecutor::SinkInternal(Vector &keys, Vector &addresses, Vector &group_ids) {
+bool PerfectGroupJoinExecutor::SinkInternal(Vector &keys, Vector &addresses, Vector &group_ids, bool ignore_nulls) {
 	UnifiedVectorFormat key_data;
 	keys.ToUnifiedFormat(key_data);
 	addresses.Flatten();
@@ -34,6 +34,9 @@ bool PerfectGroupJoinExecutor::SinkInternal(Vector &keys, Vector &addresses, Vec
 	for (idx_t row_idx = 0; row_idx < keys.size(); row_idx++) {
 		const auto input_idx = key_data.sel->get_index(row_idx);
 		if (!key_data.validity.RowIsValid(input_idx)) {
+			if (ignore_nulls) {
+				continue;
+			}
 			throw InternalException("PERFECT_GROUP_JOIN owner key unexpectedly contained NULL");
 		}
 		const auto value = input_data[input_idx];
@@ -53,24 +56,24 @@ bool PerfectGroupJoinExecutor::SinkInternal(Vector &keys, Vector &addresses, Vec
 	return true;
 }
 
-bool PerfectGroupJoinExecutor::Sink(Vector &keys, Vector &addresses, Vector &group_ids) {
+bool PerfectGroupJoinExecutor::Sink(Vector &keys, Vector &addresses, Vector &group_ids, bool ignore_nulls) {
 	switch (key_type.InternalType()) {
 	case PhysicalType::INT8:
-		return SinkInternal<int8_t>(keys, addresses, group_ids);
+		return SinkInternal<int8_t>(keys, addresses, group_ids, ignore_nulls);
 	case PhysicalType::INT16:
-		return SinkInternal<int16_t>(keys, addresses, group_ids);
+		return SinkInternal<int16_t>(keys, addresses, group_ids, ignore_nulls);
 	case PhysicalType::INT32:
-		return SinkInternal<int32_t>(keys, addresses, group_ids);
+		return SinkInternal<int32_t>(keys, addresses, group_ids, ignore_nulls);
 	case PhysicalType::INT64:
-		return SinkInternal<int64_t>(keys, addresses, group_ids);
+		return SinkInternal<int64_t>(keys, addresses, group_ids, ignore_nulls);
 	case PhysicalType::UINT8:
-		return SinkInternal<uint8_t>(keys, addresses, group_ids);
+		return SinkInternal<uint8_t>(keys, addresses, group_ids, ignore_nulls);
 	case PhysicalType::UINT16:
-		return SinkInternal<uint16_t>(keys, addresses, group_ids);
+		return SinkInternal<uint16_t>(keys, addresses, group_ids, ignore_nulls);
 	case PhysicalType::UINT32:
-		return SinkInternal<uint32_t>(keys, addresses, group_ids);
+		return SinkInternal<uint32_t>(keys, addresses, group_ids, ignore_nulls);
 	case PhysicalType::UINT64:
-		return SinkInternal<uint64_t>(keys, addresses, group_ids);
+		return SinkInternal<uint64_t>(keys, addresses, group_ids, ignore_nulls);
 	default:
 		throw InternalException("Unsupported PERFECT_GROUP_JOIN key type");
 	}

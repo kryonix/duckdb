@@ -303,8 +303,9 @@ public:
 			skipped_unique_build = true;
 			if ((op.implementation == GroupJoinImplementation::PERFECT_HASH ||
 			     op.implementation == GroupJoinImplementation::EAGER_HASH) &&
-			    !op.owner_keys_can_have_null && op.grouped_aggregate_data.group_types.size() == 1 &&
-			    !op.perfect_min.IsNull() && !op.perfect_max.IsNull() &&
+			    (!op.owner_keys_can_have_null || op.unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD) &&
+			    op.grouped_aggregate_data.group_types.size() == 1 && !op.perfect_min.IsNull() &&
+			    !op.perfect_max.IsNull() &&
 			    PerfectGroupJoinDirectoryFits(op.perfect_range,
 			                                  BufferManager::GetBufferManager(context).GetMaxMemory())) {
 				perfect_executor = make_uniq<PerfectGroupJoinExecutor>(
@@ -534,8 +535,9 @@ SinkResultType PhysicalHashGroupJoin::Sink(ExecutionContext &context, DataChunk 
 	}
 	if (global_state.perfect_executor) {
 		FlatVector::SetSize(local_state.perfect_group_ids, chunk.size());
-		if (!global_state.perfect_executor->Sink(local_state.owner_keys.data[0], local_state.addresses,
-		                                         local_state.perfect_group_ids)) {
+		if (!global_state.perfect_executor->Sink(
+		        local_state.owner_keys.data[0], local_state.addresses, local_state.perfect_group_ids,
+		        owner_keys_can_have_null && unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD)) {
 			global_state.perfect_executor.reset();
 		}
 	}

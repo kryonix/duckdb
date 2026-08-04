@@ -1566,7 +1566,8 @@ GROUP BY p.k
 ----
 1	1	20
 
-# A requested perfect specialization must fall back to the nullable hash layout.
+# A discard join can omit the nullable owner group from the perfect lookup directory because ordinary equality never
+# matches it.
 statement ok
 SET debug_group_join_strategy = 'perfect'
 
@@ -1577,6 +1578,16 @@ FROM o JOIN gj_nullable_group_probe p USING (k)
 GROUP BY o.k
 ----
 1	1	20
+
+# Owner-preserving joins still retain the nullable group and therefore use the nullable hash layout.
+query III rowsort
+WITH o AS (SELECT k FROM gj_nullable_group_owner GROUP BY k)
+SELECT o.k, count(*), sum(p.v)
+FROM o LEFT JOIN gj_nullable_group_probe p USING (k)
+GROUP BY o.k
+----
+1	1	20
+NULL	1	NULL
 
 statement ok
 SET debug_group_join_strategy = 'force'

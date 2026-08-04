@@ -259,6 +259,15 @@ TEST_CASE("Perfect GroupJoin lookup preserves input order and rejects invalid ow
 	SetIntegerValues(owner_keys, {Value::INTEGER(1)});
 	REQUIRE_THROWS(executor.Sink(owner_keys.data[0], owner_addresses, owner_ids));
 
+	PerfectGroupJoinExecutor nullable_executor(LogicalType::INTEGER, Value::INTEGER(-2), Value::INTEGER(5), 7);
+	SetIntegerValues(owner_keys, {Value(LogicalType::INTEGER), Value::INTEGER(1)});
+	FlatVector::SetSize(owner_addresses, 2);
+	FlatVector::SetSize(owner_ids, 2);
+	REQUIRE_THROWS(nullable_executor.Sink(owner_keys.data[0], owner_addresses, owner_ids));
+	REQUIRE(nullable_executor.Sink(owner_keys.data[0], owner_addresses, owner_ids, true));
+	REQUIRE(nullable_executor.Lookup(owner_keys.data[0], found_addresses, found_ids, found) == 1);
+	REQUIRE(found.get_index(0) == 1);
+
 	PerfectGroupJoinExecutor invalid_extreme_range(LogicalType::BIGINT,
 	                                               Value::BIGINT(NumericLimits<int64_t>::Minimum()),
 	                                               Value::BIGINT(NumericLimits<int64_t>::Maximum()), 7);
