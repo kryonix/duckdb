@@ -304,9 +304,8 @@ PhysicalFactorizedGroupJoin::PhysicalFactorizedGroupJoin(
 			branch_modes[factor_idx] = FactorizedGroupJoinBranchMode::LAZY;
 		}
 	}
-	streaming_driver = !driver_first && unique_driver && !routed &&
-	                   planned_execution_mode != GroupJoinExecutionMode::EXTERNAL &&
-	                   (distinct_aggregates.empty() || (!preserve_left && !preserve_right));
+	streaming_driver =
+	    !driver_first && unique_driver && !routed && planned_execution_mode != GroupJoinExecutionMode::EXTERNAL;
 }
 
 vector<AggregateObject> PhysicalFactorizedGroupJoin::CreateHashTableAggregates() const {
@@ -2852,6 +2851,86 @@ static void FinalizeStreamingFactorizedDistinct(const PhysicalFactorizedGroupJoi
 	}
 }
 
+static void UpdateStreamingFactorizedNullExtendedRows(const PhysicalFactorizedGroupJoin &op, idx_t source_idx,
+                                                      FactorizedGroupJoinLocalSinkState &state,
+                                                      GroupedAggregateHashTable &target, ClientContext &context) {
+	if ((source_idx == FactorizedSourceIndex(FactorizedAggregateSource::LEFT_FACTOR) && !op.preserve_left) ||
+	    (source_idx == FactorizedSourceIndex(FactorizedAggregateSource::RIGHT_FACTOR) && !op.preserve_right)) {
+		return;
+	}
+	auto &range = op.source_ranges[source_idx];
+	D_ASSERT(range.multiplicity_index.IsValid());
+	state.addresses.Flatten();
+	auto source_addresses = FlatVector::GetData<data_ptr_t>(state.addresses);
+	Vector unmatched_addresses(LogicalType::POINTER);
+	auto unmatched = FlatVector::GetDataMutable<data_ptr_t>(unmatched_addresses);
+	idx_t unmatched_count = 0;
+	for (idx_t row_idx = 0; row_idx < state.group_ids.size(); row_idx++) {
+		if (LoadFactorizedCount(target.GetLayout(), source_addresses[row_idx], range.multiplicity_index.GetIndex()) ==
+		    0) {
+			unmatched[unmatched_count++] = source_addresses[row_idx];
+		}
+	}
+	if (unmatched_count == 0) {
+		return;
+	}
+	FlatVector::SetSize(unmatched_addresses, unmatched_count);
+
+	ExpressionExecutor executor(context);
+	for (auto &expression : op.source_arguments[source_idx]) {
+		executor.AddExpression(*expression);
+	}
+	DataChunk null_input;
+	null_input.Initialize(Allocator::Get(context), op.source_input_types[source_idx]);
+	for (idx_t column_idx = 0; column_idx < op.source_input_types[source_idx].size(); column_idx++) {
+		null_input.data[column_idx].Reference(Value(op.source_input_types[source_idx][column_idx]),
+		                                      count_t(unmatched_count));
+	}
+	null_input.SetChildCardinality(unmatched_count);
+	DataChunk null_payload;
+	null_payload.Initialize(Allocator::Get(context), op.source_argument_types[source_idx]);
+	if (op.source_argument_types[source_idx].empty()) {
+		null_payload.SetChildCardinality(unmatched_count);
+	} else {
+		executor.Execute(null_input, null_payload);
+	}
+
+	auto source_aggregates = op.CreateSourceAggregates(source_idx);
+	unsafe_vector<idx_t> aggregate_filter;
+	for (idx_t range_idx = 0; range_idx < range.count; range_idx++) {
+		if (source_aggregates[range_idx].aggr_type != AggregateType::DISTINCT) {
+			aggregate_filter.push_back(range_idx);
+		}
+	}
+	AggregateFilterDataSet filter_set;
+	filter_set.Initialize(context, source_aggregates, op.source_argument_types[source_idx]);
+	target.UpdateAggregatesAtAddressesRangeWithFilterSet(*state.update_state, unmatched_addresses, null_payload,
+	                                                     range.begin, range.count, aggregate_filter, filter_set);
+	for (auto &distinct : op.distinct_aggregates) {
+		if (distinct.source_idx != source_idx) {
+			continue;
+		}
+		idx_t distinct_count = unmatched_count;
+		optional_ptr<DataChunk> distinct_payload = null_payload;
+		Vector distinct_addresses(LogicalType::POINTER);
+		if (distinct.filter_index.IsValid()) {
+			auto &filter_data = filter_set.GetFilterData(distinct.range_index);
+			distinct_count = filter_data.ApplyFilter(null_payload);
+			if (distinct_count == 0) {
+				continue;
+			}
+			distinct_addresses.Slice(unmatched_addresses, filter_data.true_sel, distinct_count);
+			distinct_payload = filter_data.filtered_payload;
+		} else {
+			distinct_addresses.Reference(unmatched_addresses);
+		}
+		distinct_addresses.Flatten();
+		unsafe_vector<idx_t> distinct_filter {distinct.range_index};
+		target.UpdateAggregatesAtAddressesRange(*state.update_state, distinct_addresses, *distinct_payload, range.begin,
+		                                        range.count, distinct_filter);
+	}
+}
+
 unique_ptr<GlobalOperatorState> PhysicalFactorizedGroupJoin::GetGlobalOperatorState(ClientContext &context) const {
 	if (!streaming_driver) {
 		return PhysicalOperator::GetGlobalOperatorState(context);
@@ -2892,6 +2971,10 @@ OperatorResultType PhysicalFactorizedGroupJoin::Execute(ExecutionContext &contex
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
 	FinalizeStreamingFactorizedDistinct(*this, driver, target, context.client);
+	UpdateStreamingFactorizedNullExtendedRows(*this, FactorizedSourceIndex(FactorizedAggregateSource::LEFT_FACTOR),
+	                                          driver, target, context.client);
+	UpdateStreamingFactorizedNullExtendedRows(*this, FactorizedSourceIndex(FactorizedAggregateSource::RIGHT_FACTOR),
+	                                          driver, target, context.client);
 
 	auto layout = target.GetLayoutPtr();
 	auto &left_range = source_ranges[FactorizedSourceIndex(FactorizedAggregateSource::LEFT_FACTOR)];
