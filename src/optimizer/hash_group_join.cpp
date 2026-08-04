@@ -1941,9 +1941,9 @@ static FactorizedGroupJoinCostEstimate EstimateFactorizedGroupJoinCost(LogicalAg
 	    direct_driver_edge ? inputs.nested_join.estimated_cardinality : result.left_rows + result.right_rows;
 	const auto total_payload_cost = payload_costs[0] + payload_costs[1] + payload_costs[2];
 	const auto total_state_cost = state_costs[0] + state_costs[1] + state_costs[2];
-	const auto separate_factor_rows = direct_driver_edge
-	                                      ? static_cast<double>(result.left_scan_rows) + result.right_scan_rows
-	                                      : static_cast<double>(result.left_rows) + result.right_rows;
+	const auto separate_factor_rows =
+	    direct_driver_edge ? static_cast<double>(result.left_scan_rows) + static_cast<double>(result.right_scan_rows)
+	                       : static_cast<double>(result.left_rows) + static_cast<double>(result.right_rows);
 	result.separate_cost = (static_cast<double>(result.driver_rows) + separate_factor_rows) * key_cost +
 	                       static_cast<double>(intermediate_rows) * (key_cost + 1.0) +
 	                       static_cast<double>(result.join_rows) * (total_payload_cost + total_state_cost + 2.0);
