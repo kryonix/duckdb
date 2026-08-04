@@ -305,7 +305,8 @@ PhysicalFactorizedGroupJoin::PhysicalFactorizedGroupJoin(
 		}
 	}
 	streaming_driver = !driver_first && unique_driver && !routed &&
-	                   planned_execution_mode != GroupJoinExecutionMode::EXTERNAL && distinct_aggregates.empty();
+	                   planned_execution_mode != GroupJoinExecutionMode::EXTERNAL &&
+	                   (distinct_aggregates.empty() || (!preserve_left && !preserve_right));
 }
 
 vector<AggregateObject> PhysicalFactorizedGroupJoin::CreateHashTableAggregates() const {
@@ -2771,7 +2772,9 @@ public:
 	             op.op_state->Cast<FactorizedGroupJoinGlobalOperatorState>().driver_state, true),
 	      selected_addresses(LogicalType::POINTER), selected_rows(STANDARD_VECTOR_SIZE),
 	      left_multiplicities(LogicalType::BIGINT), right_multiplicities(LogicalType::BIGINT),
-	      product_multiplicities(LogicalType::BIGINT), output(context.client, op.target_layout) {
+	      product_multiplicities(LogicalType::BIGINT),
+	      unit_multiplicities(Value::BIGINT(1), count_t(STANDARD_VECTOR_SIZE)),
+	      output(context.client, op.target_layout) {
 	}
 
 	FactorizedGroupJoinLocalSinkState driver;
@@ -2780,9 +2783,74 @@ public:
 	Vector left_multiplicities;
 	Vector right_multiplicities;
 	Vector product_multiplicities;
+	Vector unit_multiplicities;
 	FactorizedGroupJoinOutputBuffer output;
 	InterruptState interrupt_state;
 };
+
+static void FinalizeStreamingFactorizedDistinct(const PhysicalFactorizedGroupJoin &op,
+                                                FactorizedGroupJoinLocalSinkState &state,
+                                                GroupedAggregateHashTable &target, ClientContext &context) {
+	if (op.distinct_aggregates.empty()) {
+		return;
+	}
+	state.group_ids.data[0].Flatten();
+	state.addresses.Flatten();
+	auto group_ids = FlatVector::GetData<uint64_t>(state.group_ids.data[0]);
+	auto addresses = FlatVector::GetData<data_ptr_t>(state.addresses);
+	unordered_map<uint64_t, data_ptr_t> target_by_group;
+	for (idx_t row_idx = 0; row_idx < state.group_ids.size(); row_idx++) {
+		target_by_group.emplace(group_ids[row_idx], addresses[row_idx]);
+	}
+
+	Vector target_addresses(LogicalType::POINTER);
+	for (idx_t distinct_idx = 0; distinct_idx < op.distinct_aggregates.size(); distinct_idx++) {
+		auto &distinct = op.distinct_aggregates[distinct_idx];
+		auto &table = state.distinct_tables[distinct_idx];
+		if (!table || table->Count() == 0) {
+			continue;
+		}
+		vector<LogicalType> distinct_types {LogicalType::UBIGINT};
+		distinct_types.insert(distinct_types.end(), distinct.argument_types.begin(), distinct.argument_types.end());
+		DataChunk distinct_rows;
+		distinct_rows.Initialize(Allocator::Get(context), distinct_types);
+		DataChunk payload;
+		payload.Initialize(Allocator::Get(context), op.source_argument_types[distinct.source_idx]);
+		unsafe_vector<idx_t> distinct_filter {distinct.range_index};
+		auto &range = op.source_ranges[distinct.source_idx];
+		AggregateHTScanState scan;
+		table->InitializeScan(scan);
+		while (table->ScanGroups(scan, distinct_rows)) {
+			distinct_rows.Flatten();
+			auto ids = FlatVector::GetData<uint64_t>(distinct_rows.data[0]);
+			auto targets = FlatVector::GetDataMutable<data_ptr_t>(target_addresses);
+			payload.Reset();
+			for (idx_t payload_idx = 0; payload_idx < op.source_argument_types[distinct.source_idx].size();
+			     payload_idx++) {
+				payload.data[payload_idx].Reference(Value(op.source_argument_types[distinct.source_idx][payload_idx]),
+				                                    count_t(distinct_rows.size()));
+			}
+			for (idx_t child_idx = 0; child_idx < distinct.argument_types.size(); child_idx++) {
+				payload.data[distinct.payload_index + child_idx].Reference(distinct_rows.data[child_idx + 1]);
+			}
+			if (distinct.filter_index.IsValid()) {
+				payload.data[distinct.filter_index.GetIndex()].Reference(Value::BOOLEAN(true),
+				                                                         count_t(distinct_rows.size()));
+			}
+			payload.SetChildCardinality(distinct_rows.size());
+			for (idx_t row_idx = 0; row_idx < distinct_rows.size(); row_idx++) {
+				auto target_entry = target_by_group.find(ids[row_idx]);
+				if (target_entry == target_by_group.end()) {
+					throw InternalException("Factorized GroupJoin streaming distinct group was not found");
+				}
+				targets[row_idx] = target_entry->second;
+			}
+			FlatVector::SetSize(target_addresses, distinct_rows.size());
+			target.UpdateAggregatesAtAddressesRange(*state.update_state, target_addresses, payload, range.begin,
+			                                        range.count, distinct_filter);
+		}
+	}
+}
 
 unique_ptr<GlobalOperatorState> PhysicalFactorizedGroupJoin::GetGlobalOperatorState(ClientContext &context) const {
 	if (!streaming_driver) {
@@ -2810,6 +2878,11 @@ OperatorResultType PhysicalFactorizedGroupJoin::Execute(ExecutionContext &contex
 	target.ResetForNewIteration(0);
 	target.SkipLookups();
 	driver.update_state = make_uniq<AggregateHTUpdateState>(target);
+	for (auto &distinct_table : driver.distinct_tables) {
+		if (distinct_table) {
+			distinct_table->ResetForNewIteration(0);
+		}
+	}
 	chunk.Reset();
 
 	OperatorSinkInput sink_input {gstate.driver_state, driver, state.interrupt_state};
@@ -2818,6 +2891,7 @@ OperatorResultType PhysicalFactorizedGroupJoin::Execute(ExecutionContext &contex
 	if (input.size() == 0) {
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
+	FinalizeStreamingFactorizedDistinct(*this, driver, target, context.client);
 
 	auto layout = target.GetLayoutPtr();
 	auto &left_range = source_ranges[FactorizedSourceIndex(FactorizedAggregateSource::LEFT_FACTOR)];
@@ -2868,18 +2942,22 @@ OperatorResultType PhysicalFactorizedGroupJoin::Execute(ExecutionContext &contex
 		for (idx_t aggregate_idx = 0; aggregate_idx < aggregate_expressions.size(); aggregate_idx++) {
 			auto source_idx = FactorizedSourceIndex(aggregate_sources[aggregate_idx]);
 			Vector *multiplicities;
-			switch (source_idx) {
-			case 0:
-				multiplicities = &state.product_multiplicities;
-				break;
-			case 1:
-				multiplicities = &state.left_multiplicities;
-				break;
-			case 2:
-				multiplicities = &state.right_multiplicities;
-				break;
-			default:
-				throw InternalException("Invalid factorized aggregate source");
+			if (aggregate_expressions[aggregate_idx]->Cast<BoundAggregateExpression>().IsDistinct()) {
+				multiplicities = &state.unit_multiplicities;
+			} else {
+				switch (source_idx) {
+				case 0:
+					multiplicities = &state.product_multiplicities;
+					break;
+				case 1:
+					multiplicities = &state.left_multiplicities;
+					break;
+				case 2:
+					multiplicities = &state.right_multiplicities;
+					break;
+				default:
+					throw InternalException("Invalid factorized aggregate source");
+				}
 			}
 			RowOperations::CombineStatesRange(state.output.row_state, *layout, state.selected_addresses,
 			                                  partial_indexes[aggregate_idx], state.output.layout,
