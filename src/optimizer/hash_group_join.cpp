@@ -347,6 +347,30 @@ static bool AutoHashGroupJoinAggregatesSupported(const LogicalAggregate &aggrega
 	return supported && state_size <= 128;
 }
 
+static bool AutoMixedDistinctMemoizingSupported(const LogicalAggregate &aggregate, idx_t &state_size) {
+	state_size = sizeof(idx_t);
+	idx_t distinct_count = 0;
+	idx_t non_distinct_count = 0;
+	for (auto &expression : aggregate.expressions) {
+		auto &aggr = expression->Cast<BoundAggregateExpression>();
+		state_size += aggr.Function().GetStateSize(aggr.BindInfo().get());
+		if (aggr.GetFilter() || aggr.GetOrderBys() || aggr.Function().GetName() == "combine_aggr") {
+			return false;
+		}
+		for (auto &child : aggr.GetChildren()) {
+			if (child->GetReturnType().IsAggregateState()) {
+				return false;
+			}
+		}
+		if (aggr.IsDistinct()) {
+			distinct_count++;
+		} else {
+			non_distinct_count++;
+		}
+	}
+	return distinct_count == 1 && non_distinct_count > 0;
+}
+
 struct AutoHashGroupJoinCostModel {
 	static constexpr idx_t MIN_OWNER_ROWS = 100000;
 	static constexpr idx_t MIN_KEY_WIDTH = 16;
@@ -377,6 +401,8 @@ struct AutoHashGroupJoinCostModel {
 	static constexpr double MAX_PERFECT_FANOUT = 10;
 	static constexpr double MIN_PERFECT_DENSITY = 0.7;
 	static constexpr double PERFECT_COST_RATIO = 0.75;
+	// Two aggregate branches, shared-input materialization, and a grouped-result join.
+	static constexpr double MIXED_DISTINCT_SEPARATE_FACTOR = 3.5;
 };
 
 static bool IsFixedSizeHashGroupJoinKey(const LogicalType &type) {
@@ -613,6 +639,17 @@ HashGroupJoinCostEstimate EstimateHashGroupJoinAlternatives(idx_t owner_rows, id
 	return result;
 }
 
+void ApplyMixedDistinctMemoizingCost(HashGroupJoinCostEstimate &cost) {
+	if (cost.execution_mode == GroupJoinExecutionMode::EXTERNAL || cost.owner_rows < 10000 || cost.probe_rows == 0 ||
+	    static_cast<double>(cost.probe_rows) * 8 > static_cast<double>(cost.owner_rows) || cost.match_rows == 0 ||
+	    cost.match_rows > cost.owner_rows) {
+		return;
+	}
+	// The incumbent materializes distinct and non-distinct aggregate branches and joins their grouped results.
+	cost.separate_cost *= AutoHashGroupJoinCostModel::MIXED_DISTINCT_SEPARATE_FACTOR;
+	cost.hash_selected = cost.memoizing_cost <= cost.separate_cost * AutoHashGroupJoinCostModel::MAX_COST_RATIO;
+}
+
 static bool TryGetPerfectGroupJoinBounds(LogicalAggregate &aggregate, LogicalComparisonJoin &join,
                                          const HashGroupJoinCandidate &candidate, ClientContext &context,
                                          Value &minimum, Value &maximum, idx_t &range);
@@ -633,6 +670,13 @@ HashGroupJoinCostEstimate EstimateHashGroupJoinCost(LogicalAggregate &aggregate,
 	}
 	idx_t state_width;
 	const auto auto_aggregates_supported = AutoHashGroupJoinAggregatesSupported(aggregate, state_width);
+	idx_t mixed_distinct_state_width;
+	const auto mixed_distinct_memoizing =
+	    AutoMixedDistinctMemoizingSupported(aggregate, mixed_distinct_state_width) &&
+	    join.join_type == JoinType::INNER && candidate.unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD;
+	if (!auto_aggregates_supported && mixed_distinct_memoizing) {
+		state_width = mixed_distinct_state_width;
+	}
 	const auto physical_eager_supported = PhysicalEagerGroupJoinSupported(aggregate, candidate);
 	Value perfect_min;
 	Value perfect_max;
@@ -657,6 +701,9 @@ HashGroupJoinCostEstimate EstimateHashGroupJoinCost(LogicalAggregate &aggregate,
 		result.physical_eager_selected = false;
 		result.perfect_selected = false;
 	}
+	if (mixed_distinct_memoizing) {
+		ApplyMixedDistinctMemoizingCost(result);
+	}
 	result.index_available = index_compatible && HasAutoHashGroupJoinART(join, candidate, context);
 	if (auto_aggregates_supported && index_compatible && result.probe_rows != 0 &&
 	    static_cast<double>(result.owner_rows) <=
@@ -676,6 +723,37 @@ HashGroupJoinCostEstimate EstimateHashGroupJoinCost(LogicalAggregate &aggregate,
 	return result;
 }
 
+bool HasPotentialAutoMixedDistinctHashGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context) {
+	if (Settings::Get<DebugGroupJoinStrategySetting>(context) != GroupJoinStrategy::AUTO ||
+	    aggregate.children.size() != 1 ||
+	    aggregate.children[0]->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		return false;
+	}
+	auto &join = aggregate.children[0]->Cast<LogicalComparisonJoin>();
+	auto candidate = TryGetHashGroupJoinCandidate(aggregate, join, context,
+	                                              HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER);
+	if (!candidate) {
+		return false;
+	}
+	idx_t state_width;
+	if (!AutoMixedDistinctMemoizingSupported(aggregate, state_width) || join.join_type != JoinType::INNER ||
+	    candidate->unmatched_policy != HashGroupJoinUnmatchedPolicy::DISCARD) {
+		return false;
+	}
+	return true;
+}
+
+bool HasAutoMixedDistinctHashGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context) {
+	if (!HasPotentialAutoMixedDistinctHashGroupJoinCandidate(aggregate, context)) {
+		return false;
+	}
+	auto &join = aggregate.children[0]->Cast<LogicalComparisonJoin>();
+	auto candidate = TryGetHashGroupJoinCandidate(aggregate, join, context,
+	                                              HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER);
+	D_ASSERT(candidate);
+	return EstimateHashGroupJoinCost(aggregate, join, *candidate, context).hash_selected;
+}
+
 optional<HashGroupJoinOrderContext> GetHashGroupJoinOrderContext(LogicalAggregate &aggregate, ClientContext &context) {
 	if (!HashGroupJoinPlanningEnabled(context) || aggregate.children.size() != 1 ||
 	    aggregate.children[0]->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
@@ -693,7 +771,11 @@ optional<HashGroupJoinOrderContext> GetHashGroupJoinOrderContext(LogicalAggregat
 		return nullopt;
 	}
 	const auto auto_aggregates_supported = AutoHashGroupJoinAggregatesSupported(aggregate, result.state_width);
-	if (result.strategy == GroupJoinStrategy::AUTO && !auto_aggregates_supported) {
+	result.mixed_distinct_memoizing =
+	    AutoMixedDistinctMemoizingSupported(aggregate, result.state_width) && join.join_type == JoinType::INNER &&
+	    candidate->unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD;
+	if (result.strategy == GroupJoinStrategy::AUTO && !auto_aggregates_supported &&
+	    !result.mixed_distinct_memoizing) {
 		return nullopt;
 	}
 	for (auto &condition : join.conditions) {

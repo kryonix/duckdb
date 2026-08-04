@@ -18,7 +18,7 @@ class Optimizer;
 //! a non-distinct aggregate. Multiple sets share the original input through a CTE and join on the original group keys.
 class DistinctAggregateRewriter : public LogicalOperatorVisitor {
 public:
-	explicit DistinctAggregateRewriter(Optimizer &optimizer);
+	explicit DistinctAggregateRewriter(Optimizer &optimizer, bool deferred = false);
 
 	void VisitOperator(unique_ptr<LogicalOperator> &op) override;
 
@@ -28,6 +28,7 @@ private:
 
 private:
 	Optimizer &optimizer;
+	bool deferred;
 	column_binding_map_t<ColumnBinding> replacement_map;
 };
 

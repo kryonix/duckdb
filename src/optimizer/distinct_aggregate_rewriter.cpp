@@ -19,7 +19,8 @@
 
 namespace duckdb {
 
-DistinctAggregateRewriter::DistinctAggregateRewriter(Optimizer &optimizer_p) : optimizer(optimizer_p) {
+DistinctAggregateRewriter::DistinctAggregateRewriter(Optimizer &optimizer_p, bool deferred_p)
+    : optimizer(optimizer_p), deferred(deferred_p) {
 }
 
 namespace {
@@ -267,6 +268,10 @@ bool DistinctAggregateRewriter::TryRewrite(unique_ptr<LogicalOperator> &op) {
 	}
 	auto &aggr = op->Cast<LogicalAggregate>();
 	if (HasPotentialFactorizedGroupJoinCandidate(aggr, optimizer.context)) {
+		return false;
+	}
+	if ((!deferred && HasPotentialAutoMixedDistinctHashGroupJoinCandidate(aggr, optimizer.context)) ||
+	    (deferred && HasAutoMixedDistinctHashGroupJoinCandidate(aggr, optimizer.context))) {
 		return false;
 	}
 	auto coarse_factorized = GetFactorizedCoarseGroupInfo(aggr, optimizer.context);

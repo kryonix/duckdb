@@ -84,6 +84,7 @@ struct HashGroupJoinOrderContext {
 	bool physical_eager_supported = false;
 	bool perfect_supported = false;
 	idx_t perfect_range = 0;
+	bool mixed_distinct_memoizing = false;
 	double factorized_cost = 0;
 	GroupJoinStrategy strategy = GroupJoinStrategy::AUTO;
 	bool factorized = false;
@@ -107,6 +108,9 @@ HashGroupJoinCostEstimate EstimateHashGroupJoinAlternatives(idx_t owner_rows, id
                                                             bool physical_eager_supported, bool perfect_supported,
                                                             idx_t perfect_range, ClientContext &context);
 
+//! Accounts for the materialized aggregate branches and rejoin used by mixed DISTINCT/non-DISTINCT aggregation.
+void ApplyMixedDistinctMemoizingCost(HashGroupJoinCostEstimate &cost);
+
 optional<HashGroupJoinOrderContext> GetHashGroupJoinOrderContext(LogicalAggregate &aggregate, ClientContext &context);
 optional<HashGroupJoinOrderContext> GetFactorizedGroupJoinOrderContext(LogicalAggregate &aggregate,
                                                                        ClientContext &context);
@@ -124,6 +128,12 @@ TryGetPlannedHashGroupJoinCandidate(LogicalAggregate &aggregate, LogicalComparis
 //! Returns whether the aggregate has a semantically valid factorized two-branch candidate under the exact strategy.
 bool HasFactorizedGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context);
 bool HasPotentialFactorizedGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context);
+
+//! Returns true when AUTO should retain a mixed DISTINCT aggregate for memoizing GroupJoin planning.
+bool HasAutoMixedDistinctHashGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context);
+
+//! Returns true when a mixed DISTINCT aggregate needs costing before the DISTINCT branch rewrite.
+bool HasPotentialAutoMixedDistinctHashGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context);
 
 //! Returns the driver keys needed to turn a coarse factorized aggregate into a driver-grain aggregate.
 optional<FactorizedCoarseGroupInfo> GetFactorizedCoarseGroupInfo(LogicalAggregate &aggregate, ClientContext &context);

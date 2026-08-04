@@ -97,6 +97,9 @@ double CostModel::ComputeCost(DPJoinNode &left, DPJoinNode &right, JoinRelationS
 		    group_join_context->state_width, group_join_context->routed, group_join_context->direct_inner,
 		    group_join_context->fixed_size_keys, group_join_context->physical_eager_supported,
 		    group_join_context->perfect_supported, group_join_context->perfect_range, query_graph_manager.context);
+		if (group_join_context->mixed_distinct_memoizing) {
+			ApplyMixedDistinctMemoizingCost(costs);
+		}
 		if (left_is_owner || right_is_owner) {
 			if (group_join_context->strategy == GroupJoinStrategy::FORCE ||
 			    group_join_context->strategy == GroupJoinStrategy::HASH ||
@@ -104,6 +107,8 @@ double CostModel::ComputeCost(DPJoinNode &left, DPJoinNode &right, JoinRelationS
 			    group_join_context->strategy == GroupJoinStrategy::EAGER ||
 			    group_join_context->strategy == GroupJoinStrategy::INDEX) {
 				join_cost = -left.cost - right.cost;
+			} else if (group_join_context->mixed_distinct_memoizing && costs.hash_selected) {
+				join_cost = join_card + costs.memoizing_cost - costs.separate_cost;
 			} else if (costs.perfect_selected && costs.separate_cost != 0) {
 				join_cost = join_card * costs.perfect_cost / costs.separate_cost;
 			} else if (costs.physical_eager_selected && costs.separate_cost != 0) {

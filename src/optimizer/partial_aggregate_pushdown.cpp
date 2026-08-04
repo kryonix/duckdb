@@ -1088,6 +1088,9 @@ void PartialAggregatePushdown::VisitOperator(unique_ptr<LogicalOperator> &op) {
 		                                    HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER)) {
 			return;
 		}
+		if (HasPotentialAutoMixedDistinctHashGroupJoinCandidate(aggregate, optimizer.context)) {
+			return;
+		}
 	}
 	LogicalOperatorVisitor::VisitOperator(op);
 	FuseInterveningProjections(*op);
@@ -1100,6 +1103,9 @@ void PartialAggregatePushdown::VisitOperator(unique_ptr<LogicalOperator> &op) {
 		auto &join = op->children[0]->Cast<LogicalComparisonJoin>();
 		if (TrySelectHashGroupJoinCandidate(aggregate, join, optimizer.context,
 		                                    HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER)) {
+			return;
+		}
+		if (HasPotentialAutoMixedDistinctHashGroupJoinCandidate(aggregate, optimizer.context)) {
 			return;
 		}
 		auto candidate = TryGetHashGroupJoinCandidate(aggregate, join, optimizer.context,

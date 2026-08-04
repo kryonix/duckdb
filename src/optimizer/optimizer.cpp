@@ -320,6 +320,12 @@ void Optimizer::RunBuiltInOptimizers() {
 		partial_aggregate_pushdown.VisitOperator(plan);
 	});
 
+	// Cost mixed DISTINCT GroupJoin candidates before falling back to the explicit aggregate-branch rewrite.
+	RunOptimizer(OptimizerType::DISTINCT_AGGREGATE_REWRITE, [&]() {
+		DistinctAggregateRewriter deferred_distinct_aggregate_rewriter(*this, true);
+		deferred_distinct_aggregate_rewriter.VisitOperator(plan);
+	});
+
 	RunOptimizer(OptimizerType::JOIN_ELIMINATION, [&]() {
 		JoinElimination join_elimination;
 		plan = join_elimination.Optimize(std::move(plan));

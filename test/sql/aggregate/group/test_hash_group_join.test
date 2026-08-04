@@ -1698,6 +1698,74 @@ SELECT count(*), sum(n), sum(s) FROM (
 ----
 100000	1200000	719999400000
 
+# Mixed DISTINCT and ordinary aggregates otherwise require materialized aggregate branches and a rejoin. A compact
+# probe domain can maintain both states in one routed owner directory.
+statement ok
+CREATE TABLE gj_auto_mixed_distinct_owner AS
+SELECT i::BIGINT AS id, CASE WHEN i < 18000 THEN (i % 3000)::BIGINT ELSE i + 100000 END AS k
+FROM range(80000) t(i)
+
+statement ok
+CREATE TABLE gj_auto_mixed_distinct_probe AS
+SELECT i::BIGINT AS k, ('tag-' || i::VARCHAR) AS label FROM range(3000) t(i)
+
+statement ok
+ANALYZE gj_auto_mixed_distinct_owner
+
+statement ok
+ANALYZE gj_auto_mixed_distinct_probe
+
+query II
+EXPLAIN SELECT o.id, array_agg(DISTINCT p.label), count(*)
+FROM gj_auto_mixed_distinct_owner o JOIN gj_auto_mixed_distinct_probe p USING (k)
+GROUP BY o.id
+----
+physical_plan	<REGEX>:(?s).*Hash Group Join.*MEMOIZING_HASH.*
+
+query III
+SELECT count(*), sum(n), count(DISTINCT labels) FROM (
+	SELECT o.id, array_agg(DISTINCT p.label) labels, count(*) n
+	FROM gj_auto_mixed_distinct_owner o JOIN gj_auto_mixed_distinct_probe p USING (k)
+	GROUP BY o.id
+)
+----
+18000	18000	3000
+
+# Balanced domains and multiple DISTINCT states retain the mature aggregate decomposition.
+statement ok
+CREATE TABLE gj_auto_mixed_distinct_balanced_owner AS SELECT i::BIGINT id, i::BIGINT k FROM range(10000) t(i)
+
+statement ok
+CREATE TABLE gj_auto_mixed_distinct_balanced_probe AS
+SELECT i::BIGINT k, ('tag-' || i::VARCHAR) label FROM range(10000) t(i)
+
+statement ok
+ANALYZE gj_auto_mixed_distinct_balanced_owner
+
+statement ok
+ANALYZE gj_auto_mixed_distinct_balanced_probe
+
+query II
+EXPLAIN SELECT o.id, array_agg(DISTINCT p.label), count(*)
+FROM gj_auto_mixed_distinct_balanced_owner o JOIN gj_auto_mixed_distinct_balanced_probe p USING (k)
+GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT o.id, array_agg(DISTINCT p.label), count(*)
+FROM gj_auto_mixed_distinct_balanced_owner o JOIN gj_auto_mixed_distinct_balanced_probe p USING (k)
+GROUP BY o.id
+----
+physical_plan	<REGEX>:(?s).*CTE Name: __distinct_aggregate_cte_.*Hash Group By.*Hash Group By.*
+
+query II
+EXPLAIN SELECT o.id, array_agg(DISTINCT p.label), count(DISTINCT p.k), count(*)
+FROM gj_auto_mixed_distinct_owner o JOIN gj_auto_mixed_distinct_probe p USING (k)
+GROUP BY o.id
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
 # A routed candidate that cannot enter AUTO must not suppress the mature partial aggregate rewrite. Its boundary-level
 # GroupJoin cost does not model the benefit of reducing a nested or multiplicity-increasing probe subtree.
 statement ok
