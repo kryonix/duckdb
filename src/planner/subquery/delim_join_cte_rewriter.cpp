@@ -30,6 +30,8 @@
 namespace duckdb {
 
 static constexpr const char *CTE_DELIMINATOR_PROFILER_KEY = "optimizer.deliminator";
+static constexpr idx_t MAX_COMPACT_REDUCED_DOMAIN = 2 * STANDARD_VECTOR_SIZE;
+static constexpr idx_t MIN_REDUCED_DOMAIN_RATIO = 10;
 
 static void VerifyNoDelim(LogicalOperator &op) {
 	// Verify that there are no delim joins or delim scans in the plan, as these should have been rewritten to CTEs at
@@ -165,6 +167,26 @@ static optional_ptr<LogicalOperator> FindReducedDomainSource(LogicalOperator &op
 		result = FindReducedDomainSource(*child, bindings, filter_candidates);
 	}
 	return result ? result : optional_ptr<LogicalOperator>(op);
+}
+
+static bool IsProfitableReducedDomainSource(ClientContext &context, LogicalOperator &source, LogicalOperator &outer) {
+	unordered_set<TableIndex> source_relations;
+	unordered_set<TableIndex> outer_relations;
+	LogicalJoin::GetTableReferences(source, source_relations);
+	LogicalJoin::GetTableReferences(outer, outer_relations);
+	if (source_relations.empty() || source_relations.size() >= outer_relations.size()) {
+		return false;
+	}
+	for (auto relation : source_relations) {
+		if (outer_relations.find(relation) == outer_relations.end()) {
+			return false;
+		}
+	}
+
+	const auto source_cardinality = source.EstimateCardinality(context);
+	const auto outer_cardinality = outer.EstimateCardinality(context);
+	return source_cardinality <= MAX_COMPACT_REDUCED_DOMAIN ||
+	       static_cast<double>(source_cardinality) * MIN_REDUCED_DOMAIN_RATIO <= static_cast<double>(outer_cardinality);
 }
 
 static void AddFilterToOperator(unique_ptr<LogicalOperator> &child, unique_ptr<Expression> filter) {
@@ -2267,7 +2289,7 @@ BindingReplacementGraph DelimJoinCTERewriter::MaterializeDelimJoinAsCTE(unique_p
 		}
 		vector<reference<Expression>> filter_candidates;
 		auto reduced_source = FindReducedDomainSource(*plan->children[0], dedup_bindings, filter_candidates);
-		if (reduced_source && reduced_source.get() != plan->children[0].get() &&
+		if (reduced_source && IsProfitableReducedDomainSource(binder.context, *reduced_source, *plan->children[0]) &&
 		    LogicalSubtreeIsRepeatable(*reduced_source) && LogicalSubtreeIsRepeatable(*plan->children[1]) &&
 		    ContainsAllBindings(*reduced_source, dedup_bindings, reduced_domain_column_indices)) {
 			auto source_bindings = reduced_source->GetColumnBindings();

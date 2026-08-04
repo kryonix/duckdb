@@ -21,6 +21,12 @@ statement ok
 INSERT INTO inner_fact VALUES (1, 10), (1, 20), (3, 4), (3, 8);
 
 statement ok
+CREATE TABLE broad_domain AS SELECT i AS k, true AS active FROM range(10000) t(i);
+
+statement ok
+CREATE TABLE broad_fact AS SELECT i % 10000 AS k, i AS x FROM range(40000) t(i);
+
+statement ok
 SET delim_join_as_cte = true;
 
 statement ok
@@ -41,6 +47,25 @@ PRAGMA disable_verification;
 
 statement ok
 PRAGMA explain_output = 'optimized_only';
+
+# A reduced source must be compact enough to justify rescanning it instead of materializing
+# the already-filtered outer result.
+query II
+EXPLAIN (FORMAT JSON)
+SELECT count(*)
+FROM broad_fact f
+JOIN broad_domain d ON f.k = d.k
+WHERE d.active AND x < (SELECT avg(v) FROM inner_fact i WHERE i.k = d.k);
+----
+logical_opt	<REGEX>:.*"name":\s*"CTE".*
+
+query I
+SELECT count(*)
+FROM broad_fact f
+JOIN broad_domain d ON f.k = d.k
+WHERE d.active AND x < (SELECT avg(v) FROM inner_fact i WHERE i.k = d.k);
+----
+2
 
 # The correlation key comes entirely from domain_dim, so the deduplicated domain can rescan that
 # repeatable subtree instead of materializing the complete outer_fact/domain_dim result.
@@ -108,8 +133,8 @@ WHERE d.active
 ----
 7
 
-# Correlation bindings spanning both join inputs retain the complete deduplication key.
-# The reduced domain may remove the outer filter, but it must still include both join inputs.
+# Correlation bindings spanning both join inputs cannot remove an outer relation.
+# Rescanning the same join without its filter is not a reduced domain.
 query II
 EXPLAIN (FORMAT JSON)
 SELECT sum(x)
@@ -118,17 +143,7 @@ JOIN domain_dim d ON f.k = d.k
 WHERE d.active
   AND x < (SELECT avg(v) FROM inner_fact i WHERE i.k = d.k AND i.v > f.x);
 ----
-logical_opt	<!REGEX>:.*"name":\s*"CTE".*
-
-query II
-EXPLAIN (FORMAT JSON)
-SELECT sum(x)
-FROM outer_fact f
-JOIN domain_dim d ON f.k = d.k
-WHERE d.active
-  AND x < (SELECT avg(v) FROM inner_fact i WHERE i.k = d.k AND i.v > f.x);
-----
-logical_opt	<REGEX>:.*"Groups":\s*\[\s*"#\[[0-9]+\.[0-9]+\]",\s*"#\[[0-9]+\.[0-9]+\]"\s*\].*
+logical_opt	<REGEX>:.*"name":\s*"CTE".*
 
 query I
 SELECT sum(x)
