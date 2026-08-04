@@ -121,8 +121,8 @@ PhysicalFactorizedGroupJoin::PhysicalFactorizedGroupJoin(
     PhysicalOperator &right_factor, vector<idx_t> driver_keys, vector<idx_t> left_keys, vector<idx_t> right_keys,
     vector<idx_t> output_group_key_indices_p, vector<unique_ptr<Expression>> aggregates,
     vector<FactorizedAggregateSource> aggregate_sources_p, bool preserve_left_p, bool preserve_right_p,
-    bool semi_left_p, bool semi_right_p, bool unique_driver_p, bool routed_p, GroupJoinExecutionMode execution_mode_p,
-    Value perfect_min_p, Value perfect_max_p, idx_t perfect_range_p,
+    bool semi_left_p, bool semi_right_p, bool unique_driver_p, bool driver_keys_can_have_null_p, bool routed_p,
+    GroupJoinExecutionMode execution_mode_p, Value perfect_min_p, Value perfect_max_p, idx_t perfect_range_p,
     unique_ptr<JoinFilterPushdownInfo> left_filter_pushdown, unique_ptr<JoinFilterPushdownInfo> right_filter_pushdown,
     unique_ptr<JoinFilterPushdownInfo> left_driver_filter_pushdown,
     unique_ptr<JoinFilterPushdownInfo> right_driver_filter_pushdown, idx_t estimated_cardinality)
@@ -131,8 +131,8 @@ PhysicalFactorizedGroupJoin::PhysicalFactorizedGroupJoin(
       source_argument_types(SOURCE_COUNT), aggregate_sources(std::move(aggregate_sources_p)),
       source_ranges(SOURCE_COUNT), output_group_key_indices(std::move(output_group_key_indices_p)),
       preserve_left(preserve_left_p), preserve_right(preserve_right_p), semi_left(semi_left_p),
-      semi_right(semi_right_p), unique_driver(unique_driver_p), routed(routed_p),
-      planned_execution_mode(execution_mode_p), perfect_min(std::move(perfect_min_p)),
+      semi_right(semi_right_p), unique_driver(unique_driver_p), driver_keys_can_have_null(driver_keys_can_have_null_p),
+      routed(routed_p), planned_execution_mode(execution_mode_p), perfect_min(std::move(perfect_min_p)),
       perfect_max(std::move(perfect_max_p)), perfect_range(perfect_range_p), physical_plan(physical_plan) {
 	auto &logical_group_join = op.Cast<LogicalGroupJoin>();
 	factor_filter_pushdown[0] = std::move(left_filter_pushdown);
@@ -969,14 +969,14 @@ public:
 			return;
 		}
 		if (source_idx == FactorizedSourceIndex(FactorizedAggregateSource::DRIVER)) {
-			parallel_driver =
-			    op.unique_driver && !op.routed && TaskScheduler::GetScheduler(context).NumberOfThreads() > 1;
+			parallel_driver = op.unique_driver && !op.driver_keys_can_have_null && !op.routed &&
+			                  TaskScheduler::GetScheduler(context).NumberOfThreads() > 1;
 			target = make_uniq<GroupedAggregateHashTable>(
 			    context, BufferAllocator::Get(context), op.group_types, vector<LogicalType> {},
 			    op.CreateHashTableAggregates(), GroupedAggregateHashTable::InitialCapacity(),
 			    parallel_driver ? FACTORIZED_GROUP_JOIN_RADIX_BITS : idx_t(0),
-			    op.unique_driver ? TupleDataValidityType::CANNOT_HAVE_NULL_VALUES
-			                     : TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+			    !op.unique_driver || op.driver_keys_can_have_null ? TupleDataValidityType::CAN_HAVE_NULL_VALUES
+			                                                      : TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 			if (op.unique_driver && !parallel_driver) {
 				target->SkipLookups();
 			}
@@ -987,8 +987,8 @@ public:
 				    GroupedAggregateHashTable::InitialCapacity(), idx_t(0),
 				    TupleDataValidityType::CAN_HAVE_NULL_VALUES);
 			}
-			if (!parallel_driver && !op.routed && op.key_types.size() == 1 && !op.perfect_min.IsNull() &&
-			    !op.perfect_max.IsNull() &&
+			if (!parallel_driver && !op.routed && !op.driver_keys_can_have_null && op.key_types.size() == 1 &&
+			    !op.perfect_min.IsNull() && !op.perfect_max.IsNull() &&
 			    PerfectGroupJoinDirectoryFits(op.perfect_range,
 			                                  BufferManager::GetBufferManager(context).GetMaxMemory())) {
 				perfect_executor = make_uniq<PerfectGroupJoinExecutor>(op.key_types[0], op.perfect_min, op.perfect_max,
@@ -1215,7 +1215,8 @@ public:
 				    context.client, BufferAllocator::Get(context.client), op.group_types, vector<LogicalType> {},
 				    op.CreateHashTableAggregates(), GroupedAggregateHashTable::InitialCapacity(),
 				    streaming ? idx_t(0) : FACTORIZED_GROUP_JOIN_RADIX_BITS,
-				    TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
+				    !op.unique_driver || op.driver_keys_can_have_null ? TupleDataValidityType::CAN_HAVE_NULL_VALUES
+				                                                      : TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 				local_driver_target->SkipLookups();
 				update_state = make_uniq<AggregateHTUpdateState>(*local_driver_target);
 			} else {

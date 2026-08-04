@@ -1531,6 +1531,44 @@ RESET debug_group_join_execution
 statement ok
 RESET debug_group_join_strategy
 
+# A complete aggregate grouping key is unique but may contain one NULL tuple.
+statement ok
+SET threads = 4
+
+statement ok
+SET debug_group_join_strategy = 'force'
+
+statement ok
+CREATE TABLE gj_nullable_group_owner(k INTEGER)
+
+statement ok
+INSERT INTO gj_nullable_group_owner VALUES (NULL), (1), (1)
+
+statement ok
+CREATE TABLE gj_nullable_group_probe(k INTEGER, v INTEGER)
+
+statement ok
+INSERT INTO gj_nullable_group_probe VALUES (NULL, 10), (1, 20), (2, 30)
+
+query II
+EXPLAIN SELECT p.k, count(*), sum(p.v)
+FROM gj_nullable_group_probe p
+SEMI JOIN (SELECT k FROM gj_nullable_group_owner GROUP BY k) o USING (k)
+GROUP BY p.k
+----
+physical_plan	<REGEX>:.*Hash Group Join.*
+
+query III rowsort
+SELECT p.k, count(*), sum(p.v)
+FROM gj_nullable_group_probe p
+SEMI JOIN (SELECT k FROM gj_nullable_group_owner GROUP BY k) o USING (k)
+GROUP BY p.k
+----
+1	1	20
+
+statement ok
+RESET debug_group_join_strategy
+
 # AUTO is deliberately narrow. The hash cost gate retains the mature alternative when its calibrated margin is
 # insufficient, while a selective exact ART range plan is selected and retained through physical planning.
 statement ok

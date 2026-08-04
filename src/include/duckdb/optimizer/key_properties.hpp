@@ -20,12 +20,13 @@ enum class UniqueKeyProof : uint8_t { PRIMARY_KEY, UNIQUE_NOT_NULL, AGGREGATE_GR
 struct UniqueKeyProperty {
 	UniqueKeyProof proof;
 	optional_ptr<LogicalGet> base_scan;
+	bool can_have_null;
 
 	//! Returns whether the proven key functionally determines an output column through direct projections/filters.
 	bool FunctionallyDetermines(LogicalOperator &owner, idx_t output_column) const;
 };
 
-//! Proves that the output columns are a complete non-NULL unique key of one base table.
+//! Proves that the output columns form a unique key. Aggregate-derived keys can contain one NULL tuple.
 optional<UniqueKeyProperty> GetUniqueKeyProperty(LogicalOperator &owner, const vector<idx_t> &output_columns);
 
 //! Proves that foreign_columns are a declared foreign key referencing primary_columns.

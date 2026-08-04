@@ -124,20 +124,21 @@ PhysicalHashGroupJoin::PhysicalHashGroupJoin(
     PhysicalPlan &physical_plan, LogicalAggregate &op, PhysicalOperator &probe, PhysicalOperator &owner,
     vector<unique_ptr<Expression>> aggregates, vector<unique_ptr<Expression>> owner_payload_aggregates,
     vector<unique_ptr<Expression>> groups, vector<HashGroupJoinOutputColumn> output_groups_p,
-    HashGroupJoinUnmatchedPolicy unmatched_policy_p, bool routed_p, bool unique_owner_p, bool single_match_p,
-    unique_ptr<JoinFilterPushdownInfo> filter_pushdown_p, GroupJoinImplementation implementation_p,
-    GroupJoinExecutionMode execution_mode_p, Value perfect_min_p, Value perfect_max_p, idx_t perfect_range_p,
-    vector<LogicalType> eager_payload_types_p, vector<LogicalType> unmatched_probe_types_p,
-    vector<unique_ptr<Expression>> unmatched_payload_expressions_p, bool streaming_eager_raw_p,
-    idx_t estimated_cardinality)
+    HashGroupJoinUnmatchedPolicy unmatched_policy_p, bool routed_p, bool unique_owner_p,
+    bool owner_keys_can_have_null_p, bool single_match_p, unique_ptr<JoinFilterPushdownInfo> filter_pushdown_p,
+    GroupJoinImplementation implementation_p, GroupJoinExecutionMode execution_mode_p, Value perfect_min_p,
+    Value perfect_max_p, idx_t perfect_range_p, vector<LogicalType> eager_payload_types_p,
+    vector<LogicalType> unmatched_probe_types_p, vector<unique_ptr<Expression>> unmatched_payload_expressions_p,
+    bool streaming_eager_raw_p, idx_t estimated_cardinality)
     : PhysicalJoin(physical_plan, op, PhysicalOperatorType::HASH_GROUP_JOIN, JoinType::INNER, estimated_cardinality),
       output_groups(std::move(output_groups_p)), unmatched_policy(unmatched_policy_p),
       eager_payload_types(std::move(eager_payload_types_p)), routed(routed_p), unique_owner(unique_owner_p),
-      single_match(single_match_p), null_equal(false), static_mode(false),
+      owner_keys_can_have_null(owner_keys_can_have_null_p), single_match(single_match_p), null_equal(false),
+      static_mode(false),
       streaming_eager(implementation_p == GroupJoinImplementation::EAGER_HASH && unique_owner_p && !routed_p &&
                       (streaming_eager_raw_p || execution_mode_p != GroupJoinExecutionMode::EXTERNAL)),
       streaming_eager_raw(streaming_eager_raw_p),
-      parallel_owner_build(!streaming_eager && unique_owner_p && !routed_p &&
+      parallel_owner_build(!streaming_eager && unique_owner_p && !owner_keys_can_have_null_p && !routed_p &&
                            owner.estimated_cardinality >= GROUP_JOIN_PARALLEL_BUILD_THRESHOLD),
       implementation(implementation_p), planned_execution_mode(execution_mode_p), perfect_min(std::move(perfect_min_p)),
       perfect_max(std::move(perfect_max_p)), perfect_range(perfect_range_p),
@@ -205,8 +206,8 @@ PhysicalHashGroupJoin::PhysicalHashGroupJoin(PhysicalPlan &physical_plan, Logica
                                              idx_t estimated_cardinality)
     : PhysicalJoin(physical_plan, op, PhysicalOperatorType::HASH_GROUP_JOIN, JoinType::INNER, estimated_cardinality),
       output_columns(std::move(output_columns_p)), unmatched_policy(HashGroupJoinUnmatchedPolicy::EMPTY_AGGREGATE),
-      routed(false), unique_owner(false), single_match(false), null_equal(true), static_mode(true),
-      streaming_eager(false), streaming_eager_raw(false), parallel_owner_build(false),
+      routed(false), unique_owner(false), owner_keys_can_have_null(true), single_match(false), null_equal(true),
+      static_mode(true), streaming_eager(false), streaming_eager_raw(false), parallel_owner_build(false),
       implementation(GroupJoinImplementation::MEMOIZING_HASH), planned_execution_mode(GroupJoinExecutionMode::AUTO),
       perfect_range(0) {
 	for (auto &group : groups) {
@@ -292,16 +293,17 @@ public:
 			    context, BufferAllocator::Get(context), op.grouped_aggregate_data.group_types,
 			    CreateGlobalGroupJoinPayloadTypes(op), CreateGlobalGroupJoinAggregates(op),
 			    GroupedAggregateHashTable::InitialCapacity(), parallel_build ? GROUP_JOIN_LOCAL_RADIX_BITS : idx_t(0),
-			    op.null_equal || op.streaming_eager ? TupleDataValidityType::CAN_HAVE_NULL_VALUES
-			                                        : TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
+			    op.null_equal || op.streaming_eager || op.owner_keys_can_have_null
+			        ? TupleDataValidityType::CAN_HAVE_NULL_VALUES
+			        : TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 		}
 		if (!op.streaming_eager && !op.routed && op.unique_owner && !op.null_equal && !parallel_build) {
 			hash_table->SkipLookups();
 			skipped_unique_build = true;
 			if ((op.implementation == GroupJoinImplementation::PERFECT_HASH ||
 			     op.implementation == GroupJoinImplementation::EAGER_HASH) &&
-			    op.grouped_aggregate_data.group_types.size() == 1 && !op.perfect_min.IsNull() &&
-			    !op.perfect_max.IsNull() &&
+			    !op.owner_keys_can_have_null && op.grouped_aggregate_data.group_types.size() == 1 &&
+			    !op.perfect_min.IsNull() && !op.perfect_max.IsNull() &&
 			    PerfectGroupJoinDirectoryFits(op.perfect_range,
 			                                  BufferManager::GetBufferManager(context).GetMaxMemory())) {
 				perfect_executor = make_uniq<PerfectGroupJoinExecutor>(
@@ -485,9 +487,6 @@ SinkResultType PhysicalHashGroupJoin::Sink(ExecutionContext &context, DataChunk 
 		if (local_state.filter_keys) {
 			local_state.filter_keys->Append(local_state.owner_keys);
 		}
-	}
-	if (unique_owner && !null_equal && PhysicalJoin::HasNullValues(local_state.owner_keys)) {
-		throw InternalException("HASH_GROUP_JOIN owner key unexpectedly contained NULL");
 	}
 	if (global_state.external) {
 		local_state.owner_keys.Hash(local_state.hashes);

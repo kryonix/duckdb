@@ -30,6 +30,7 @@ public:
 	HashGroupJoinUnmatchedPolicy unmatched_policy = HashGroupJoinUnmatchedPolicy::DISCARD;
 	bool routed = false;
 	bool unique_owner = false;
+	bool owner_keys_can_have_null = false;
 	bool single_match = false;
 	GroupJoinImplementation implementation = GroupJoinImplementation::MEMOIZING_HASH;
 	GroupJoinExecutionMode execution_mode = GroupJoinExecutionMode::AUTO;

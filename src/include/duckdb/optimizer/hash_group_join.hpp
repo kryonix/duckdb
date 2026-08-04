@@ -35,6 +35,7 @@ struct HashGroupJoinCandidate {
 	vector<idx_t> owner_payload_indices;
 	vector<HashGroupJoinOutputColumn> output_groups;
 	bool unique_owner;
+	bool owner_keys_can_have_null;
 	HashGroupJoinUnmatchedPolicy unmatched_policy;
 	bool routed;
 	bool single_match;
@@ -133,13 +134,12 @@ TryGetPlannedHashGroupJoinCandidate(LogicalAggregate &aggregate, LogicalComparis
 bool HasFactorizedGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context);
 bool HasPotentialFactorizedGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context);
 
+//! Returns true when a mixed DISTINCT aggregate needs costing before the DISTINCT branch rewrite.
+bool HasPotentialAutoMixedDistinctHashGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context);
 //! Returns true when AUTO should retain a mixed DISTINCT aggregate for memoizing GroupJoin planning.
 bool HasAutoMixedDistinctHashGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context);
 bool HasPotentialAutoDomainSemiHashGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context);
 bool HasAutoDomainSemiHashGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context);
-
-//! Returns true when a mixed DISTINCT aggregate needs costing before the DISTINCT branch rewrite.
-bool HasPotentialAutoMixedDistinctHashGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context);
 
 //! Returns the driver keys needed to turn a coarse factorized aggregate into a driver-grain aggregate.
 optional<FactorizedCoarseGroupInfo> GetFactorizedCoarseGroupInfo(LogicalAggregate &aggregate, ClientContext &context);

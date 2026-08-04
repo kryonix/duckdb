@@ -692,6 +692,7 @@ void LogicalGroupJoin::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<double>(265, "factorized_driver_first_cost", factorized_driver_first_cost, 0);
 	serializer.WritePropertyWithDefault<double>(266, "factorized_factors_first_cost", factorized_factors_first_cost, 0);
 	serializer.WritePropertyWithDefault<bool>(267, "factorized_driver_first", factorized_driver_first, true);
+	serializer.WritePropertyWithDefault<bool>(268, "owner_keys_can_have_null", owner_keys_can_have_null, false);
 }
 
 unique_ptr<LogicalOperator> LogicalGroupJoin::Deserialize(Deserializer &deserializer) {
@@ -764,6 +765,7 @@ unique_ptr<LogicalOperator> LogicalGroupJoin::Deserialize(Deserializer &deserial
 	deserializer.ReadPropertyWithExplicitDefault<double>(265, "factorized_driver_first_cost", result->factorized_driver_first_cost, 0);
 	deserializer.ReadPropertyWithExplicitDefault<double>(266, "factorized_factors_first_cost", result->factorized_factors_first_cost, 0);
 	deserializer.ReadPropertyWithExplicitDefault<bool>(267, "factorized_driver_first", result->factorized_driver_first, true);
+	deserializer.ReadPropertyWithExplicitDefault<bool>(268, "owner_keys_can_have_null", result->owner_keys_can_have_null, false);
 	if (use_index && result->implementation == GroupJoinImplementation::MEMOIZING_HASH) {
 		result->implementation = GroupJoinImplementation::INDEX;
 	}

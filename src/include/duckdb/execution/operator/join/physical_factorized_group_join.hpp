@@ -44,9 +44,10 @@ public:
 	                            vector<idx_t> driver_keys, vector<idx_t> left_keys, vector<idx_t> right_keys,
 	                            vector<idx_t> output_group_key_indices, vector<unique_ptr<Expression>> aggregates,
 	                            vector<FactorizedAggregateSource> aggregate_sources, bool preserve_left,
-	                            bool preserve_right, bool semi_left, bool semi_right, bool unique_driver, bool routed,
-	                            GroupJoinExecutionMode execution_mode, Value perfect_min, Value perfect_max,
-	                            idx_t perfect_range, unique_ptr<JoinFilterPushdownInfo> left_filter_pushdown,
+	                            bool preserve_right, bool semi_left, bool semi_right, bool unique_driver,
+	                            bool driver_keys_can_have_null, bool routed, GroupJoinExecutionMode execution_mode,
+	                            Value perfect_min, Value perfect_max, idx_t perfect_range,
+	                            unique_ptr<JoinFilterPushdownInfo> left_filter_pushdown,
 	                            unique_ptr<JoinFilterPushdownInfo> right_filter_pushdown,
 	                            unique_ptr<JoinFilterPushdownInfo> left_driver_filter_pushdown,
 	                            unique_ptr<JoinFilterPushdownInfo> right_driver_filter_pushdown,
@@ -77,6 +78,7 @@ public:
 	bool semi_left;
 	bool semi_right;
 	bool unique_driver;
+	bool driver_keys_can_have_null;
 	bool routed;
 	GroupJoinExecutionMode planned_execution_mode;
 	array<FactorizedGroupJoinBranchMode, SOURCE_COUNT - 1> branch_modes;

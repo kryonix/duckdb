@@ -163,7 +163,7 @@ optional<UniqueKeyProperty> GetUniqueKeyProperty(LogicalOperator &owner, const v
 			}
 			matched_groups[column] = true;
 		}
-		return UniqueKeyProperty {UniqueKeyProof::AGGREGATE_GROUP, nullptr};
+		return UniqueKeyProperty {UniqueKeyProof::AGGREGATE_GROUP, nullptr, true};
 	}
 	if (current.get().type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto &join = current.get().Cast<LogicalComparisonJoin>();
@@ -195,8 +195,11 @@ optional<UniqueKeyProperty> GetUniqueKeyProperty(LogicalOperator &owner, const v
 			}
 			child_columns.push_back(child_column.GetIndex());
 		}
-		if (key_child == DConstants::INVALID_INDEX ||
-		    !GetUniqueKeyProperty(*join.children[key_child], child_columns)) {
+		if (key_child == DConstants::INVALID_INDEX) {
+			return nullopt;
+		}
+		auto key_property = GetUniqueKeyProperty(*join.children[key_child], child_columns);
+		if (!key_property) {
 			return nullopt;
 		}
 
@@ -242,7 +245,7 @@ optional<UniqueKeyProperty> GetUniqueKeyProperty(LogicalOperator &owner, const v
 		if (!preserves_key) {
 			return nullopt;
 		}
-		return UniqueKeyProperty {UniqueKeyProof::KEY_PRESERVING_JOIN, nullptr};
+		return UniqueKeyProperty {UniqueKeyProof::KEY_PRESERVING_JOIN, nullptr, key_property->can_have_null};
 	}
 
 	logical_columns = output_columns;
@@ -283,8 +286,9 @@ optional<UniqueKeyProperty> GetUniqueKeyProperty(LogicalOperator &owner, const v
 			}
 		}
 		if (matches) {
-			return UniqueKeyProperty {
-			    unique.IsPrimaryKey() ? UniqueKeyProof::PRIMARY_KEY : UniqueKeyProof::UNIQUE_NOT_NULL, base_scan};
+			return UniqueKeyProperty {unique.IsPrimaryKey() ? UniqueKeyProof::PRIMARY_KEY
+			                                                : UniqueKeyProof::UNIQUE_NOT_NULL,
+			                          base_scan, false};
 		}
 	}
 	return nullopt;

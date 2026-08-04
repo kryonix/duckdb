@@ -442,9 +442,11 @@ static HashGroupJoinCandidate GetHashGroupJoinCandidate(LogicalGroupJoin &op) {
 	for (idx_t group_idx = 0; group_idx < op.output_group_sources.size(); group_idx++) {
 		output_groups.push_back({op.output_group_sources[group_idx], op.output_group_indices[group_idx]});
 	}
-	return HashGroupJoinCandidate {op.owner_child,       op.probe_child,           op.owner_key_indices,
-	                               op.probe_key_indices, op.owner_payload_indices, std::move(output_groups),
-	                               op.unique_owner,      op.unmatched_policy,      op.routed,
+	return HashGroupJoinCandidate {op.owner_child,           op.probe_child,
+	                               op.owner_key_indices,     op.probe_key_indices,
+	                               op.owner_payload_indices, std::move(output_groups),
+	                               op.unique_owner,          op.owner_keys_can_have_null,
+	                               op.unmatched_policy,      op.routed,
 	                               op.single_match};
 }
 
@@ -521,8 +523,8 @@ static PhysicalOperator &CreateFactorizedGroupJoinPlan(PhysicalPlanGenerator &ge
 	            op, driver, left_factor, right_factor, op.factorized_driver_key_indices, op.factorized_left_key_indices,
 	            op.factorized_right_key_indices, std::move(output_group_indices), std::move(aggregates),
 	            op.factorized_aggregate_sources, op.factorized_preserve_left, op.factorized_preserve_right,
-	            op.factorized_semi_left, op.factorized_semi_right, op.unique_owner, op.routed, op.execution_mode,
-	            std::move(op.perfect_min), std::move(op.perfect_max), op.perfect_range,
+	            op.factorized_semi_left, op.factorized_semi_right, op.unique_owner, op.owner_keys_can_have_null,
+	            op.routed, op.execution_mode, std::move(op.perfect_min), std::move(op.perfect_max), op.perfect_range,
 	            std::move(op.factorized_left_filter_pushdown), std::move(op.factorized_right_filter_pushdown),
 	            std::move(op.factorized_left_driver_filter_pushdown),
 	            std::move(op.factorized_right_driver_filter_pushdown), op.estimated_cardinality)
@@ -720,10 +722,10 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalGroupJoin &op) {
 	return Make<PhysicalHashGroupJoin>(
 	    op, group_join_probe, owner_projection, std::move(aggregates), std::move(owner_payload_aggregates),
 	    std::move(groups), std::move(candidate.output_groups), candidate.unmatched_policy, candidate.routed,
-	    candidate.unique_owner, candidate.single_match, std::move(op.filter_pushdown), actual_implementation,
-	    op.execution_mode, std::move(op.perfect_min), std::move(op.perfect_max), op.perfect_range,
-	    std::move(eager_payload_types), std::move(unmatched_probe_types), std::move(unmatched_payload_expressions),
-	    streaming_eager_raw, op.estimated_cardinality);
+	    candidate.unique_owner, candidate.owner_keys_can_have_null, candidate.single_match,
+	    std::move(op.filter_pushdown), actual_implementation, op.execution_mode, std::move(op.perfect_min),
+	    std::move(op.perfect_max), op.perfect_range, std::move(eager_payload_types), std::move(unmatched_probe_types),
+	    std::move(unmatched_payload_expressions), streaming_eager_raw, op.estimated_cardinality);
 }
 
 PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalAggregate &op) {

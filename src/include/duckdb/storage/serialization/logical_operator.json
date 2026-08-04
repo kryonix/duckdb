@@ -532,6 +532,12 @@
         "name": "factorized_driver_first",
         "type": "bool",
         "default": "true"
+      },
+      {
+        "id": 268,
+        "name": "owner_keys_can_have_null",
+        "type": "bool",
+        "default": "false"
       }
     ],
     "constructor": [

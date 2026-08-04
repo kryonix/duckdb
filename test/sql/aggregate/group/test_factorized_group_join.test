@@ -1391,3 +1391,52 @@ physical_plan	<!REGEX>:.*Factorized Group Join.*
 
 statement ok
 RESET debug_group_join_strategy
+
+# Grouping proves driver uniqueness without proving that the key is non-NULL.
+statement ok
+SET threads = 4
+
+statement ok
+SET debug_group_join_strategy = 'factorized'
+
+statement ok
+CREATE TABLE fg_nullable_group_driver(k INTEGER)
+
+statement ok
+INSERT INTO fg_nullable_group_driver VALUES (NULL), (1), (1)
+
+statement ok
+CREATE TABLE fg_nullable_group_left(k INTEGER, v INTEGER)
+
+statement ok
+INSERT INTO fg_nullable_group_left VALUES (NULL, 99), (1, 10)
+
+statement ok
+CREATE TABLE fg_nullable_group_right(k INTEGER, v INTEGER)
+
+statement ok
+INSERT INTO fg_nullable_group_right VALUES (NULL, 88), (1, 20)
+
+query II
+EXPLAIN WITH driver AS (SELECT k FROM fg_nullable_group_driver GROUP BY k)
+SELECT d.k, count(l.v), count(r.v)
+FROM driver d
+LEFT JOIN fg_nullable_group_left l USING (k)
+LEFT JOIN fg_nullable_group_right r USING (k)
+GROUP BY d.k
+----
+physical_plan	<REGEX>:.*Factorized Group Join.*
+
+query III rowsort
+WITH driver AS (SELECT k FROM fg_nullable_group_driver GROUP BY k)
+SELECT d.k, count(l.v), count(r.v)
+FROM driver d
+LEFT JOIN fg_nullable_group_left l USING (k)
+LEFT JOIN fg_nullable_group_right r USING (k)
+GROUP BY d.k
+----
+1	1	1
+NULL	0	0
+
+statement ok
+RESET debug_group_join_strategy

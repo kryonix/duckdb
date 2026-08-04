@@ -255,6 +255,7 @@ optional<HashGroupJoinCandidate> TryGetHashGroupJoinCandidate(LogicalAggregate &
 			                                  {},
 			                                  {},
 			                                  key_property.has_value(),
+			                                  key_property && key_property->can_have_null,
 			                                  unmatched_policy,
 			                                  false,
 			                                  join.join_type == JoinType::SEMI};
@@ -1076,6 +1077,7 @@ struct FactorizedGroupJoinCandidate {
 	vector<idx_t> group_driver_indices;
 	vector<FactorizedAggregateSource> aggregate_sources;
 	bool unique_driver;
+	bool driver_keys_can_have_null;
 	bool routed;
 	bool preserve_left;
 	bool preserve_right;
@@ -1300,7 +1302,9 @@ static optional<FactorizedGroupJoinCandidate> ValidateFactorizedGroupJoinCandida
     LogicalOperator &driver, LogicalOperator &left_factor, LogicalOperator &right_factor, idx_t nested_child,
     idx_t driver_child, vector<idx_t> driver_keys, vector<idx_t> left_keys, vector<idx_t> right_keys,
     bool preserve_left, bool preserve_right, bool semi_left, bool semi_right, bool require_all_driver_keys) {
-	const auto unique_driver = GetUniqueKeyProperty(driver, driver_keys).has_value();
+	auto driver_key_property = GetUniqueKeyProperty(driver, driver_keys);
+	const auto unique_driver = driver_key_property.has_value();
+	const auto driver_keys_can_have_null = driver_key_property && driver_key_property->can_have_null;
 	unordered_set<idx_t> group_key_pairs;
 	vector<idx_t> group_driver_indices;
 	bool routed = false;
@@ -1375,6 +1379,7 @@ static optional<FactorizedGroupJoinCandidate> ValidateFactorizedGroupJoinCandida
 	                                     std::move(group_driver_indices),
 	                                     std::move(aggregate_sources),
 	                                     unique_driver,
+	                                     driver_keys_can_have_null,
 	                                     routed,
 	                                     preserve_left,
 	                                     preserve_right,
@@ -2261,6 +2266,7 @@ static void PlanFactorizedGroupJoin(unique_ptr<LogicalOperator> &root, LogicalAg
 	result->has_estimated_cardinality = aggregate.has_estimated_cardinality;
 	result->implementation = GroupJoinImplementation::FACTORIZED_HASH;
 	result->unique_owner = candidate.unique_driver;
+	result->owner_keys_can_have_null = candidate.driver_keys_can_have_null;
 	result->routed = candidate.routed;
 	result->factorized_driver_key_indices = std::move(candidate.driver_key_indices);
 	result->factorized_left_key_indices = std::move(candidate.left_key_indices);
@@ -2392,6 +2398,7 @@ void PlanHashGroupJoins(unique_ptr<LogicalOperator> &root, ClientContext &contex
 	result->unmatched_policy = candidate->unmatched_policy;
 	result->routed = candidate->routed;
 	result->unique_owner = candidate->unique_owner;
+	result->owner_keys_can_have_null = candidate->owner_keys_can_have_null;
 	result->single_match = candidate->single_match;
 	if (can_use_perfect) {
 		result->perfect_min = perfect_min;
