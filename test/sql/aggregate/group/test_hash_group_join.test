@@ -1566,7 +1566,7 @@ EXPLAIN SELECT o.a, o.b, count(*), sum(p.value)
 FROM gj_auto_owner o JOIN gj_auto_probe p USING (a, b)
 GROUP BY o.a, o.b
 ----
-physical_plan	<REGEX>:(?s).*Hash Group Join.*EAGER_HASH.*STREAMING_OWNER.*INLINE.*
+physical_plan	<REGEX>:(?s).*Hash Group Join.*EAGER_HASH.*STREAMING_OWNER.*INLINE.*PARALLEL_COMMON_RADIX.*
 
 query II
 EXPLAIN SELECT o.a, o.b, count(*), sum(p.value)
@@ -1769,7 +1769,7 @@ EXPLAIN SELECT o.a, o.b, count(*), sum(p.value), min(p.value), max(p.value)
 FROM gj_auto_physical_eager_owner o JOIN gj_auto_physical_eager_probe p USING (a, b)
 GROUP BY o.a, o.b
 ----
-physical_plan	<REGEX>:(?s).*Hash Group Join.*EAGER_HASH.*STREAMING_OWNER.*INLINE.*
+physical_plan	<REGEX>:(?s).*Hash Group Join.*EAGER_HASH.*STREAMING_OWNER.*INLINE.*PARALLEL_COMMON_RADIX.*
 
 query II
 EXPLAIN SELECT o.a, o.b, count(*), sum(p.value), min(p.value), max(p.value)
@@ -2107,7 +2107,7 @@ query II
 EXPLAIN SELECT o.k, count(*), sum(p.v)
 FROM gj_eager_owner o JOIN gj_physical_eager_probe p USING (k) GROUP BY o.k
 ----
-physical_plan	<REGEX>:(?s).*Hash Group Join.*EAGER_HASH.*STREAMING_OWNER.*INLINE.*
+physical_plan	<REGEX>:(?s).*Hash Group Join.*EAGER_HASH.*STREAMING_OWNER.*INLINE.*PARALLEL_COMMON_RADIX.*
 
 statement ok
 SET debug_verify_serializer = true
@@ -2123,6 +2123,13 @@ SELECT count(*), sum(n), sum(s) FROM (
 
 statement ok
 SET debug_verify_serializer = false
+
+query II
+EXPLAIN SELECT o.k, count(DISTINCT p.v), string_agg(p.s, ',' ORDER BY p.v, p.s)
+FROM gj_eager_owner o LEFT JOIN gj_physical_eager_probe p USING (k)
+GROUP BY o.k
+----
+physical_plan	<REGEX>:(?s).*Hash Group Join.*STREAMING_OWNER.*EXPORTED_STATE.*PARALLEL_COMMON_RADIX.*
 
 query IIIIIITT
 SELECT o.k, count(*), count(p.v), sum(p.v), count(DISTINCT p.v), sum(p.v) FILTER (WHERE p.v > 1),
@@ -2250,7 +2257,7 @@ EXPLAIN SELECT o.k, count(*), sum(p.v) FILTER (WHERE p.v % 3 = 0),
 FROM gj_eager_variable_owner o JOIN gj_eager_variable_probe p USING (k)
 GROUP BY o.k
 ----
-physical_plan	<REGEX>:(?s).*Hash Group Join.*EAGER_HASH.*STREAMING_OWNER.*INLINE.*
+physical_plan	<REGEX>:(?s).*Hash Group Join.*EAGER_HASH.*STREAMING_OWNER.*INLINE.*PARALLEL_COMMON_RADIX.*
 
 query I
 SELECT count(*) FROM (

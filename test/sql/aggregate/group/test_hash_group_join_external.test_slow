@@ -51,8 +51,34 @@ SELECT count(*), sum(n), sum(s) FROM (
 ----
 100000	4000000	9949998000000
 
+# The streaming eager build uses the aggregate hash table's adaptive common-radix spill path before probing owners.
+statement ok
+SET debug_group_join_strategy = 'eager'
+
+statement ok
+PRAGMA profiling_output = '{TEST_DIR}/hash_group_join_external_streaming.json'
+
+query III
+SELECT count(*), sum(n), sum(s) FROM (
+	SELECT o.id, count(*) n, sum(p.v) s
+	FROM external_owner o
+	JOIN (SELECT (i % 125000)::INTEGER id, i::BIGINT v FROM range(5000000) t(i)) p USING (id)
+	GROUP BY o.id
+)
+----
+100000	4000000	9949998000000
+
 statement ok
 PRAGMA profiling_output = '{TEST_DIR}/hash_group_join_external_distinct.json'
+
+# DISTINCT retains the materialized external path because one variable-sized state can exceed memory.
+query II
+EXPLAIN SELECT count(DISTINCT p.v)
+FROM external_owner o
+JOIN (SELECT 0::INTEGER id, i::BIGINT v FROM range(5000000) t(i)) p USING (id)
+GROUP BY o.id
+----
+physical_plan	<REGEX>:(?s).*Hash Group Join.*MATERIALIZED_OWNER.*Strategy: EXTERNAL.*
 
 query I
 SELECT count(DISTINCT p.v)
@@ -61,6 +87,9 @@ JOIN (SELECT 0::INTEGER id, i::BIGINT v FROM range(5000000) t(i)) p USING (id)
 GROUP BY o.id
 ----
 5000000
+
+statement ok
+SET debug_group_join_strategy = 'force'
 
 # A hot non-unique lookup key exercises routed external execution without materializing the owner partition as Values.
 statement ok
@@ -90,6 +119,8 @@ statement ok
 CREATE TEMP TABLE external_metrics AS
 SELECT * FROM '{TEST_DIR}/hash_group_join_external.json'
 UNION ALL
+SELECT * FROM '{TEST_DIR}/hash_group_join_external_streaming.json'
+UNION ALL
 SELECT * FROM '{TEST_DIR}/hash_group_join_external_distinct.json'
 UNION ALL
 SELECT * FROM '{TEST_DIR}/hash_group_join_external_general.json'
@@ -98,4 +129,4 @@ query III
 SELECT count(*), min(system.peak_buffer_memory <= 30000000), min(system.peak_temp_dir_size > 0)
 FROM external_metrics
 ----
-3	true	true
+4	true	true

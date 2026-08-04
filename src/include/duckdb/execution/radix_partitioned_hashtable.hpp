@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/common/types/row/tuple_data_layout.hpp"
+#include "duckdb/execution/aggregate_hashtable.hpp"
 #include "duckdb/execution/physical_operator_states.hpp"
 #include "duckdb/execution/operator/aggregate/grouped_aggregate_data.hpp"
 #include "duckdb/execution/progress_data.hpp"
@@ -18,8 +19,20 @@ namespace duckdb {
 class GlobalSinkState;
 class LocalSinkState;
 
-class GroupedAggregateHashTable;
 struct AggregatePartition;
+
+//! Task-local scratch state for probing finalized radix aggregate partitions.
+struct RadixHTLookupState {
+public:
+	RadixHTLookupState();
+
+	vector<unique_ptr<AggregateHTLookupState>> partition_states;
+	vector<SelectionVector> partition_selections;
+	vector<idx_t> partition_counts;
+	DataChunk selected_groups;
+	Vector selected_hashes;
+	SelectionVector selected_found;
+};
 
 class RadixPartitionedHashTable {
 public:
@@ -48,6 +61,9 @@ public:
 
 	void Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input, DataChunk &aggregate_input_chunk,
 	          const unsafe_vector<idx_t> &filter) const;
+	//! Combines one serialized state column into each aggregate beginning at aggregate_begin.
+	void SinkExportedStates(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input,
+	                        DataChunk &serialized_states, idx_t aggregate_begin) const;
 	void Combine(ExecutionContext &context, GlobalSinkState &gstate, LocalSinkState &lstate) const;
 	void Finalize(ClientContext &context, GlobalSinkState &gstate) const;
 
@@ -67,6 +83,14 @@ public:
 	const TupleDataLayout &GetLayout() const;
 	idx_t MaxThreads(GlobalSinkState &sink) const;
 	static void SetMultiScan(GlobalSinkState &sink);
+
+	//! Finalize all radix partitions into immutable lookup tables. Calls can run concurrently.
+	void FinalizeLookupPartitions(ClientContext &context, GlobalSinkState &sink) const;
+	//! Verify that every lookup partition was finalized.
+	void FinishLookup(GlobalSinkState &sink) const;
+	//! Probe immutable lookup partitions with precomputed group hashes.
+	idx_t LookupGroups(GlobalSinkState &sink, DataChunk &groups, Vector &group_hashes, RadixHTLookupState &state,
+	                   Vector &addresses, SelectionVector &found_groups) const;
 
 private:
 	void SetGroupingValues();

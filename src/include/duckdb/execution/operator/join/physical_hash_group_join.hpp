@@ -11,6 +11,7 @@
 #include "duckdb/execution/operator/aggregate/grouped_aggregate_data.hpp"
 #include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/execution/operator/join/physical_join.hpp"
+#include "duckdb/execution/radix_partitioned_hashtable.hpp"
 
 namespace duckdb {
 
@@ -47,6 +48,8 @@ public:
 
 	GroupedAggregateData grouped_aggregate_data;
 	GroupedAggregateData owner_payload_data;
+	GroupingSet streaming_grouping_set;
+	unique_ptr<RadixPartitionedHashTable> streaming_table_data;
 	vector<HashGroupJoinOutputColumn> output_groups;
 	vector<HashGroupJoinOutputColumn> output_columns;
 	vector<string> output_group_names;
@@ -100,7 +103,7 @@ public:
 		return !streaming_eager;
 	}
 	bool ParallelSink() const override {
-		return parallel_owner_build;
+		return streaming_table_data != nullptr || parallel_owner_build;
 	}
 	bool ParallelOperator() const override {
 		return true;
