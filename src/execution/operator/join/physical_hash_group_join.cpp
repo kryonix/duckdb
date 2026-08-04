@@ -1413,11 +1413,13 @@ static OperatorResultType ExecuteStreamingEagerGroupJoin(const PhysicalHashGroup
 	state.streaming_addresses.SetVectorType(VectorType::FLAT_VECTOR);
 	auto output_addresses = FlatVector::GetDataMutable<data_ptr_t>(state.streaming_addresses);
 	auto lookup_addresses = FlatVector::GetData<data_ptr_t>(state.lookup_state.addresses);
+	const auto preserve_input_order =
+	    op.unmatched_policy != HashGroupJoinUnmatchedPolicy::DISCARD && match_count == input.size();
 	for (idx_t match_idx = 0; match_idx < match_count; match_idx++) {
 		auto lookup_idx = state.found_sel.get_index_unsafe(match_idx);
 		auto input_idx = non_null_count == input.size() ? lookup_idx : state.non_null_sel.get_index_unsafe(lookup_idx);
 		state.streaming_output_sel.set_index(match_idx, input_idx);
-		output_addresses[match_idx] = lookup_addresses[lookup_idx];
+		output_addresses[preserve_input_order ? input_idx : match_idx] = lookup_addresses[lookup_idx];
 	}
 	FlatVector::SetSize(state.streaming_addresses, match_count);
 
@@ -1435,7 +1437,7 @@ static OperatorResultType ExecuteStreamingEagerGroupJoin(const PhysicalHashGroup
 		default:
 			throw InternalException("Streaming eager HASH_GROUP_JOIN encountered a non-owner output group");
 		}
-		if (op.unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD && match_count != input.size()) {
+		if (op.unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD) {
 			chunk.data[group_idx].Slice(input.data[input_idx], state.streaming_output_sel, match_count);
 		} else {
 			chunk.data[group_idx].Reference(input.data[input_idx]);

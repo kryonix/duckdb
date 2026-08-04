@@ -2358,6 +2358,37 @@ SELECT count(*), sum(n), sum(s) FROM (
 ----
 2	4	10
 
+# Parallel radix lookup visits partitions out of owner-input order. Keep each owner key paired with its aggregate.
+statement ok
+CREATE TABLE gj_eager_partition_owner(k INTEGER PRIMARY KEY)
+
+statement ok
+INSERT INTO gj_eager_partition_owner SELECT i FROM range(256) t(i)
+
+statement ok
+CREATE TABLE gj_eager_partition_probe(k INTEGER, v BIGINT)
+
+statement ok
+INSERT INTO gj_eager_partition_probe SELECT i, i * 1000003 + 17 FROM range(256) t(i)
+
+query I
+SELECT count(*) FROM (
+	SELECT o.k, sum(p.v) s
+	FROM gj_eager_partition_owner o JOIN gj_eager_partition_probe p USING (k)
+	GROUP BY o.k
+) WHERE s != k * 1000003 + 17
+----
+0
+
+query I
+SELECT count(*) FROM (
+	SELECT o.k, sum(p.v) s
+	FROM gj_eager_partition_owner o LEFT JOIN gj_eager_partition_probe p USING (k)
+	GROUP BY o.k
+) WHERE s != k * 1000003 + 17
+----
+0
+
 statement ok
 SET debug_verify_serializer = false
 
