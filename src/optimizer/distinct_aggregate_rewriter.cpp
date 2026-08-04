@@ -9,6 +9,7 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/bound_result_modifier.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
@@ -267,6 +268,26 @@ bool DistinctAggregateRewriter::TryRewrite(unique_ptr<LogicalOperator> &op) {
 	auto &aggr = op->Cast<LogicalAggregate>();
 	if (HasPotentialFactorizedGroupJoinCandidate(aggr, optimizer.context)) {
 		return false;
+	}
+	auto coarse_factorized = GetFactorizedCoarseGroupInfo(aggr, optimizer.context);
+	if (coarse_factorized && coarse_factorized->missing_driver_keys.size() == 1) {
+		bool distinct_driver_key_only = true;
+		for (auto &expression : aggr.expressions) {
+			auto &aggregate = expression->Cast<BoundAggregateExpression>();
+			if (!aggregate.IsDistinct()) {
+				continue;
+			}
+			if (aggregate.GetChildren().size() != 1 ||
+			    aggregate.GetChildren()[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
+			    aggregate.GetChildren()[0]->Cast<BoundColumnRefExpression>().Binding() !=
+			        coarse_factorized->missing_driver_keys[0]) {
+				distinct_driver_key_only = false;
+				break;
+			}
+		}
+		if (distinct_driver_key_only) {
+			return false;
+		}
 	}
 	if (ForceHashGroupJoinPlanning(optimizer.context) &&
 	    IsStaticHashGroupJoinAggregate(optimizer.GetPlan(), aggr, optimizer.context,

@@ -536,6 +536,111 @@ BuildFinalProjection(Optimizer &optimizer, LogicalAggregate &aggr, unique_ptr<Lo
 	return projection;
 }
 
+static bool CanCombineCoarseFactorizedAggregate(const BoundAggregateExpression &aggregate,
+                                                const FactorizedCoarseGroupInfo &coarse_info) {
+	if (aggregate.GetOrderBys() || aggregate.StateExportMode() != AggregateStateExportMode::NONE) {
+		return false;
+	}
+	if (aggregate.IsDistinct()) {
+		if (coarse_info.missing_driver_keys.size() != 1 || aggregate.GetChildren().size() != 1 ||
+		    aggregate.GetChildren()[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
+		    aggregate.GetChildren()[0]->Cast<BoundColumnRefExpression>().Binding() !=
+		        coarse_info.missing_driver_keys[0]) {
+			return false;
+		}
+	}
+	auto &function = aggregate.Function();
+	return function.HasStateCombineCallback() && !function.HasStateDestructorCallback() &&
+	       function.HasStateSizeCallback() && function.HasStateFinalizeCallback() &&
+	       function.HasGetStateTypeCallback() &&
+	       function.HasExportAggregateStateCallback() == function.HasImportAggregateStateCallback();
+}
+
+bool PartialAggregatePushdown::TryFactorizedCoarseGrouping(unique_ptr<LogicalOperator> &op) {
+	if (op->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY || op->children.size() != 1) {
+		return false;
+	}
+	auto &aggregate = op->Cast<LogicalAggregate>();
+	auto coarse_info = GetFactorizedCoarseGroupInfo(aggregate, optimizer.context);
+	if (!coarse_info) {
+		return false;
+	}
+	for (auto &expression : aggregate.expressions) {
+		if (expression->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE ||
+		    !CanCombineCoarseFactorizedAggregate(expression->Cast<BoundAggregateExpression>(), *coarse_info)) {
+			return false;
+		}
+	}
+
+	const auto inner_group_index = optimizer.binder.GenerateTableIndex();
+	const auto inner_aggregate_index = optimizer.binder.GenerateTableIndex();
+	vector<unique_ptr<Expression>> inner_aggregates;
+	inner_aggregates.reserve(aggregate.expressions.size());
+	for (auto &expression : aggregate.expressions) {
+		auto copy = unique_ptr_cast<Expression, BoundAggregateExpression>(expression->Copy());
+		inner_aggregates.push_back(ExportAggregateFunction::Bind(std::move(copy)));
+	}
+	auto inner = make_uniq<LogicalAggregate>(inner_group_index, inner_aggregate_index, std::move(inner_aggregates));
+	for (auto &group : aggregate.groups) {
+		inner->groups.push_back(group->Copy());
+	}
+	for (idx_t key_idx = 0; key_idx < coarse_info->missing_driver_keys.size(); key_idx++) {
+		inner->groups.push_back(make_uniq<BoundColumnRefExpression>(coarse_info->missing_driver_key_types[key_idx],
+		                                                            coarse_info->missing_driver_keys[key_idx]));
+	}
+	inner->children.push_back(std::move(aggregate.children[0]));
+	inner->ResolveOperatorTypes();
+	inner->SetEstimatedCardinality(coarse_info->estimated_driver_rows);
+
+	if (!HasFactorizedGroupJoinCandidate(*inner, optimizer.context)) {
+		aggregate.children[0] = std::move(inner->children[0]);
+		return false;
+	}
+
+	vector<unique_ptr<Expression>> upper_aggregates;
+	upper_aggregates.reserve(aggregate.expressions.size());
+	FunctionBinder function_binder(optimizer.context);
+	auto combine_function = CombineAggrFun::GetFunction();
+	for (idx_t aggregate_idx = 0; aggregate_idx < aggregate.expressions.size(); aggregate_idx++) {
+		auto state_type =
+		    inner->types[aggregate.groups.size() + coarse_info->missing_driver_keys.size() + aggregate_idx];
+		vector<unique_ptr<Expression>> arguments;
+		arguments.push_back(make_uniq<BoundColumnRefExpression>(
+		    state_type, ColumnBinding(inner_aggregate_index, ProjectionIndex(aggregate_idx))));
+		auto combined = function_binder.BindAggregateFunction(combine_function, std::move(arguments));
+		if (combined->GetReturnType() != state_type) {
+			throw InternalException("Coarse factorized aggregate state type changed during combination");
+		}
+		upper_aggregates.push_back(std::move(combined));
+	}
+
+	auto upper = make_uniq<LogicalAggregate>(optimizer.binder.GenerateTableIndex(),
+	                                         optimizer.binder.GenerateTableIndex(), std::move(upper_aggregates));
+	for (idx_t group_idx = 0; group_idx < aggregate.groups.size(); group_idx++) {
+		upper->groups.push_back(make_uniq<BoundColumnRefExpression>(
+		    inner->types[group_idx], ColumnBinding(inner_group_index, ProjectionIndex(group_idx))));
+	}
+	upper->grouping_sets = aggregate.grouping_sets;
+	upper->children.push_back(std::move(inner));
+	upper->ResolveOperatorTypes();
+	CopyCardinality(*upper, aggregate);
+
+	auto projection = BuildFinalProjection(
+	    optimizer, aggregate, std::move(upper), replacement_map,
+	    [&](idx_t aggregate_idx, unique_ptr<Expression> state) -> unique_ptr<Expression> {
+		    auto finalized = optimizer.BindScalarFunction("finalize", std::move(state));
+		    if (finalized->GetReturnType() != aggregate.expressions[aggregate_idx]->GetReturnType()) {
+			    return nullptr;
+		    }
+		    return finalized;
+	    });
+	if (!projection) {
+		throw InternalException("Coarse factorized aggregate state did not round-trip to its result type");
+	}
+	op = std::move(projection);
+	return true;
+}
+
 //===--------------------------------------------------------------------===//
 // Double-Eager Aggregation
 //===--------------------------------------------------------------------===//
@@ -954,13 +1059,25 @@ void PartialAggregatePushdown::VisitOperator(unique_ptr<LogicalOperator> &op) {
 			return;
 		}
 		op->Cast<LogicalAggregate>().factorized_group_join_deferred = false;
-	} else if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && op->children.size() == 1 &&
-	           HasPotentialFactorizedGroupJoinCandidate(op->Cast<LogicalAggregate>(), optimizer.context)) {
-		op->Cast<LogicalAggregate>().factorized_group_join_deferred = true;
-		return;
+	} else if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && op->children.size() == 1) {
+		auto &aggregate = op->Cast<LogicalAggregate>();
+		if (HasPotentialFactorizedGroupJoinCandidate(aggregate, optimizer.context)) {
+			aggregate.factorized_group_join_deferred = true;
+			return;
+		}
+		if (GetFactorizedCoarseGroupInfo(aggregate, optimizer.context)) {
+			if (TryFactorizedCoarseGrouping(op)) {
+				return;
+			}
+			aggregate.factorized_group_join_deferred = true;
+			return;
+		}
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && op->children.size() == 1 &&
 	    HasFactorizedGroupJoinCandidate(op->Cast<LogicalAggregate>(), optimizer.context)) {
+		return;
+	}
+	if (TryFactorizedCoarseGrouping(op)) {
 		return;
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && op->children.size() == 1 &&

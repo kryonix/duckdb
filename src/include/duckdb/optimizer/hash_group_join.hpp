@@ -10,6 +10,7 @@
 #include "duckdb/common/optional.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/execution/group_join_strategy.hpp"
+#include "duckdb/planner/column_binding.hpp"
 
 namespace duckdb {
 
@@ -17,6 +18,12 @@ class ClientContext;
 class LogicalAggregate;
 class LogicalComparisonJoin;
 class LogicalOperator;
+
+struct FactorizedCoarseGroupInfo {
+	vector<ColumnBinding> missing_driver_keys;
+	vector<LogicalType> missing_driver_key_types;
+	idx_t estimated_driver_rows;
+};
 
 enum class HashGroupJoinCandidateMode : uint8_t { STRICT, ALLOW_AGGREGATE_ORDER };
 
@@ -116,6 +123,9 @@ TryGetPlannedHashGroupJoinCandidate(LogicalAggregate &aggregate, LogicalComparis
 //! Returns whether the aggregate has a semantically valid factorized two-branch candidate under the exact strategy.
 bool HasFactorizedGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context);
 bool HasPotentialFactorizedGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context);
+
+//! Returns the driver keys needed to turn a coarse factorized aggregate into a driver-grain aggregate.
+optional<FactorizedCoarseGroupInfo> GetFactorizedCoarseGroupInfo(LogicalAggregate &aggregate, ClientContext &context);
 
 //! Replaces selected aggregate-over-join patterns with first-class logical GroupJoin operators.
 void PlanHashGroupJoins(unique_ptr<LogicalOperator> &root, ClientContext &context);

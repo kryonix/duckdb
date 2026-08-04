@@ -304,8 +304,7 @@ PhysicalFactorizedGroupJoin::PhysicalFactorizedGroupJoin(
 			branch_modes[factor_idx] = FactorizedGroupJoinBranchMode::LAZY;
 		}
 	}
-	streaming_driver =
-	    !driver_first && unique_driver && !routed && planned_execution_mode != GroupJoinExecutionMode::EXTERNAL;
+	streaming_driver = !driver_first && unique_driver && planned_execution_mode != GroupJoinExecutionMode::EXTERNAL;
 }
 
 vector<AggregateObject> PhysicalFactorizedGroupJoin::CreateHashTableAggregates() const {
@@ -1892,7 +1891,7 @@ SinkResultType PhysicalFactorizedGroupJoinSink::Sink(ExecutionContext &context, 
 				driver_state.group_addresses.push_back(addresses[input_idx]);
 			}
 		}
-		if (op.routed) {
+		if (op.routed && !op.streaming_driver) {
 			D_ASSERT(driver_state.routing_table);
 			auto route_count =
 			    driver_state.routing_table->FindOrCreateGroups(state.keys, state.routing_addresses, state.new_routes);
@@ -3047,8 +3046,9 @@ OperatorResultType PhysicalFactorizedGroupJoin::Execute(ExecutionContext &contex
 			                                  state.output.addresses, aggregate_idx, 1, *multiplicities,
 			                                  AggregateCombineType::PRESERVE_INPUT);
 		}
+		auto &output_groups = routed ? driver.groups : driver.keys;
 		for (idx_t group_idx = 0; group_idx < output_group_key_indices.size(); group_idx++) {
-			chunk.data[group_idx].Slice(driver.keys.data[output_group_key_indices[group_idx]], state.selected_rows,
+			chunk.data[group_idx].Slice(output_groups.data[output_group_key_indices[group_idx]], state.selected_rows,
 			                            result_count);
 		}
 		chunk.SetChildCardinality(result_count);
