@@ -14,12 +14,16 @@ namespace duckdb {
 
 class LogicalOperator;
 class Optimizer;
+class Expression;
 
 class CTEFilterPusher {
 public:
 	explicit CTEFilterPusher(Optimizer &optimizer);
 	//! Finds all materialized CTEs and pushes OR filters into them (if applicable)
 	unique_ptr<LogicalOperator> Optimize(unique_ptr<LogicalOperator> op);
+	//! Builds the disjunction of consumer filters using the CTE definition's column bindings
+	static unique_ptr<Expression> BuildFilterExpression(LogicalOperator &definition,
+	                                                    const vector<reference<LogicalOperator>> &filters);
 
 private:
 	//! CTE info needed for creating OR filters that can be pushed down

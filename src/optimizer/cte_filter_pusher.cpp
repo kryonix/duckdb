@@ -73,13 +73,32 @@ void CTEFilterPusher::PushFilterIntoCTE(MaterializedCTEInfo &info) {
 		return;
 	}
 
-	// Create an OR expression with all the filters on all references of the CTE
+	auto outer_expr = BuildFilterExpression(*info.materialized_cte.children[0], info.filters);
+
+	// Add the filter on top of the CTE definition and split the predicates
+	auto new_cte = make_uniq_base<LogicalOperator, LogicalFilter>(std::move(outer_expr));
+	LogicalFilter::SplitPredicates(new_cte->Cast<LogicalFilter>().expressions);
+
+	// Rewrite the operator expressions before adding the child op (children should be rewritten already)
+	optimizer.rewriter.VisitOperator(*new_cte);
+	new_cte->children.push_back(std::move(info.materialized_cte.children[0]));
+
+	// Push down the filter
+	FilterPushdown pushdown(optimizer, true, FilterPushdown::ProjectionMode::PRESERVE_COMPUTED_EXPRESSIONS);
+	new_cte = pushdown.Rewrite(std::move(new_cte));
+
+	info.materialized_cte.children[0] = std::move(new_cte);
+}
+
+unique_ptr<Expression> CTEFilterPusher::BuildFilterExpression(LogicalOperator &definition,
+                                                              const vector<reference<LogicalOperator>> &filters) {
+	D_ASSERT(!filters.empty());
 	unique_ptr<Expression> outer_expr;
-	for (auto &filter : info.filters) {
+	for (auto &filter : filters) {
 		D_ASSERT(filter.get().type == LogicalOperatorType::LOGICAL_FILTER);
 
 		auto old_bindings = filter.get().children[0]->GetColumnBindings();
-		auto new_bindings = info.materialized_cte.children[0]->GetColumnBindings();
+		auto new_bindings = definition.GetColumnBindings();
 		D_ASSERT(old_bindings.size() == new_bindings.size());
 
 		ColumnBindingReplacer replacer;
@@ -108,20 +127,7 @@ void CTEFilterPusher::PushFilterIntoCTE(MaterializedCTEInfo &info) {
 			outer_expr = std::move(inner_expr);
 		}
 	}
-
-	// Add the filter on top of the CTE definition and split the predicates
-	auto new_cte = make_uniq_base<LogicalOperator, LogicalFilter>(std::move(outer_expr));
-	LogicalFilter::SplitPredicates(new_cte->Cast<LogicalFilter>().expressions);
-
-	// Rewrite the operator expressions before adding the child op (children should be rewritten already)
-	optimizer.rewriter.VisitOperator(*new_cte);
-	new_cte->children.push_back(std::move(info.materialized_cte.children[0]));
-
-	// Push down the filter
-	FilterPushdown pushdown(optimizer, true, FilterPushdown::ProjectionMode::PRESERVE_COMPUTED_EXPRESSIONS);
-	new_cte = pushdown.Rewrite(std::move(new_cte));
-
-	info.materialized_cte.children[0] = std::move(new_cte);
+	return outer_expr;
 }
 
 } // namespace duckdb

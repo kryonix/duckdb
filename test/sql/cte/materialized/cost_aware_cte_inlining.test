@@ -1,0 +1,113 @@
+# name: test/sql/cte/materialized/cost_aware_cte_inlining.test
+# description: Cost-aware per-reader CTE inlining
+# group: [materialized]
+
+statement ok
+PRAGMA explain_output='optimized_only'
+
+statement ok
+CREATE TABLE cte_cost_a AS SELECT i, i % 100 AS g FROM range(100000) t(i)
+
+statement ok
+CREATE TABLE cte_cost_b AS SELECT i FROM range(100000) t(i)
+
+statement ok
+CREATE TABLE cte_cost_c AS SELECT i FROM range(100000) t(i)
+
+statement ok
+ANALYZE
+
+# The selective join reader would be materialized by the exchange, so it is inlined while both direct readers share
+# the producer.
+query II
+EXPLAIN WITH cte AS (
+	SELECT * FROM cte_cost_a JOIN cte_cost_b USING (i) JOIN cte_cost_c USING (i)
+)
+SELECT (SELECT sum(g) FROM cte),
+       (SELECT count(*) FROM cte),
+       (SELECT count(*) FROM cte JOIN (VALUES (42)) v(i) USING (i) WHERE cte.i = 42)
+----
+logical_opt	<REGEX>:(?s)(?:.*CTE Scan){2}.*
+
+query II
+EXPLAIN WITH cte AS (
+	SELECT * FROM cte_cost_a JOIN cte_cost_b USING (i) JOIN cte_cost_c USING (i)
+)
+SELECT (SELECT sum(g) FROM cte),
+       (SELECT count(*) FROM cte),
+       (SELECT count(*) FROM cte JOIN (VALUES (42)) v(i) USING (i) WHERE cte.i = 42)
+----
+logical_opt	<!REGEX>:(?s)(?:.*CTE Scan){3}.*
+
+# More than four direct exchange readers use bounded greedy search and remain shared.
+query II
+EXPLAIN WITH cte AS (
+	SELECT * FROM cte_cost_a JOIN cte_cost_b USING (i) JOIN cte_cost_c USING (i)
+)
+SELECT count(*) FROM cte WHERE i = 42
+UNION ALL
+SELECT count(*) FROM cte WHERE i = 43
+UNION ALL
+SELECT count(*) FROM cte
+UNION ALL
+SELECT sum(g) FROM cte
+UNION ALL
+SELECT max(g) FROM cte
+UNION ALL
+SELECT min(g) FROM cte
+----
+logical_opt	<REGEX>:(?s)(?:.*CTE Scan){6}.*
+
+query III
+WITH cte AS (
+	SELECT * FROM cte_cost_a JOIN cte_cost_b USING (i) JOIN cte_cost_c USING (i)
+)
+SELECT (SELECT sum(g) FROM cte),
+       (SELECT count(*) FROM cte),
+       (SELECT count(*) FROM cte JOIN (VALUES (42)) v(i) USING (i) WHERE cte.i = 42)
+----
+4950000	100000	1
+
+# Explicit materialization remains an all-reader instruction.
+query II
+EXPLAIN WITH cte AS MATERIALIZED (
+	SELECT * FROM cte_cost_a JOIN cte_cost_b USING (i) JOIN cte_cost_c USING (i)
+)
+SELECT (SELECT sum(g) FROM cte),
+       (SELECT count(*) FROM cte),
+       (SELECT count(*) FROM cte JOIN (VALUES (42)) v(i) USING (i) WHERE cte.i = 42)
+----
+logical_opt	<REGEX>:(?s)(?:.*CTE Scan){3}.*
+
+# Keep the logical exchange classifier aligned with physical pipeline selection.
+query II
+EXPLAIN ANALYZE WITH cte AS MATERIALIZED (
+	SELECT * FROM cte_cost_a JOIN cte_cost_b USING (i) JOIN cte_cost_c USING (i)
+)
+SELECT (SELECT sum(g) FROM cte),
+       (SELECT count(*) FROM cte),
+       (SELECT count(*) FROM cte JOIN (VALUES (42)) v(i) USING (i) WHERE cte.i = 42)
+----
+analyzed_plan	<REGEX>:(?s).*Execution Mode: HYBRID_FANOUT.*Direct Consumers: 2.*Materialized Consumers: 1.*
+
+# Explicit non-materialization remains an all-reader instruction.
+query II
+EXPLAIN WITH cte AS NOT MATERIALIZED (
+	SELECT * FROM cte_cost_a JOIN cte_cost_b USING (i) JOIN cte_cost_c USING (i)
+)
+SELECT (SELECT sum(g) FROM cte),
+       (SELECT count(*) FROM cte),
+       (SELECT count(*) FROM cte JOIN (VALUES (42)) v(i) USING (i) WHERE cte.i = 42)
+----
+logical_opt	<!REGEX>:.*CTE Scan.*
+
+# A volatile producer must execute once and remain materialized.
+query II
+EXPLAIN WITH cte AS (
+	SELECT i, random() AS r FROM range(10) t(i)
+)
+SELECT sum(r) FROM cte
+UNION ALL
+SELECT sum(r) FROM cte
+----
+logical_opt	<REGEX>:(?s)(?:.*CTE Scan){2}.*

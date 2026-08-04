@@ -218,7 +218,7 @@ void Optimizer::RunBuiltInOptimizers() {
 	// try to inline CTEs instead of materialization
 	RunOptimizer(OptimizerType::CTE_INLINING, [&]() {
 		CTEInlining cte_inlining(*this);
-		plan = cte_inlining.Optimize(std::move(plan));
+		plan = cte_inlining.OptimizeStructural(std::move(plan));
 	});
 
 	// Rewrites AVG(x) -> SUM(x)/COUNT(x) and SUM(x+C) -> SUM(x) + C*COUNT(x)
@@ -239,12 +239,6 @@ void Optimizer::RunBuiltInOptimizers() {
 		unordered_set<TableIndex> top_bindings;
 		filter_pushdown.CheckMarkToSemi(*plan, top_bindings);
 		plan = filter_pushdown.Rewrite(std::move(plan));
-	});
-
-	// derive and push filters into materialized CTEs
-	RunOptimizer(OptimizerType::CTE_FILTER_PUSHER, [&]() {
-		CTEFilterPusher cte_filter_pusher(*this);
-		plan = cte_filter_pusher.Optimize(std::move(plan));
 	});
 
 	RunOptimizer(OptimizerType::REGEX_RANGE, [&]() {
@@ -278,7 +272,7 @@ void Optimizer::RunBuiltInOptimizers() {
 	// try to inline CTEs instead of materialization
 	RunOptimizer(OptimizerType::CTE_INLINING, [&]() {
 		CTEInlining cte_inlining(*this);
-		plan = cte_inlining.Optimize(std::move(plan));
+		plan = cte_inlining.OptimizeStructural(std::move(plan));
 	});
 
 	// Pulls up empty results
@@ -291,6 +285,28 @@ void Optimizer::RunBuiltInOptimizers() {
 	RunOptimizer(OptimizerType::WINDOW_SELF_JOIN, [&]() {
 		WindowSelfJoinOptimizer window_self_join_optimizer(*this);
 		plan = window_self_join_optimizer.Optimize(std::move(plan));
+	});
+
+	// choose the execution strategy for default multi-reader CTEs after all early CTE-producing rewrites
+	bool cost_aware_cte_changed = false;
+	RunOptimizer(OptimizerType::CTE_INLINING, [&]() {
+		CTEInlining cte_inlining(*this);
+		plan = cte_inlining.OptimizeCostAware(std::move(plan));
+		cost_aware_cte_changed = cte_inlining.HasChanges();
+	});
+	if (cost_aware_cte_changed) {
+		RunOptimizer(OptimizerType::FILTER_PUSHDOWN, [&]() {
+			FilterPushdown filter_pushdown(*this);
+			unordered_set<TableIndex> top_bindings;
+			filter_pushdown.CheckMarkToSemi(*plan, top_bindings);
+			plan = filter_pushdown.Rewrite(std::move(plan));
+		});
+	}
+
+	// derive and push filters into the CTE readers that remain materialized
+	RunOptimizer(OptimizerType::CTE_FILTER_PUSHER, [&]() {
+		CTEFilterPusher cte_filter_pusher(*this);
+		plan = cte_filter_pusher.Optimize(std::move(plan));
 	});
 
 	// Pull up projection from joins
