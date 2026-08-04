@@ -42,6 +42,7 @@ struct HashGroupJoinCandidate {
 
 struct StaticHashGroupJoinCandidate {
 	LogicalAggregate *aggregate;
+	idx_t owner_child;
 	vector<idx_t> owner_key_indices;
 	vector<idx_t> owner_payload_indices;
 	vector<HashGroupJoinOutputColumn> output_columns;
@@ -85,6 +86,7 @@ struct HashGroupJoinOrderContext {
 	bool perfect_supported = false;
 	idx_t perfect_range = 0;
 	bool mixed_distinct_memoizing = false;
+	bool domain_semi_memoizing = false;
 	double factorized_cost = 0;
 	GroupJoinStrategy strategy = GroupJoinStrategy::AUTO;
 	bool factorized = false;
@@ -110,6 +112,8 @@ HashGroupJoinCostEstimate EstimateHashGroupJoinAlternatives(idx_t owner_rows, id
 
 //! Accounts for the materialized aggregate branches and rejoin used by mixed DISTINCT/non-DISTINCT aggregation.
 void ApplyMixedDistinctMemoizingCost(HashGroupJoinCostEstimate &cost);
+//! Accounts for a compact SEMI-join domain that filters a large aggregate probe.
+void ApplyDomainSemiMemoizingCost(HashGroupJoinCostEstimate &cost);
 
 optional<HashGroupJoinOrderContext> GetHashGroupJoinOrderContext(LogicalAggregate &aggregate, ClientContext &context);
 optional<HashGroupJoinOrderContext> GetFactorizedGroupJoinOrderContext(LogicalAggregate &aggregate,
@@ -131,6 +135,8 @@ bool HasPotentialFactorizedGroupJoinCandidate(LogicalAggregate &aggregate, Clien
 
 //! Returns true when AUTO should retain a mixed DISTINCT aggregate for memoizing GroupJoin planning.
 bool HasAutoMixedDistinctHashGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context);
+bool HasPotentialAutoDomainSemiHashGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context);
+bool HasAutoDomainSemiHashGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context);
 
 //! Returns true when a mixed DISTINCT aggregate needs costing before the DISTINCT branch rewrite.
 bool HasPotentialAutoMixedDistinctHashGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context);

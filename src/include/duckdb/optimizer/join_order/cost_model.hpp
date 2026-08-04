@@ -30,6 +30,7 @@ struct GroupJoinOrderCostContext {
 	bool perfect_supported;
 	idx_t perfect_range;
 	bool mixed_distinct_memoizing;
+	bool domain_semi_memoizing;
 	double factorized_cost;
 	GroupJoinStrategy strategy;
 	bool factorized;

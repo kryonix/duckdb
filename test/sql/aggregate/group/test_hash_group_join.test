@@ -1213,7 +1213,7 @@ RESET debug_group_join_execution
 
 # Static result caching spans vector boundaries and reuses one finalized state for duplicate owner keys.
 statement ok
-CREATE TABLE gj_static_many_owner AS SELECT i % 3000 AS k FROM range(6000) t(i)
+CREATE TABLE gj_static_many_owner AS SELECT i % 3000 AS k, i AS label FROM range(6000) t(i)
 
 statement ok
 CREATE TABLE gj_static_many_probe AS SELECT i AS k, i::BIGINT AS value FROM range(3000) t(i)
@@ -1237,6 +1237,15 @@ FROM (
 )
 ----
 8997000
+
+query II
+SELECT sum(label)::BIGINT, sum(value_sum)::BIGINT
+FROM (
+	SELECT label, (SELECT sum(value) FROM gj_static_many_probe p WHERE p.k = o.k) AS value_sum
+	FROM gj_static_many_owner o
+)
+----
+17997000	8997000
 
 endloop
 
@@ -1854,6 +1863,59 @@ SELECT count(*), sum(n), sum(s) FROM (
 )
 ----
 20000	2000000	1999999000000
+
+# A compact SEMI-join domain should be fused into a large aggregate probe. Duplicate and NULL domain keys retain
+# ordinary SEMI semantics, and the same boundary supports a fixed-width DISTINCT count.
+statement ok
+CREATE TABLE gj_auto_domain_semi AS
+SELECT i::BIGINT AS a FROM range(1000) t(i) UNION ALL SELECT 0 UNION ALL SELECT NULL
+
+statement ok
+ANALYZE gj_auto_domain_semi
+
+query II
+EXPLAIN SELECT p.a, count(*)
+FROM gj_auto_physical_eager_probe p SEMI JOIN gj_auto_domain_semi d USING (a)
+GROUP BY p.a
+----
+physical_plan	<REGEX>:(?s).*Hash Group Join.*Join Type: SEMI.*MEMOIZING_HASH.*
+
+query II
+EXPLAIN SELECT p.a, count(DISTINCT p.value)
+FROM gj_auto_physical_eager_probe p SEMI JOIN gj_auto_domain_semi d USING (a)
+GROUP BY p.a
+----
+physical_plan	<REGEX>:(?s).*Hash Group Join.*Join Type: SEMI.*count\(DISTINCT.*
+
+statement ok
+SET debug_verify_serializer = true
+
+query III
+SELECT count(*), sum(n), sum(s) FROM (
+	SELECT p.a, count(*) n, sum(p.value) s
+	FROM gj_auto_physical_eager_probe p SEMI JOIN gj_auto_domain_semi d USING (a)
+	GROUP BY p.a
+)
+----
+1000	100000	4999950000
+
+statement ok
+SET debug_verify_serializer = false
+
+# The setup floor and compact-domain bound protect smaller probes and broader domains.
+query II
+EXPLAIN SELECT p.a, count(*)
+FROM gj_auto_memo_probe p SEMI JOIN range(1000) d(a) USING (a)
+GROUP BY p.a
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
+
+query II
+EXPLAIN SELECT p.a, count(*)
+FROM gj_auto_physical_eager_probe p SEMI JOIN range(9000) d(a) USING (a)
+GROUP BY p.a
+----
+physical_plan	<!REGEX>:.*Hash Group Join.*
 
 statement ok
 SET threads = 1

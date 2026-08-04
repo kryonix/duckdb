@@ -270,8 +270,10 @@ bool DistinctAggregateRewriter::TryRewrite(unique_ptr<LogicalOperator> &op) {
 	if (HasPotentialFactorizedGroupJoinCandidate(aggr, optimizer.context)) {
 		return false;
 	}
-	if ((!deferred && HasPotentialAutoMixedDistinctHashGroupJoinCandidate(aggr, optimizer.context)) ||
-	    (deferred && HasAutoMixedDistinctHashGroupJoinCandidate(aggr, optimizer.context))) {
+	if ((!deferred && (HasPotentialAutoMixedDistinctHashGroupJoinCandidate(aggr, optimizer.context) ||
+	                   HasPotentialAutoDomainSemiHashGroupJoinCandidate(aggr, optimizer.context))) ||
+	    (deferred && (HasAutoMixedDistinctHashGroupJoinCandidate(aggr, optimizer.context) ||
+	                  HasAutoDomainSemiHashGroupJoinCandidate(aggr, optimizer.context)))) {
 		return false;
 	}
 	auto coarse_factorized = GetFactorizedCoarseGroupInfo(aggr, optimizer.context);

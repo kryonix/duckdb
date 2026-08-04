@@ -371,6 +371,20 @@ static bool AutoMixedDistinctMemoizingSupported(const LogicalAggregate &aggregat
 	return distinct_count == 1 && non_distinct_count > 0;
 }
 
+static bool IsFixedSizeHashGroupJoinKey(const LogicalType &type);
+
+static bool AutoDomainSemiAggregatesSupported(const LogicalAggregate &aggregate, idx_t &state_size) {
+	if (AutoHashGroupJoinAggregatesSupported(aggregate, state_size)) {
+		return true;
+	}
+	if (aggregate.expressions.size() != 1) {
+		return false;
+	}
+	auto &aggr = aggregate.expressions[0]->Cast<BoundAggregateExpression>();
+	return aggr.IsDistinct() && aggr.Function().GetName() == "count" && !aggr.GetFilter() && !aggr.GetOrderBys() &&
+	       aggr.GetChildren().size() == 1 && IsFixedSizeHashGroupJoinKey(aggr.GetChildren()[0]->GetReturnType());
+}
+
 struct AutoHashGroupJoinCostModel {
 	static constexpr idx_t MIN_OWNER_ROWS = 100000;
 	static constexpr idx_t MIN_KEY_WIDTH = 16;
@@ -401,6 +415,10 @@ struct AutoHashGroupJoinCostModel {
 	static constexpr double MAX_PERFECT_FANOUT = 10;
 	static constexpr double MIN_PERFECT_DENSITY = 0.7;
 	static constexpr double PERFECT_COST_RATIO = 0.75;
+	static constexpr idx_t MIN_DOMAIN_SEMI_PROBE_ROWS = 2000000;
+	static constexpr idx_t MAX_DOMAIN_SEMI_OWNER_ROWS = 8192;
+	static constexpr double MAX_DOMAIN_SEMI_RETENTION = 0.25;
+	static constexpr double MIN_DOMAIN_SEMI_MATCH_DENSITY = 0.7;
 	// Two aggregate branches, shared-input materialization, and a grouped-result join.
 	static constexpr double MIXED_DISTINCT_SEPARATE_FACTOR = 3.5;
 };
@@ -650,6 +668,21 @@ void ApplyMixedDistinctMemoizingCost(HashGroupJoinCostEstimate &cost) {
 	cost.hash_selected = cost.memoizing_cost <= cost.separate_cost * AutoHashGroupJoinCostModel::MAX_COST_RATIO;
 }
 
+void ApplyDomainSemiMemoizingCost(HashGroupJoinCostEstimate &cost) {
+	if (cost.execution_mode == GroupJoinExecutionMode::EXTERNAL || cost.owner_rows == 0 || cost.probe_rows == 0) {
+		return;
+	}
+	const auto retention = static_cast<double>(cost.match_rows) / static_cast<double>(cost.probe_rows);
+	const auto match_density = static_cast<double>(cost.matched_groups) / static_cast<double>(cost.owner_rows);
+	if (cost.owner_rows <= AutoHashGroupJoinCostModel::MAX_DOMAIN_SEMI_OWNER_ROWS &&
+	    cost.probe_rows >= AutoHashGroupJoinCostModel::MIN_DOMAIN_SEMI_PROBE_ROWS &&
+	    retention <= AutoHashGroupJoinCostModel::MAX_DOMAIN_SEMI_RETENTION &&
+	    match_density >= AutoHashGroupJoinCostModel::MIN_DOMAIN_SEMI_MATCH_DENSITY &&
+	    cost.memoizing_cost <= cost.separate_cost * AutoHashGroupJoinCostModel::MAX_COST_RATIO) {
+		cost.hash_selected = true;
+	}
+}
+
 static bool TryGetPerfectGroupJoinBounds(LogicalAggregate &aggregate, LogicalComparisonJoin &join,
                                          const HashGroupJoinCandidate &candidate, ClientContext &context,
                                          Value &minimum, Value &maximum, idx_t &range);
@@ -671,11 +704,17 @@ HashGroupJoinCostEstimate EstimateHashGroupJoinCost(LogicalAggregate &aggregate,
 	idx_t state_width;
 	const auto auto_aggregates_supported = AutoHashGroupJoinAggregatesSupported(aggregate, state_width);
 	idx_t mixed_distinct_state_width;
-	const auto mixed_distinct_memoizing =
-	    AutoMixedDistinctMemoizingSupported(aggregate, mixed_distinct_state_width) &&
-	    join.join_type == JoinType::INNER && candidate.unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD;
+	const auto mixed_distinct_memoizing = AutoMixedDistinctMemoizingSupported(aggregate, mixed_distinct_state_width) &&
+	                                      join.join_type == JoinType::INNER &&
+	                                      candidate.unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD;
+	idx_t domain_semi_state_width;
+	const auto domain_semi_memoizing = join.join_type == JoinType::SEMI && candidate.single_match && candidate.routed &&
+	                                   candidate.unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD &&
+	                                   AutoDomainSemiAggregatesSupported(aggregate, domain_semi_state_width);
 	if (!auto_aggregates_supported && mixed_distinct_memoizing) {
 		state_width = mixed_distinct_state_width;
+	} else if (!auto_aggregates_supported && domain_semi_memoizing) {
+		state_width = domain_semi_state_width;
 	}
 	const auto physical_eager_supported = PhysicalEagerGroupJoinSupported(aggregate, candidate);
 	Value perfect_min;
@@ -696,13 +735,16 @@ HashGroupJoinCostEstimate EstimateHashGroupJoinCost(LogicalAggregate &aggregate,
 	        : MinValue(join.children[candidate.owner_child]->estimated_cardinality, join.estimated_cardinality),
 	    key_width, state_width, candidate.routed, direct_inner, fixed_size_keys, physical_eager_supported,
 	    perfect_supported, perfect_range, context);
-	if (!auto_aggregates_supported) {
+	if (!auto_aggregates_supported && !domain_semi_memoizing) {
 		result.hash_selected = false;
 		result.physical_eager_selected = false;
 		result.perfect_selected = false;
 	}
 	if (mixed_distinct_memoizing) {
 		ApplyMixedDistinctMemoizingCost(result);
+	}
+	if (domain_semi_memoizing) {
+		ApplyDomainSemiMemoizingCost(result);
 	}
 	result.index_available = index_compatible && HasAutoHashGroupJoinART(join, candidate, context);
 	if (auto_aggregates_supported && index_compatible && result.probe_rows != 0 &&
@@ -725,13 +767,12 @@ HashGroupJoinCostEstimate EstimateHashGroupJoinCost(LogicalAggregate &aggregate,
 
 bool HasPotentialAutoMixedDistinctHashGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context) {
 	if (Settings::Get<DebugGroupJoinStrategySetting>(context) != GroupJoinStrategy::AUTO ||
-	    aggregate.children.size() != 1 ||
-	    aggregate.children[0]->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+	    aggregate.children.size() != 1 || aggregate.children[0]->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		return false;
 	}
 	auto &join = aggregate.children[0]->Cast<LogicalComparisonJoin>();
-	auto candidate = TryGetHashGroupJoinCandidate(aggregate, join, context,
-	                                              HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER);
+	auto candidate =
+	    TryGetHashGroupJoinCandidate(aggregate, join, context, HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER);
 	if (!candidate) {
 		return false;
 	}
@@ -748,8 +789,36 @@ bool HasAutoMixedDistinctHashGroupJoinCandidate(LogicalAggregate &aggregate, Cli
 		return false;
 	}
 	auto &join = aggregate.children[0]->Cast<LogicalComparisonJoin>();
-	auto candidate = TryGetHashGroupJoinCandidate(aggregate, join, context,
-	                                              HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER);
+	auto candidate =
+	    TryGetHashGroupJoinCandidate(aggregate, join, context, HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER);
+	D_ASSERT(candidate);
+	return EstimateHashGroupJoinCost(aggregate, join, *candidate, context).hash_selected;
+}
+
+bool HasPotentialAutoDomainSemiHashGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context) {
+	if (Settings::Get<DebugGroupJoinStrategySetting>(context) != GroupJoinStrategy::AUTO ||
+	    aggregate.children.size() != 1 || aggregate.children[0]->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		return false;
+	}
+	auto &join = aggregate.children[0]->Cast<LogicalComparisonJoin>();
+	auto candidate =
+	    TryGetHashGroupJoinCandidate(aggregate, join, context, HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER);
+	if (!candidate) {
+		return false;
+	}
+	idx_t state_width;
+	return join.join_type == JoinType::SEMI && candidate->single_match && candidate->routed &&
+	       candidate->unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD &&
+	       AutoDomainSemiAggregatesSupported(aggregate, state_width);
+}
+
+bool HasAutoDomainSemiHashGroupJoinCandidate(LogicalAggregate &aggregate, ClientContext &context) {
+	if (!HasPotentialAutoDomainSemiHashGroupJoinCandidate(aggregate, context)) {
+		return false;
+	}
+	auto &join = aggregate.children[0]->Cast<LogicalComparisonJoin>();
+	auto candidate =
+	    TryGetHashGroupJoinCandidate(aggregate, join, context, HashGroupJoinCandidateMode::ALLOW_AGGREGATE_ORDER);
 	D_ASSERT(candidate);
 	return EstimateHashGroupJoinCost(aggregate, join, *candidate, context).hash_selected;
 }
@@ -771,11 +840,14 @@ optional<HashGroupJoinOrderContext> GetHashGroupJoinOrderContext(LogicalAggregat
 		return nullopt;
 	}
 	const auto auto_aggregates_supported = AutoHashGroupJoinAggregatesSupported(aggregate, result.state_width);
-	result.mixed_distinct_memoizing =
-	    AutoMixedDistinctMemoizingSupported(aggregate, result.state_width) && join.join_type == JoinType::INNER &&
-	    candidate->unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD;
-	if (result.strategy == GroupJoinStrategy::AUTO && !auto_aggregates_supported &&
-	    !result.mixed_distinct_memoizing) {
+	result.mixed_distinct_memoizing = AutoMixedDistinctMemoizingSupported(aggregate, result.state_width) &&
+	                                  join.join_type == JoinType::INNER &&
+	                                  candidate->unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD;
+	result.domain_semi_memoizing = join.join_type == JoinType::SEMI && candidate->single_match && candidate->routed &&
+	                               candidate->unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD &&
+	                               AutoDomainSemiAggregatesSupported(aggregate, result.state_width);
+	if (result.strategy == GroupJoinStrategy::AUTO && !auto_aggregates_supported && !result.mixed_distinct_memoizing &&
+	    !result.domain_semi_memoizing) {
 		return nullopt;
 	}
 	for (auto &condition : join.conditions) {
@@ -2410,12 +2482,16 @@ optional<StaticHashGroupJoinCandidate> TryGetStaticHashGroupJoinCandidate(Logica
 	    strategy == GroupJoinStrategy::EAGER || strategy == GroupJoinStrategy::FACTORIZED) {
 		return nullopt;
 	}
-	if (join.join_type != JoinType::LEFT || join.children.size() != 2 || join.conditions.empty() ||
-	    join.HasArbitraryConditions() ||
-	    join.children[1]->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+	if ((join.join_type != JoinType::LEFT && join.join_type != JoinType::RIGHT) || join.children.size() != 2 ||
+	    join.conditions.empty() || join.HasArbitraryConditions()) {
 		return nullopt;
 	}
-	auto &aggregate = join.children[1]->Cast<LogicalAggregate>();
+	const auto owner_child = join.join_type == JoinType::LEFT ? idx_t(0) : idx_t(1);
+	const auto aggregate_child = 1 - owner_child;
+	if (join.children[aggregate_child]->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		return nullopt;
+	}
+	auto &aggregate = join.children[aggregate_child]->Cast<LogicalAggregate>();
 	if (aggregate.children.size() != 1 || aggregate.groups.empty() || !aggregate.grouping_functions.empty() ||
 	    aggregate.grouping_sets.size() > 1 || join.conditions.size() != aggregate.groups.size() ||
 	    !AggregateFunctionsSupported(aggregate, mode)) {
@@ -2444,8 +2520,10 @@ optional<StaticHashGroupJoinCandidate> TryGetStaticHashGroupJoinCandidate(Logica
 		    condition.GetLHS().GetReturnType() != condition.GetRHS().GetReturnType()) {
 			return nullopt;
 		}
-		auto owner_key = GetDirectReferenceIndex(condition.GetLHS(), *join.children[0]);
-		auto aggregate_output = GetDirectReferenceIndex(condition.GetRHS(), aggregate);
+		auto &owner_expression = owner_child == 0 ? condition.GetLHS() : condition.GetRHS();
+		auto &aggregate_expression = owner_child == 0 ? condition.GetRHS() : condition.GetLHS();
+		auto owner_key = GetDirectReferenceIndex(owner_expression, *join.children[owner_child]);
+		auto aggregate_output = GetDirectReferenceIndex(aggregate_expression, aggregate);
 		if (!owner_key.IsValid() || !aggregate_output.IsValid() ||
 		    aggregate_output.GetIndex() >= aggregate.groups.size() ||
 		    owner_key_indices[aggregate_output.GetIndex()] != DConstants::INVALID_INDEX) {
@@ -2458,38 +2536,53 @@ optional<StaticHashGroupJoinCandidate> TryGetStaticHashGroupJoinCandidate(Logica
 			return nullopt;
 		}
 	}
-	StaticHashGroupJoinCandidate result {&aggregate, owner_key_indices, {}, {}};
-	auto left_outputs = GetProjectedColumns(*join.children[0], join.left_projection_map);
-	for (auto output_index : left_outputs) {
-		auto key_entry = std::find(owner_key_indices.begin(), owner_key_indices.end(), output_index);
-		if (key_entry != owner_key_indices.end()) {
-			result.output_columns.push_back(
-			    {HashGroupJoinOutputSource::KEY, NumericCast<idx_t>(key_entry - owner_key_indices.begin())});
-			continue;
-		}
-		auto payload_entry =
-		    std::find(result.owner_payload_indices.begin(), result.owner_payload_indices.end(), output_index);
-		idx_t payload_index;
-		if (payload_entry == result.owner_payload_indices.end()) {
-			payload_index = result.owner_payload_indices.size();
-			result.owner_payload_indices.push_back(output_index);
-		} else {
-			payload_index = NumericCast<idx_t>(payload_entry - result.owner_payload_indices.begin());
-		}
-		result.output_columns.push_back({HashGroupJoinOutputSource::OWNER_PAYLOAD, payload_index});
-	}
-
-	auto right_outputs = GetProjectedColumns(aggregate, join.right_projection_map);
-	for (auto output_index : right_outputs) {
-		if (output_index < aggregate.groups.size()) {
-			result.output_columns.push_back({HashGroupJoinOutputSource::MATCHED_KEY, output_index});
-		} else {
-			auto aggregate_index = output_index - aggregate.groups.size();
-			if (aggregate_index >= aggregate.expressions.size()) {
-				return nullopt;
+	StaticHashGroupJoinCandidate result {&aggregate, owner_child, owner_key_indices, {}, {}};
+	auto AppendOwnerOutputs = [&](const vector<ProjectionIndex> &projection_map) {
+		auto owner_outputs = GetProjectedColumns(*join.children[owner_child], projection_map);
+		for (auto output_index : owner_outputs) {
+			auto key_entry = std::find(owner_key_indices.begin(), owner_key_indices.end(), output_index);
+			if (key_entry != owner_key_indices.end()) {
+				result.output_columns.push_back(
+				    {HashGroupJoinOutputSource::KEY, NumericCast<idx_t>(key_entry - owner_key_indices.begin())});
+				continue;
 			}
-			result.output_columns.push_back({HashGroupJoinOutputSource::AGGREGATE, aggregate_index});
+			auto payload_entry =
+			    std::find(result.owner_payload_indices.begin(), result.owner_payload_indices.end(), output_index);
+			idx_t payload_index;
+			if (payload_entry == result.owner_payload_indices.end()) {
+				payload_index = result.owner_payload_indices.size();
+				result.owner_payload_indices.push_back(output_index);
+			} else {
+				payload_index = NumericCast<idx_t>(payload_entry - result.owner_payload_indices.begin());
+			}
+			result.output_columns.push_back({HashGroupJoinOutputSource::OWNER_PAYLOAD, payload_index});
 		}
+	};
+	auto AppendAggregateOutputs = [&](const vector<ProjectionIndex> &projection_map) -> bool {
+		auto aggregate_outputs = GetProjectedColumns(aggregate, projection_map);
+		for (auto output_index : aggregate_outputs) {
+			if (output_index < aggregate.groups.size()) {
+				result.output_columns.push_back({HashGroupJoinOutputSource::MATCHED_KEY, output_index});
+			} else {
+				auto aggregate_index = output_index - aggregate.groups.size();
+				if (aggregate_index >= aggregate.expressions.size()) {
+					return false;
+				}
+				result.output_columns.push_back({HashGroupJoinOutputSource::AGGREGATE, aggregate_index});
+			}
+		}
+		return true;
+	};
+	if (owner_child == 0) {
+		AppendOwnerOutputs(join.left_projection_map);
+		if (!AppendAggregateOutputs(join.right_projection_map)) {
+			return nullopt;
+		}
+	} else {
+		if (!AppendAggregateOutputs(join.left_projection_map)) {
+			return nullopt;
+		}
+		AppendOwnerOutputs(join.right_projection_map);
 	}
 	if (result.output_columns.size() != join.GetColumnBindings().size()) {
 		return nullopt;
@@ -2502,9 +2595,11 @@ bool IsStaticHashGroupJoinAggregate(LogicalOperator &root, LogicalAggregate &agg
 	if (root.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
 	    root.type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
 		auto &join = root.Cast<LogicalComparisonJoin>();
-		if (join.children.size() == 2 && join.children[1].get() == &aggregate &&
-		    TryGetStaticHashGroupJoinCandidate(join, context, mode)) {
-			return true;
+		if (join.children.size() == 2) {
+			auto candidate = TryGetStaticHashGroupJoinCandidate(join, context, mode);
+			if (candidate && candidate->aggregate == &aggregate) {
+				return true;
+			}
 		}
 	}
 	for (auto &child : root.children) {

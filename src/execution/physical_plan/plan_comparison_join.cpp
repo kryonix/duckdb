@@ -122,9 +122,9 @@ PhysicalOperator &PhysicalPlanGenerator::PlanComparisonJoin(LogicalComparisonJoi
 				}
 			}
 
-			reference<PhysicalOperator> owner = CreatePlan(*op.children[0]);
+			reference<PhysicalOperator> owner = CreatePlan(*op.children[candidate->owner_child]);
 			reference<PhysicalOperator> probe = CreatePlan(*aggregate_op.children[0]);
-			owner.get().estimated_cardinality = op.children[0]->EstimateCardinality(context);
+			owner.get().estimated_cardinality = op.children[candidate->owner_child]->EstimateCardinality(context);
 			probe.get().estimated_cardinality = aggregate_op.children[0]->EstimateCardinality(context);
 
 			vector<unique_ptr<Expression>> owner_expressions;

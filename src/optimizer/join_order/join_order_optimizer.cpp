@@ -69,6 +69,7 @@ unique_ptr<LogicalOperator> JoinOrderOptimizer::Optimize(unique_ptr<LogicalOpera
 			                                  group_join_context->perfect_supported,
 			                                  group_join_context->perfect_range,
 			                                  group_join_context->mixed_distinct_memoizing,
+			                                  group_join_context->domain_semi_memoizing,
 			                                  group_join_context->factorized_cost,
 			                                  group_join_context->strategy,
 			                                  group_join_context->factorized};
