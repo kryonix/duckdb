@@ -171,6 +171,55 @@ def run_cli(variant, database, query, threads, timer=False):
     }
 
 
+def run_prepared_cli(variant, database, query, threads, warmups, samples):
+    command = [
+        str(variant["path"]),
+        str(database),
+        "-readonly",
+        "-bail",
+        "-batch",
+        "-csv",
+        "-noheader",
+        "-nullvalue",
+        "NULL",
+    ]
+    setup = [f"SET threads={threads}"] + variant["setup"]
+    for statement in setup:
+        command.extend(["-cmd", statement])
+
+    statement = query.rstrip().rstrip(";")
+    executions = warmups + samples
+    script = [
+        f".output {os.devnull}",
+        f"PREPARE groupjoin_evidence AS {statement};",
+        ".timer on",
+    ]
+    script.extend("EXECUTE groupjoin_evidence;" for _ in range(executions))
+    started = time.perf_counter()
+    process = subprocess.run(
+        command, input="\n".join(script) + "\n", capture_output=True, text=True
+    )
+    elapsed = time.perf_counter() - started
+    if process.returncode != 0:
+        raise RuntimeError(
+            f"prepared DuckDB batch failed with status {process.returncode}\n"
+            f"command: {command}\nstdout:\n{process.stdout}\nstderr:\n{process.stderr}"
+        )
+    timings = [
+        float(value) for value in TIMER_PATTERN.findall(process.stdout + process.stderr)
+    ]
+    if len(timings) != executions:
+        raise RuntimeError(
+            f"expected {executions} timer results, found {timings}\n"
+            f"command: {command}\nstdout:\n{process.stdout}\nstderr:\n{process.stderr}"
+        )
+    return {
+        "command": command,
+        "timings": timings,
+        "process_seconds": elapsed,
+    }
+
+
 def operator_flags(plan):
     upper = plan.upper().replace(" ", "_")
     return {
@@ -347,6 +396,23 @@ def summarize_measurements(records, seed):
     return {"cells": summaries, "comparisons": comparisons}
 
 
+def write_measurement_summary(output, records, seed):
+    summary = summarize_measurements(records, seed)
+    write_json(output / "summary.json", summary)
+    with (output / "summary.csv").open("w", newline="") as summary_file:
+        writer = csv.writer(summary_file)
+        fields = (
+            "samples",
+            "median_seconds",
+            "mad_seconds",
+            "minimum_seconds",
+            "maximum_seconds",
+        )
+        writer.writerow(["cell", *fields])
+        for cell, values in sorted(summary["cells"].items()):
+            writer.writerow([cell] + [values[key] for key in fields])
+
+
 def verify_equivalent_results(args, queries, variants):
     groups = {}
     records = []
@@ -357,6 +423,7 @@ def verify_equivalent_results(args, queries, variants):
             expected = groups.setdefault(group, result["result_sha256"])
             record = {
                 "query": query["name"],
+                "query_path": query["relative_path"],
                 "variant": variant_name,
                 "equivalence_group": group,
                 "result_sha256": result["result_sha256"],
@@ -373,6 +440,9 @@ def verify_equivalent_results(args, queries, variants):
 def run_measure(args, queries, variants, output):
     verification = verify_equivalent_results(args, queries, variants)
     write_json(output / "verification.json", verification)
+    if args.protocol == "prepared":
+        return run_prepared_measure(args, queries, variants, output, verification)
+
     jobs = []
     for query in queries:
         for variant_name in variants:
@@ -399,8 +469,10 @@ def run_measure(args, queries, variants, output):
             record = {
                 "phase": phase,
                 "repetition": repetition,
+                "protocol": "fresh-process",
                 "equivalence_group": query["equivalence_group"],
                 "query": query["name"],
+                "query_path": query["relative_path"],
                 "unchanged": query["unchanged"],
                 "variant": variant_name,
                 "cell": f"{query['equivalence_group']}/{query['name']}/{variant_name}",
@@ -413,20 +485,59 @@ def run_measure(args, queries, variants, output):
             if phase == "sample":
                 records.append(record)
             print(json.dumps(record, sort_keys=True), flush=True)
-    summary = summarize_measurements(records, args.seed)
-    write_json(output / "summary.json", summary)
-    with (output / "summary.csv").open("w", newline="") as summary_file:
-        writer = csv.writer(summary_file)
-        fields = (
-            "samples",
-            "median_seconds",
-            "mad_seconds",
-            "minimum_seconds",
-            "maximum_seconds",
-        )
-        writer.writerow(["cell", *fields])
-        for cell, values in sorted(summary["cells"].items()):
-            writer.writerow([cell] + [values[key] for key in fields])
+    write_measurement_summary(output, records, args.seed)
+    return 0
+
+
+def run_prepared_measure(args, queries, variants, output, verification):
+    result_hashes = {
+        (record["query_path"], record["variant"]): record["result_sha256"]
+        for record in verification
+    }
+    cells = [(query, variant_name) for query in queries for variant_name in variants]
+    generator = random.Random(args.seed)
+    generator.shuffle(cells)
+
+    records = []
+    raw_path = output / "raw.jsonl"
+    with raw_path.open("w") as raw_file:
+        for query, variant_name in cells:
+            result = run_prepared_cli(
+                variants[variant_name],
+                args.database,
+                query["sql"],
+                args.threads,
+                args.warmups,
+                args.samples,
+            )
+            for repetition, query_seconds in enumerate(result["timings"]):
+                phase = "warmup" if repetition < args.warmups else "sample"
+                phase_repetition = (
+                    repetition if phase == "warmup" else repetition - args.warmups
+                )
+                record = {
+                    "phase": phase,
+                    "repetition": phase_repetition,
+                    "protocol": "prepared",
+                    "equivalence_group": query["equivalence_group"],
+                    "query": query["name"],
+                    "query_path": query["relative_path"],
+                    "unchanged": query["unchanged"],
+                    "variant": variant_name,
+                    "cell": f"{query['equivalence_group']}/{query['name']}/{variant_name}",
+                    "query_seconds": query_seconds,
+                    "batch_process_seconds": result["process_seconds"],
+                    "result_sha256": result_hashes[
+                        (query["relative_path"], variant_name)
+                    ],
+                }
+                raw_file.write(json.dumps(record, sort_keys=True) + "\n")
+                raw_file.flush()
+                if phase == "sample":
+                    records.append(record)
+                print(json.dumps(record, sort_keys=True), flush=True)
+
+    write_measurement_summary(output, records, args.seed)
     return 0
 
 
@@ -457,6 +568,9 @@ def create_parser():
     measure.add_argument("--warmups", type=int, default=2)
     measure.add_argument("--samples", type=int, default=15)
     measure.add_argument("--seed", type=int, default=20260803)
+    measure.add_argument(
+        "--protocol", choices=("fresh-process", "prepared"), default="fresh-process"
+    )
     return parser
 
 
@@ -464,6 +578,8 @@ def main():
     args = create_parser().parse_args()
     if args.threads < 1:
         raise ValueError("threads must be positive")
+    if args.mode == "measure" and (args.warmups < 0 or args.samples < 1):
+        raise ValueError("warmups must be non-negative and samples must be positive")
     if not args.database.is_file():
         raise ValueError(f"database does not exist: {args.database}")
     selected_names = [name for name in args.variants.split(",") if name]
@@ -474,6 +590,8 @@ def main():
     manifest, variants = load_manifest(args.manifest, selected_names)
     prepare_output(args.output)
     environment = environment_record(args, manifest, variants, args.database)
+    if args.mode == "measure":
+        environment["measurement_protocol"] = args.protocol
     environment["queries"] = [
         {key: value for key, value in query.items() if key != "sql"}
         for query in queries

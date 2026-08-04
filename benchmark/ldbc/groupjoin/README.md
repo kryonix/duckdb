@@ -3,9 +3,11 @@
 This directory contains workload diagnostics for deciding whether GroupJoin is
 useful on unchanged public queries. It is not a benchmark result by itself.
 
-The harness runs every measured sample in a fresh DuckDB CLI process, verifies
-the complete CSV result before timing, stores the raw samples and plans, and
-reports medians and median absolute deviations. Keep its output outside Git.
+The harness verifies the complete CSV result before timing, stores raw samples
+and plans, and reports medians and median absolute deviations. Fresh-process
+timing remains the default. Prepared timing keeps one connection per
+query/variant cell, prepares once, and measures only repeated executions. Keep
+its output outside Git.
 
 Create a manifest that names revision-isolated executables:
 
@@ -86,6 +88,20 @@ python3 benchmark/ldbc/groupjoin/run_evidence.py measure \
   --parameter tag=Sikh_Empire --threads 4 \
   --warmups 2 --samples 15 --seed 20260803 \
   --output /tmp/groupjoin-evidence/q5-sf1
+```
+
+Repeat the same comparison without process startup or repeated planning:
+
+```bash
+python3 benchmark/ldbc/groupjoin/run_evidence.py measure \
+  --manifest /tmp/groupjoin-builds/manifest.json \
+  --database /tmp/ldbc-bi-sf1.duckdb \
+  --queries benchmark/ldbc/groupjoin/queries/q5 \
+  --variants disabled,auto,binary,factorized \
+  --parameter tag=Sikh_Empire --threads 4 \
+  --warmups 2 --samples 15 --seed 20260803 \
+  --protocol prepared \
+  --output /tmp/groupjoin-evidence/q5-sf1-prepared
 ```
 
 `q5-original.sql`, `q5-preaggregate.sql`, and `q5-two-stage.sql` are result
