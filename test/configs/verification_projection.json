@@ -16,6 +16,7 @@
         "test/sql/cte/recursive_cte_key_probe.test",
         "test/sql/cte/recursive_cte_logging.test",
         "test/sql/aggregate/group/test_factorized_group_join.test",
+        "test/sql/aggregate/group/test_factorized_group_join_compressed.test",
         "test/sql/aggregate/group/test_factorized_group_join_external.test_slow",
         "test/sql/aggregate/group/test_hash_group_join.test",
         "test/sql/optimizer/expression/test_row_comparison_simplification.test"
