@@ -224,7 +224,7 @@ SELECT (SELECT sum(g) FROM cte),
 ----
 logical_opt	<REGEX>:(?s)(?:.*CTE Scan){3}.*
 
-# Keep the logical exchange classifier aligned with physical pipeline selection.
+# Verify the physical pipeline topology used by candidate costing.
 query II
 EXPLAIN ANALYZE WITH cte AS MATERIALIZED (
 	SELECT * FROM cte_cost_a JOIN cte_cost_b USING (i) JOIN cte_cost_c USING (i)
