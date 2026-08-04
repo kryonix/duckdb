@@ -1893,6 +1893,13 @@ optional<HashGroupJoinOrderContext> GetFactorizedGroupJoinOrderContext(LogicalAg
 	auto inputs = GetFactorizedGroupJoinInputs(aggregate, *candidate);
 	HashGroupJoinOrderContext result;
 	result.strategy = Settings::Get<DebugGroupJoinStrategySetting>(context);
+	if (result.strategy == GroupJoinStrategy::AUTO) {
+		auto cost = EstimateFactorizedGroupJoinCost(aggregate, *candidate, context);
+		if (!cost.selected) {
+			return nullopt;
+		}
+		result.factorized_cost = cost.factorized_cost;
+	}
 	result.factorized = true;
 	LogicalJoin::GetTableReferences(inputs.driver, result.factorized_driver_tables);
 	LogicalJoin::GetTableReferences(inputs.left_factor, result.factorized_left_tables);

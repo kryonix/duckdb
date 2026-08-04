@@ -75,7 +75,11 @@ double CostModel::ComputeCost(DPJoinNode &left, DPJoinNode &right, JoinRelationS
 			                             ContainsRelations(left.set, group_join_context->factorized_driver_relations) &&
 			                             ContainsRelations(left.set, group_join_context->factorized_left_relations);
 			if (left_is_left_factor || right_is_left_factor || left_is_right_factor || right_is_right_factor) {
-				join_cost = -left.cost - right.cost;
+				if (group_join_context->strategy == GroupJoinStrategy::FACTORIZED) {
+					join_cost = -left.cost - right.cost;
+				} else {
+					join_cost = group_join_context->factorized_cost - left.cost - right.cost;
+				}
 			}
 			return join_cost + left.cost + right.cost;
 		}

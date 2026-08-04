@@ -1061,7 +1061,7 @@ void PartialAggregatePushdown::VisitOperator(unique_ptr<LogicalOperator> &op) {
 		op->Cast<LogicalAggregate>().factorized_group_join_deferred = false;
 	} else if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && op->children.size() == 1) {
 		auto &aggregate = op->Cast<LogicalAggregate>();
-		if (HasPotentialFactorizedGroupJoinCandidate(aggregate, optimizer.context)) {
+		if (HasFactorizedGroupJoinCandidate(aggregate, optimizer.context)) {
 			aggregate.factorized_group_join_deferred = true;
 			return;
 		}

@@ -84,6 +84,7 @@ struct HashGroupJoinOrderContext {
 	bool physical_eager_supported = false;
 	bool perfect_supported = false;
 	idx_t perfect_range = 0;
+	double factorized_cost = 0;
 	GroupJoinStrategy strategy = GroupJoinStrategy::AUTO;
 	bool factorized = false;
 };
