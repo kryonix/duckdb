@@ -1630,8 +1630,11 @@ static FactorizedGroupJoinCostEstimate EstimateFactorizedGroupJoinCost(LogicalAg
 	}
 	const auto factor_rows = static_cast<double>(result.left_rows) + static_cast<double>(result.right_rows);
 	const auto scan_rows = static_cast<double>(result.left_scan_rows) + static_cast<double>(result.right_scan_rows);
-	const auto selective_driver =
-	    static_cast<double>(result.driver_rows) <= factor_rows / 10.0 && scan_rows <= factor_rows / 4.0;
+	const auto compact_driver_domain = static_cast<double>(result.driver_rows) <= factor_rows / 10.0;
+	const auto sparse_driver_domain =
+	    exact_driver_filter &&
+	    static_cast<double>(perfect_range) >= static_cast<double>(MaxValue<idx_t>(result.driver_rows, 1)) * 2.0;
+	const auto selective_driver = compact_driver_domain && scan_rows <= factor_rows / 4.0;
 	result.reliable = direct_driver_edge && inner_edges && (exact_driver_filter || selective_driver) &&
 	                  aggregates_supported && inputs.driver.has_estimated_cardinality &&
 	                  inputs.left_factor.has_estimated_cardinality && inputs.right_factor.has_estimated_cardinality &&
@@ -1676,6 +1679,7 @@ static FactorizedGroupJoinCostEstimate EstimateFactorizedGroupJoinCost(LogicalAg
 	}
 	result.driver_first_cost = result.build_cost + result.filter_cost + result.probe_cost + result.scan_cost +
 	                           direct_state_cost + result.routing_cost;
+	const auto driver_first_orientation_cost = result.driver_first_cost;
 	const auto retained_factor_rows =
 	    static_cast<double>(result.left_scan_rows) + static_cast<double>(result.right_scan_rows);
 	const auto factor_row_count = static_cast<double>(result.left_rows) + static_cast<double>(result.right_rows);
@@ -1699,7 +1703,9 @@ static FactorizedGroupJoinCostEstimate EstimateFactorizedGroupJoinCost(LogicalAg
 	                    static_cast<double>(result.right_rows) * (key_cost + payload_costs[2] + state_costs[2] + 1.0) +
 	                    result.build_cost + static_cast<double>(result.matched_drivers) * (key_cost + 1.0);
 	result.best_existing_cost = MinValue(result.separate_cost, result.eager_cost);
-	result.driver_first = result.driver_first_cost <= result.factors_first_cost;
+	result.driver_first = compact_driver_domain && sparse_driver_domain
+	                          ? driver_first_orientation_cost <= result.factors_first_cost
+	                          : result.driver_first_cost <= result.factors_first_cost;
 	result.factorized_cost = MinValue(result.driver_first_cost, result.factors_first_cost);
 
 	idx_t estimated_memory_rows = 0;

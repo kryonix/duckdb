@@ -656,7 +656,7 @@ EXPLAIN SELECT r.k, count(*), sum(r.payload), sum(s.x), sum(s.x * s.x), sum(t.y)
 FROM fg_auto_driver r JOIN fg_auto_left s USING (k) JOIN fg_auto_right t USING (k)
 GROUP BY r.k
 ----
-physical_plan	<REGEX>:(?s).*Factorized Group Join.*factors-first adaptive linear-chain directories.*driver-first=.*factors-first=.*Decision: AUTO SELECTED.*driver->left=NO, driver->right=NO.*
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*driver-first target \+ task-local dense factor states.*driver-first=.*factors-first=.*Decision: AUTO SELECTED.*driver->left=YES, driver->right=YES.*
 
 # Join ordering retains the costed driver-factor-factor shape independently of SQL join order.
 query II
