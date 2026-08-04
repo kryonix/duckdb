@@ -1,0 +1,18 @@
+{
+  "q5-original.sql": {
+    "equivalence_group": "q5",
+    "unchanged": true
+  },
+  "q5-preaggregate.sql": {
+    "equivalence_group": "q5",
+    "unchanged": false
+  },
+  "q5-two-stage.sql": {
+    "equivalence_group": "q5",
+    "unchanged": false
+  },
+  "q5-factorized-inner.sql": {
+    "equivalence_group": "q5-factorized-inner",
+    "unchanged": false
+  }
+}
