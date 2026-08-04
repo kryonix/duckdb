@@ -25,6 +25,7 @@ InsertionOrderPreservingMap<string> LogicalGroupJoin::ParamsToString() const {
 		result["Routing"] = routed ? "ROUTED" : "DIRECT";
 		result["Implementation"] = EnumUtil::ToString(implementation);
 		result["Strategy"] = EnumUtil::ToString(execution_mode);
+		result["Orientation"] = factorized_driver_first ? "DRIVER_FIRST" : "FACTORS_FIRST";
 		result["Factors"] = StringUtil::Format("left=%llu rows, right=%llu rows", estimated_left_factor_rows,
 		                                       estimated_right_factor_rows);
 		result["Factorized Cardinalities"] =
@@ -33,10 +34,11 @@ InsertionOrderPreservingMap<string> LogicalGroupJoin::ParamsToString() const {
 		                       estimated_factorized_join_rows, estimated_factorized_matched_drivers);
 		result["Factorized Costs"] = StringUtil::Format(
 		    "build=%.2f, filter=%.2f, probe=%.2f, scan=%.2f, cache=%.2f, eager=%.2f, routing=%.2f, spill=%.2f, "
-		    "total=%.2f, best existing=%.2f",
+		    "driver-first=%.2f, factors-first=%.2f, total=%.2f, best existing=%.2f",
 		    factorized_build_cost, factorized_filter_cost, factorized_probe_cost, factorized_scan_cost,
 		    factorized_cache_cost, factorized_eager_work_cost, factorized_routing_cost, factorized_spill_cost,
-		    factorized_cost, factorized_best_existing_cost);
+		    factorized_driver_first_cost, factorized_factors_first_cost, factorized_cost,
+		    factorized_best_existing_cost);
 		result["Factorized Decision"] = factorized_auto_selected   ? "AUTO SELECTED"
 		                                : factorized_cost_reliable ? "FORCED (AUTO COST AVAILABLE)"
 		                                                           : "FORCED (UNRELIABLE STATISTICS)";

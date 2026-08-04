@@ -36,7 +36,9 @@ JoinHashTable::ProbeState::ProbeState()
       non_empty_sel(STANDARD_VECTOR_SIZE) {
 }
 
-JoinHashTable::FactorProbeState::FactorProbeState() : pointers(LogicalType::POINTER) {
+JoinHashTable::FactorProbeState::FactorProbeState()
+    : pointers(LogicalType::POINTER), unique_factor_refs(LogicalType::UBIGINT) {
+	probe.dict_state = make_uniq<ProbeDictionaryState>();
 }
 
 JoinHashTable::ProbeDictionaryState::ProbeDictionaryState()
@@ -1377,6 +1379,21 @@ idx_t JoinHashTable::ProbeFactorRefs(DataChunk &keys, TupleDataChunkState &key_s
 	if (Count() == 0 || keys.size() == 0) {
 		return 0;
 	}
+	if (!precomputed_hashes && equality_types.size() == 1) {
+		auto &key = keys.data[0];
+		if (key.GetVectorType() == VectorType::CONSTANT_VECTOR) {
+			auto compressed_count = TryProbeFactorConstant(keys, key_state, probe_state, factor_refs, match_sel);
+			if (compressed_count.IsValid()) {
+				return compressed_count.GetIndex();
+			}
+		} else if (key.GetVectorType() == VectorType::DICTIONARY_VECTOR &&
+		           DictionaryVector::DictionarySize(key).IsValid()) {
+			auto compressed_count = TryProbeFactorDictionary(keys, key_state, probe_state, factor_refs, match_sel);
+			if (compressed_count.IsValid()) {
+				return compressed_count.GetIndex();
+			}
+		}
+	}
 
 	TupleDataCollection::ToUnifiedFormat(key_state, keys);
 	SelectionVector prepared_sel(STANDARD_VECTOR_SIZE);
@@ -1395,6 +1412,146 @@ idx_t JoinHashTable::ProbeFactorRefs(DataChunk &keys, TupleDataChunkState &key_s
 		GetFactorPointers(keys, key_state, probe_state, hashes, current_sel, count, factor_refs, match_sel, has_sel);
 	}
 	return count;
+}
+
+optional_idx JoinHashTable::TryProbeFactorConstant(DataChunk &keys, TupleDataChunkState &key_state,
+                                                   FactorProbeState &probe_state, Vector &factor_refs,
+                                                   SelectionVector &match_sel) {
+#ifndef DEBUG
+	if (keys.size() <= 1) {
+		return optional_idx();
+	}
+#endif
+	auto &dict_state = *probe_state.probe.dict_state;
+	auto &unique_values = dict_state.unique_values;
+	if (unique_values.ColumnCount() == 0) {
+		unique_values.InitializeEmpty(vector<LogicalType> {equality_types[0]});
+		TupleDataCollection::InitializeChunkState(dict_state.unique_key_state, {equality_types[0]});
+	}
+	SelectionVector single_row(1);
+	single_row.set_index(0, 0);
+	unique_values.data[0].Slice(keys.data[0], single_row, 1);
+	unique_values.Flatten();
+	TupleDataCollection::ToUnifiedFormat(dict_state.unique_key_state, unique_values);
+	optional_ptr<const SelectionVector> unique_sel;
+	SelectionVector prepared_unique(STANDARD_VECTOR_SIZE);
+	idx_t unique_count =
+	    PrepareKeys(unique_values, dict_state.unique_key_state.vector_data, unique_sel, prepared_unique, false);
+	if (unique_count != 0) {
+		Hash(unique_values, *unique_sel, unique_count, dict_state.hashes);
+		GetFactorPointers(unique_values, dict_state.unique_key_state, probe_state, dict_state.hashes, unique_sel,
+		                  unique_count, probe_state.unique_factor_refs, dict_state.match_sel, false);
+	}
+	const uint64_t resolved_ref =
+	    unique_count == 0 ? 0 : FlatVector::GetData<uint64_t>(probe_state.unique_factor_refs)[0];
+	TupleDataCollection::ToUnifiedFormat(key_state, keys);
+	optional_ptr<const SelectionVector> current_sel;
+	SelectionVector prepared_sel(STANDARD_VECTOR_SIZE);
+	const auto prepared_count = PrepareKeys(keys, key_state.vector_data, current_sel, prepared_sel, false);
+	auto refs = FlatVector::GetDataMutable<uint64_t>(factor_refs);
+	idx_t result_count = 0;
+	if (resolved_ref != 0) {
+		for (idx_t row_idx = 0; row_idx < prepared_count; row_idx++) {
+			const auto input_idx = current_sel->get_index(row_idx);
+			refs[input_idx] = resolved_ref;
+			match_sel.set_index(result_count++, input_idx);
+		}
+	}
+	return optional_idx(result_count);
+}
+
+optional_idx JoinHashTable::TryProbeFactorDictionary(DataChunk &keys, TupleDataChunkState &key_state,
+                                                     FactorProbeState &probe_state, Vector &factor_refs,
+                                                     SelectionVector &match_sel) {
+	static constexpr idx_t MAX_DICTIONARY_SIZE_THRESHOLD = 20000;
+	static constexpr idx_t DICTIONARY_THRESHOLD = 2;
+	auto &dictionary_column = keys.data[0];
+	const auto dictionary_size_option = DictionaryVector::DictionarySize(dictionary_column);
+	if (!dictionary_size_option.IsValid()) {
+		return optional_idx();
+	}
+	const auto dictionary_size = dictionary_size_option.GetIndex();
+	const auto &dictionary_id = DictionaryVector::DictionaryId(dictionary_column);
+	if (dictionary_id.empty()) {
+		if (dictionary_size * DICTIONARY_THRESHOLD >= keys.size()) {
+			return optional_idx();
+		}
+	} else if (dictionary_size >= MAX_DICTIONARY_SIZE_THRESHOLD) {
+		return optional_idx();
+	}
+	if (dictionary_size == 0) {
+		return optional_idx(0);
+	}
+	auto &dict_state = *probe_state.probe.dict_state;
+	if (dict_state.dictionary_id.empty() || dict_state.dictionary_id != dictionary_id) {
+		if (dictionary_size > dict_state.capacity) {
+			dict_state.found_entry = make_unsafe_uniq_array<bool>(dictionary_size);
+			probe_state.dictionary_factor_refs = make_uniq<Vector>(LogicalType::UBIGINT, dictionary_size);
+			dict_state.capacity = dictionary_size;
+		}
+		memset(dict_state.found_entry.get(), 0, dictionary_size * sizeof(bool));
+		memset(FlatVector::GetDataMutable(*probe_state.dictionary_factor_refs), 0, dictionary_size * sizeof(uint64_t));
+		dict_state.dictionary_id = dictionary_id;
+		dict_state.resolved_count = 0;
+	} else if (dictionary_size > dict_state.capacity) {
+		throw InternalException("Join factor probe dictionary changed size for id %s (size %d, capacity %d)",
+		                        dict_state.dictionary_id, dictionary_size, dict_state.capacity);
+	}
+	const auto &dictionary_vector = DictionaryVector::Child(dictionary_column);
+	const auto &offsets = DictionaryVector::SelVector(dictionary_column);
+	idx_t unique_count = 0;
+	if (dict_state.resolved_count < dictionary_size) {
+		for (idx_t row_idx = 0; row_idx < keys.size(); row_idx++) {
+			const auto dictionary_idx = offsets.get_index(row_idx);
+			dict_state.unique_entries.set_index(unique_count, dictionary_idx);
+			unique_count += !dict_state.found_entry[dictionary_idx];
+			dict_state.found_entry[dictionary_idx] = true;
+		}
+		dict_state.resolved_count += unique_count;
+	}
+	if (unique_count != 0) {
+		auto &unique_values = dict_state.unique_values;
+		if (unique_values.ColumnCount() == 0) {
+			unique_values.InitializeEmpty(vector<LogicalType> {equality_types[0]});
+			TupleDataCollection::InitializeChunkState(dict_state.unique_key_state, {equality_types[0]});
+		}
+		unique_values.data[0].Slice(dictionary_vector, dict_state.unique_entries, unique_count);
+		unique_values.CheckCardinality(unique_count);
+		TupleDataCollection::ToUnifiedFormat(dict_state.unique_key_state, unique_values);
+		optional_ptr<const SelectionVector> unique_sel;
+		SelectionVector prepared_unique(STANDARD_VECTOR_SIZE);
+		idx_t prepared_count =
+		    PrepareKeys(unique_values, dict_state.unique_key_state.vector_data, unique_sel, prepared_unique, false);
+		if (prepared_count != 0) {
+			Hash(unique_values, *unique_sel, prepared_count, dict_state.hashes);
+			GetFactorPointers(unique_values, dict_state.unique_key_state, probe_state, dict_state.hashes, unique_sel,
+			                  prepared_count, probe_state.unique_factor_refs, dict_state.match_sel,
+			                  prepared_count < unique_count);
+		}
+		const auto unique_refs = FlatVector::GetData<uint64_t>(probe_state.unique_factor_refs);
+		auto dictionary_refs = FlatVector::GetDataMutable<uint64_t>(*probe_state.dictionary_factor_refs);
+		for (idx_t match_idx = 0; match_idx < prepared_count; match_idx++) {
+			const auto unique_idx = dict_state.match_sel.get_index(match_idx);
+			const auto dictionary_idx = dict_state.unique_entries.get_index(unique_idx);
+			dictionary_refs[dictionary_idx] = unique_refs[unique_idx];
+		}
+	}
+	TupleDataCollection::ToUnifiedFormat(key_state, keys);
+	optional_ptr<const SelectionVector> current_sel;
+	SelectionVector prepared_sel(STANDARD_VECTOR_SIZE);
+	const auto prepared_count = PrepareKeys(keys, key_state.vector_data, current_sel, prepared_sel, false);
+	auto output_refs = FlatVector::GetDataMutable<uint64_t>(factor_refs);
+	const auto dictionary_refs = FlatVector::GetData<uint64_t>(*probe_state.dictionary_factor_refs);
+	idx_t result_count = 0;
+	for (idx_t row_idx = 0; row_idx < prepared_count; row_idx++) {
+		const auto input_idx = current_sel->get_index(row_idx);
+		const auto factor_ref = dictionary_refs[offsets.get_index(input_idx)];
+		output_refs[input_idx] = factor_ref;
+		if (factor_ref != 0) {
+			match_sel.set_index(result_count++, input_idx);
+		}
+	}
+	return optional_idx(result_count);
 }
 
 idx_t JoinHashTable::ExpandFactorRefs(Vector &factor_refs, optional_ptr<const SelectionVector> ref_sel,

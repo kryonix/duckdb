@@ -102,8 +102,11 @@ public:
 	double estimated_spill_cost = 0;
 	double estimated_factorized_cost = 0;
 	double estimated_best_existing_cost = 0;
+	double estimated_driver_first_cost = 0;
+	double estimated_factors_first_cost = 0;
 	bool estimated_cost_reliable = false;
 	bool auto_selected = false;
+	bool driver_first = true;
 	PhysicalPlan &physical_plan;
 	optional_ptr<PhysicalOperator> driver_input;
 	optional_ptr<PhysicalOperator> left_input;

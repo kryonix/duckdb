@@ -67,8 +67,11 @@ public:
 	double factorized_spill_cost = 0;
 	double factorized_cost = 0;
 	double factorized_best_existing_cost = 0;
+	double factorized_driver_first_cost = 0;
+	double factorized_factors_first_cost = 0;
 	bool factorized_cost_reliable = false;
 	bool factorized_auto_selected = false;
+	bool factorized_driver_first = true;
 	//! Runtime filters produced independently by the left and right factor builds
 	unique_ptr<JoinFilterPushdownInfo> factorized_left_filter_pushdown;
 	unique_ptr<JoinFilterPushdownInfo> factorized_right_filter_pushdown;

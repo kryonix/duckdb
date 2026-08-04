@@ -514,6 +514,24 @@
         "name": "factorized_eager_work_cost",
         "type": "double",
         "default": "0"
+      },
+      {
+        "id": 265,
+        "name": "factorized_driver_first_cost",
+        "type": "double",
+        "default": "0"
+      },
+      {
+        "id": 266,
+        "name": "factorized_factors_first_cost",
+        "type": "double",
+        "default": "0"
+      },
+      {
+        "id": 267,
+        "name": "factorized_driver_first",
+        "type": "bool",
+        "default": "true"
       }
     ],
     "constructor": [

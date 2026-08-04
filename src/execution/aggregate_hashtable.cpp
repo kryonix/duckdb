@@ -46,6 +46,10 @@ AggregateHTProbeState::AggregateHTProbeState()
       no_match_vector(STANDARD_VECTOR_SIZE) {
 }
 
+AggregateHTLookupDictionaryState::AggregateHTLookupDictionaryState()
+    : hashes(LogicalType::HASH), unique_entries(STANDARD_VECTOR_SIZE), unique_found(STANDARD_VECTOR_SIZE) {
+}
+
 AggregateHTLookupState::AggregateHTLookupState()
     : missing_vector(STANDARD_VECTOR_SIZE),
       found_groups(make_unsafe_uniq_array_uninitialized<bool>(STANDARD_VECTOR_SIZE)) {
@@ -191,6 +195,7 @@ void GroupedAggregateHashTable::Abandon() {
 	// Start over
 	ClearPointerTable();
 	count = 0;
+	lookup_generation++;
 
 	// Resetting the id ensures the dict state is reset properly when needed
 	state.dict_state.dictionary_id = string();
@@ -418,6 +423,7 @@ void GroupedAggregateHashTable::MoveUniqueGroups(GroupedAggregateHashTable &othe
 	other.ClearPointerTable();
 	other.count = 0;
 	other.sink_count = 0;
+	other.lookup_generation++;
 }
 
 void GroupedAggregateHashTable::PrepareUniqueFinalize(idx_t group_count) {
@@ -428,6 +434,7 @@ void GroupedAggregateHashTable::PrepareUniqueFinalize(idx_t group_count) {
 	count = group_count;
 	sink_count = group_count;
 	skip_lookups = false;
+	lookup_generation++;
 }
 
 void GroupedAggregateHashTable::FinalizeUniquePartition(idx_t partition_idx, vector<data_ptr_t> &row_addresses,
@@ -1392,6 +1399,7 @@ idx_t GroupedAggregateHashTable::FindOrCreateGroupsInternal(DataChunk &groups, V
 
 	FlatVector::SetSize(addresses_v, chunk_size);
 	count += new_group_count;
+	lookup_generation += new_group_count != 0;
 	return new_group_count;
 }
 
@@ -1433,13 +1441,163 @@ void GroupedAggregateHashTable::InitializeLookupState(AggregateHTLookupState &lo
 
 idx_t GroupedAggregateHashTable::LookupGroups(DataChunk &groups, AggregateHTLookupState &lookup_state,
                                               SelectionVector &found_groups_out) const {
+	if (groups.ColumnCount() == 1) {
+		auto &group = groups.data[0];
+		if (group.GetVectorType() == VectorType::CONSTANT_VECTOR) {
+			auto compressed_count = TryLookupConstantGroups(groups, lookup_state, found_groups_out);
+			if (compressed_count.IsValid()) {
+				return compressed_count.GetIndex();
+			}
+		} else if (group.GetVectorType() == VectorType::DICTIONARY_VECTOR &&
+		           DictionaryVector::DictionarySize(group).IsValid()) {
+			auto compressed_count = TryLookupDictionaryGroups(groups, lookup_state, found_groups_out);
+			if (compressed_count.IsValid()) {
+				return compressed_count.GetIndex();
+			}
+		}
+	}
 	groups.Hash(lookup_state.hashes);
-	return LookupGroups(groups, lookup_state.hashes, lookup_state, found_groups_out);
+	return LookupGroupsInternal(groups, lookup_state.hashes, lookup_state, found_groups_out);
 }
 
 idx_t GroupedAggregateHashTable::LookupGroups(DataChunk &groups, Vector &group_hashes,
                                               AggregateHTLookupState &lookup_state,
                                               SelectionVector &found_groups_out) const {
+	return LookupGroupsInternal(groups, group_hashes, lookup_state, found_groups_out);
+}
+
+optional_idx GroupedAggregateHashTable::TryLookupConstantGroups(DataChunk &groups, AggregateHTLookupState &lookup_state,
+                                                                SelectionVector &found_groups_out) const {
+#ifndef DEBUG
+	if (groups.size() <= 1) {
+		return optional_idx();
+	}
+#endif
+	if (groups.size() == 0) {
+		return optional_idx(0);
+	}
+	InitializeLookupState(lookup_state);
+	auto &dictionary_state = lookup_state.dictionary;
+	auto &unique_values = dictionary_state.unique_values;
+	if (unique_values.ColumnCount() == 0) {
+		unique_values.InitializeEmpty(groups.GetTypes());
+	}
+	const auto row_count = groups.size();
+	unique_values.Reference(groups);
+	unique_values.SetChildCardinality(1);
+	unique_values.Flatten();
+	groups.SetChildCardinality(row_count);
+	unique_values.Hash(dictionary_state.hashes);
+	const auto found_count =
+	    LookupGroupsInternal(unique_values, dictionary_state.hashes, lookup_state, dictionary_state.unique_found);
+	data_ptr_t address = nullptr;
+	if (found_count != 0) {
+		address = FlatVector::GetData<data_ptr_t>(lookup_state.addresses)[0];
+	}
+	lookup_state.addresses.SetVectorType(VectorType::FLAT_VECTOR);
+	auto result_addresses = FlatVector::GetDataMutable<data_ptr_t>(lookup_state.addresses);
+	idx_t result_count = 0;
+	for (idx_t row_idx = 0; row_idx < row_count; row_idx++) {
+		result_addresses[row_idx] = address;
+		if (address) {
+			found_groups_out.set_index(result_count++, UnsafeNumericCast<sel_t>(row_idx));
+		}
+	}
+	FlatVector::SetSize(lookup_state.addresses, row_count);
+	return optional_idx(result_count);
+}
+
+optional_idx GroupedAggregateHashTable::TryLookupDictionaryGroups(DataChunk &groups,
+                                                                  AggregateHTLookupState &lookup_state,
+                                                                  SelectionVector &found_groups_out) const {
+	static constexpr idx_t MAX_DICTIONARY_SIZE_THRESHOLD = 20000;
+	static constexpr idx_t DICTIONARY_THRESHOLD = 2;
+	auto &dictionary_column = groups.data[0];
+	const auto dictionary_size_option = DictionaryVector::DictionarySize(dictionary_column);
+	if (!dictionary_size_option.IsValid()) {
+		return optional_idx();
+	}
+	const auto dictionary_size = dictionary_size_option.GetIndex();
+	const auto &dictionary_id = DictionaryVector::DictionaryId(dictionary_column);
+	if (dictionary_id.empty()) {
+		if (dictionary_size * DICTIONARY_THRESHOLD >= groups.size()) {
+			return optional_idx();
+		}
+	} else if (dictionary_size >= MAX_DICTIONARY_SIZE_THRESHOLD) {
+		return optional_idx();
+	}
+	if (dictionary_size == 0) {
+		return optional_idx(0);
+	}
+	InitializeLookupState(lookup_state);
+	auto &dictionary_state = lookup_state.dictionary;
+	if (dictionary_state.lookup_generation != lookup_generation) {
+		dictionary_state.dictionary_id.clear();
+		dictionary_state.lookup_generation = lookup_generation;
+	}
+	if (dictionary_state.dictionary_id.empty() || dictionary_state.dictionary_id != dictionary_id) {
+		if (dictionary_size > dictionary_state.capacity) {
+			dictionary_state.dictionary_addresses = make_uniq<Vector>(LogicalType::POINTER, dictionary_size);
+			dictionary_state.resolved_entries = make_unsafe_uniq_array<bool>(dictionary_size);
+			dictionary_state.capacity = dictionary_size;
+		}
+		memset(dictionary_state.resolved_entries.get(), 0, dictionary_size * sizeof(bool));
+		memset(FlatVector::GetDataMutable(*dictionary_state.dictionary_addresses), 0,
+		       dictionary_size * sizeof(data_ptr_t));
+		dictionary_state.dictionary_id = dictionary_id;
+		dictionary_state.resolved_count = 0;
+	} else if (dictionary_size > dictionary_state.capacity) {
+		throw InternalException("AggregateHT lookup dictionary changed size for id %s (size %d, capacity %d)",
+		                        dictionary_state.dictionary_id, dictionary_size, dictionary_state.capacity);
+	}
+	const auto &dictionary_vector = DictionaryVector::Child(dictionary_column);
+	const auto &offsets = DictionaryVector::SelVector(dictionary_column);
+	idx_t unique_count = 0;
+	if (dictionary_state.resolved_count < dictionary_size) {
+		for (idx_t row_idx = 0; row_idx < groups.size(); row_idx++) {
+			const auto dictionary_idx = offsets.get_index(row_idx);
+			dictionary_state.unique_entries.set_index(unique_count, dictionary_idx);
+			unique_count += !dictionary_state.resolved_entries[dictionary_idx];
+			dictionary_state.resolved_entries[dictionary_idx] = true;
+		}
+		dictionary_state.resolved_count += unique_count;
+	}
+	if (unique_count != 0) {
+		auto &unique_values = dictionary_state.unique_values;
+		if (unique_values.ColumnCount() == 0) {
+			unique_values.InitializeEmpty(groups.GetTypes());
+		}
+		unique_values.data[0].Slice(dictionary_vector, dictionary_state.unique_entries, unique_count);
+		unique_values.CheckCardinality(unique_count);
+		unique_values.Hash(dictionary_state.hashes);
+		const auto unique_found_count =
+		    LookupGroupsInternal(unique_values, dictionary_state.hashes, lookup_state, dictionary_state.unique_found);
+		const auto unique_addresses = FlatVector::GetData<data_ptr_t>(lookup_state.addresses);
+		auto dictionary_addresses = FlatVector::GetDataMutable<data_ptr_t>(*dictionary_state.dictionary_addresses);
+		for (idx_t found_idx = 0; found_idx < unique_found_count; found_idx++) {
+			const auto unique_idx = dictionary_state.unique_found.get_index(found_idx);
+			const auto dictionary_idx = dictionary_state.unique_entries.get_index(unique_idx);
+			dictionary_addresses[dictionary_idx] = unique_addresses[unique_idx];
+		}
+	}
+	lookup_state.addresses.SetVectorType(VectorType::FLAT_VECTOR);
+	auto result_addresses = FlatVector::GetDataMutable<data_ptr_t>(lookup_state.addresses);
+	const auto dictionary_addresses = FlatVector::GetData<data_ptr_t>(*dictionary_state.dictionary_addresses);
+	idx_t result_count = 0;
+	for (idx_t row_idx = 0; row_idx < groups.size(); row_idx++) {
+		const auto address = dictionary_addresses[offsets.get_index(row_idx)];
+		result_addresses[row_idx] = address;
+		if (address) {
+			found_groups_out.set_index(result_count++, UnsafeNumericCast<sel_t>(row_idx));
+		}
+	}
+	FlatVector::SetSize(lookup_state.addresses, groups.size());
+	return optional_idx(result_count);
+}
+
+idx_t GroupedAggregateHashTable::LookupGroupsInternal(DataChunk &groups, Vector &group_hashes,
+                                                      AggregateHTLookupState &lookup_state,
+                                                      SelectionVector &found_groups_out) const {
 	D_ASSERT(groups.ColumnCount() + 1 == layout_ptr->ColumnCount());
 	D_ASSERT(group_hashes.GetType() == LogicalType::HASH);
 	const auto chunk_size = groups.size();
@@ -1745,6 +1903,7 @@ void GroupedAggregateHashTable::ResetForNewIteration(idx_t radix_bits_p) {
 
 	count = 0;
 	sink_count = 0;
+	lookup_generation++;
 	skip_lookups = false;
 	enable_hll = false;
 	hll = HyperLogLog();

@@ -59,6 +59,22 @@ public:
 	bool initialized = false;
 };
 
+struct AggregateHTLookupDictionaryState {
+public:
+	AggregateHTLookupDictionaryState();
+
+	string dictionary_id;
+	DataChunk unique_values;
+	Vector hashes;
+	SelectionVector unique_entries;
+	SelectionVector unique_found;
+	unique_ptr<Vector> dictionary_addresses;
+	unsafe_unique_array<bool> resolved_entries;
+	idx_t capacity = 0;
+	idx_t resolved_count = 0;
+	idx_t lookup_generation = 0;
+};
+
 //! Task-local scratch state for read-only group lookups.
 struct AggregateHTLookupState : public AggregateHTProbeState {
 public:
@@ -69,6 +85,7 @@ public:
 	TupleDataChunkState chunk_state;
 	RowMatcher row_matcher;
 	vector<TupleDataGatherFunction> gather_functions;
+	AggregateHTLookupDictionaryState dictionary;
 };
 
 //! Task-local state for updating aggregate rows through stable addresses.
@@ -238,7 +255,16 @@ public:
 	void ResetForNewIteration(idx_t radix_bits);
 
 private:
+	optional_idx TryLookupDictionaryGroups(DataChunk &groups, AggregateHTLookupState &state,
+	                                       SelectionVector &found_groups_out) const;
+	optional_idx TryLookupConstantGroups(DataChunk &groups, AggregateHTLookupState &state,
+	                                     SelectionVector &found_groups_out) const;
+	idx_t LookupGroupsInternal(DataChunk &groups, Vector &group_hashes, AggregateHTLookupState &state,
+	                           SelectionVector &found_groups_out) const;
+
 	ClientContext &context;
+	//! Invalidates task-local dictionary lookup caches after structural changes.
+	idx_t lookup_generation = 1;
 	//! Efficiently matches groups
 	RowMatcher row_matcher;
 

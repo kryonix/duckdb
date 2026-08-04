@@ -273,6 +273,8 @@ public:
 
 		ProbeState probe;
 		Vector pointers;
+		Vector unique_factor_refs;
+		unique_ptr<Vector> dictionary_factor_refs;
 	};
 
 	//! Resumable state for expanding factor references without constructing a cross product.
@@ -573,6 +575,11 @@ private:
 	//! Constant-vector variant of Probe. Returns false if the LHS keys are not a constant vector.
 	bool TryProbeConstant(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state,
 	                      ProbeState &probe_state);
+	optional_idx TryProbeFactorDictionary(DataChunk &keys, TupleDataChunkState &key_state,
+	                                      FactorProbeState &probe_state, Vector &factor_refs,
+	                                      SelectionVector &match_sel);
+	optional_idx TryProbeFactorConstant(DataChunk &keys, TupleDataChunkState &key_state, FactorProbeState &probe_state,
+	                                    Vector &factor_refs, SelectionVector &match_sel);
 
 	bool UseSalt() const;
 

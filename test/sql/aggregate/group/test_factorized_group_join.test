@@ -656,7 +656,7 @@ EXPLAIN SELECT r.k, count(*), sum(r.payload), sum(s.x), sum(s.x * s.x), sum(t.y)
 FROM fg_auto_driver r JOIN fg_auto_left s USING (k) JOIN fg_auto_right t USING (k)
 GROUP BY r.k
 ----
-physical_plan	<REGEX>:(?s).*Factorized Group Join.*filter=.*cache=.*Decision: AUTO SELECTED.*driver->left=YES, driver->right=YES.*
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*factors-first adaptive linear-chain directories.*driver-first=.*factors-first=.*Decision: AUTO SELECTED.*driver->left=NO, driver->right=NO.*
 
 # Join ordering retains the costed driver-factor-factor shape independently of SQL join order.
 query II
@@ -835,7 +835,7 @@ EXPLAIN ANALYZE SELECT r.k, r.payload, count(*), sum(s.x), sum(t.y)
 FROM fg_duplicate_driver r JOIN fg_cached_left s USING (k) JOIN fg_eager_right t USING (k)
 GROUP BY r.k, r.payload
 ----
-analyzed_plan	<REGEX>:(?s).*Left Mode: CACHED.*Right Mode: EAGER.*Left Sample:.*drivers=2, matches=2, factor rows=10, factors=1.*Right Sample:.*drivers=2, matches=2, factor rows=40, factors=1.*
+analyzed_plan	<REGEX>:(?s).*driver-first target \+ compact routed factor updates.*Left Mode: CACHED.*Right Mode: EAGER.*Runtime Filters:.*driver->left=YES, driver->right=YES.*Left Matched Factor Rows: 10.*Right Matched Factor Rows: 40.*
 
 # Ordered states can be cached and combined; DISTINCT branches conservatively remain LAZY.
 query I

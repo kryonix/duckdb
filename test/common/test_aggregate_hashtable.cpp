@@ -2,6 +2,7 @@
 #include "test_helpers.hpp"
 
 #include "duckdb/common/row_operations/row_operations.hpp"
+#include "duckdb/common/vector/dictionary_vector.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/execution/aggregate_hashtable.hpp"
 #include "duckdb/execution/operator/aggregate/aggregate_object.hpp"
@@ -82,6 +83,37 @@ TEST_CASE("Grouped aggregate address lookup and update", "[aggregate_hashtable]"
 		REQUIRE(lookup_addresses[0] == build_addresses[2]);
 		REQUIRE(lookup_addresses[2] == build_addresses[0]);
 		REQUIRE(lookup_addresses[3] == build_addresses[1]);
+	}
+
+	SECTION("dictionary lookup cache is invalidated when groups are inserted") {
+		GroupedAggregateHashTable hash_table(context, allocator, {LogicalType::INTEGER},
+		                                     TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
+		DataChunk groups;
+		groups.Initialize(allocator, {LogicalType::INTEGER});
+		SetIntegerValues(groups, {Value::INTEGER(10)});
+		Vector addresses(LogicalType::POINTER);
+		SelectionVector new_groups(STANDARD_VECTOR_SIZE);
+		REQUIRE(hash_table.FindOrCreateGroups(groups, addresses, new_groups) == 1);
+
+		DataChunk dictionary_values;
+		dictionary_values.Initialize(allocator, {LogicalType::INTEGER});
+		SetIntegerValues(dictionary_values, {Value::INTEGER(10), Value::INTEGER(99)});
+		SelectionVector dictionary_sel(STANDARD_VECTOR_SIZE);
+		for (idx_t row_idx = 0; row_idx < STANDARD_VECTOR_SIZE; row_idx++) {
+			dictionary_sel.set_index(row_idx, UnsafeNumericCast<sel_t>(row_idx % 2));
+		}
+		DataChunk lookup_keys;
+		lookup_keys.InitializeEmpty({LogicalType::INTEGER});
+		lookup_keys.Slice(dictionary_values, dictionary_sel, STANDARD_VECTOR_SIZE);
+		lookup_keys.data[0].BufferMutable().Cast<DictionaryBuffer>().SetDictionaryId("aggregate-lookup-test");
+
+		AggregateHTLookupState lookup_state;
+		SelectionVector found(STANDARD_VECTOR_SIZE);
+		REQUIRE(hash_table.LookupGroups(lookup_keys, lookup_state, found) == STANDARD_VECTOR_SIZE / 2);
+
+		SetIntegerValues(groups, {Value::INTEGER(99)});
+		REQUIRE(hash_table.FindOrCreateGroups(groups, addresses, new_groups) == 1);
+		REQUIRE(hash_table.LookupGroups(lookup_keys, lookup_state, found) == STANDARD_VECTOR_SIZE);
 	}
 
 	vector<AggregateObject> aggregates;

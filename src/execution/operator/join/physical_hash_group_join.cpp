@@ -128,12 +128,15 @@ PhysicalHashGroupJoin::PhysicalHashGroupJoin(
     unique_ptr<JoinFilterPushdownInfo> filter_pushdown_p, GroupJoinImplementation implementation_p,
     GroupJoinExecutionMode execution_mode_p, Value perfect_min_p, Value perfect_max_p, idx_t perfect_range_p,
     vector<LogicalType> eager_payload_types_p, vector<LogicalType> unmatched_probe_types_p,
-    vector<unique_ptr<Expression>> unmatched_payload_expressions_p, idx_t estimated_cardinality)
+    vector<unique_ptr<Expression>> unmatched_payload_expressions_p, bool streaming_eager_raw_p,
+    idx_t estimated_cardinality)
     : PhysicalJoin(physical_plan, op, PhysicalOperatorType::HASH_GROUP_JOIN, JoinType::INNER, estimated_cardinality),
       output_groups(std::move(output_groups_p)), unmatched_policy(unmatched_policy_p),
       eager_payload_types(std::move(eager_payload_types_p)), routed(routed_p), unique_owner(unique_owner_p),
       single_match(single_match_p), null_equal(false), static_mode(false),
-      parallel_owner_build(unique_owner_p && !routed_p &&
+      streaming_eager(implementation_p == GroupJoinImplementation::EAGER_HASH && unique_owner_p && !routed_p),
+      streaming_eager_raw(streaming_eager_raw_p),
+      parallel_owner_build(!streaming_eager && unique_owner_p && !routed_p &&
                            owner.estimated_cardinality >= GROUP_JOIN_PARALLEL_BUILD_THRESHOLD),
       implementation(implementation_p), planned_execution_mode(execution_mode_p), perfect_min(std::move(perfect_min_p)),
       perfect_max(std::move(perfect_max_p)), perfect_range(perfect_range_p),
@@ -176,8 +179,13 @@ PhysicalHashGroupJoin::PhysicalHashGroupJoin(
 		payload_index += aggregate.GetChildren().size();
 	}
 	D_ASSERT(output_groups.size() == op.groups.size());
-	children.push_back(probe);
-	children.push_back(owner);
+	if (streaming_eager) {
+		children.push_back(owner);
+		children.push_back(probe);
+	} else {
+		children.push_back(probe);
+		children.push_back(owner);
+	}
 }
 
 PhysicalHashGroupJoin::PhysicalHashGroupJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op,
@@ -190,8 +198,9 @@ PhysicalHashGroupJoin::PhysicalHashGroupJoin(PhysicalPlan &physical_plan, Logica
     : PhysicalJoin(physical_plan, op, PhysicalOperatorType::HASH_GROUP_JOIN, JoinType::INNER, estimated_cardinality),
       output_columns(std::move(output_columns_p)), unmatched_policy(HashGroupJoinUnmatchedPolicy::EMPTY_AGGREGATE),
       routed(false), unique_owner(false), single_match(false), null_equal(true), static_mode(true),
-      parallel_owner_build(false), implementation(GroupJoinImplementation::MEMOIZING_HASH),
-      planned_execution_mode(GroupJoinExecutionMode::AUTO), perfect_range(0) {
+      streaming_eager(false), streaming_eager_raw(false), parallel_owner_build(false),
+      implementation(GroupJoinImplementation::MEMOIZING_HASH), planned_execution_mode(GroupJoinExecutionMode::AUTO),
+      perfect_range(0) {
 	for (auto &group : groups) {
 		output_group_types.push_back(group->GetReturnType());
 		output_group_names.push_back(group->GetName().GetIdentifierName());
@@ -271,10 +280,10 @@ public:
 			    context, BufferAllocator::Get(context), op.grouped_aggregate_data.group_types,
 			    CreateGlobalGroupJoinPayloadTypes(op), CreateGlobalGroupJoinAggregates(op),
 			    GroupedAggregateHashTable::InitialCapacity(), parallel_build ? GROUP_JOIN_LOCAL_RADIX_BITS : idx_t(0),
-			    op.null_equal ? TupleDataValidityType::CAN_HAVE_NULL_VALUES
-			                  : TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
+			    op.null_equal || op.streaming_eager ? TupleDataValidityType::CAN_HAVE_NULL_VALUES
+			                                        : TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 		}
-		if (!op.routed && op.unique_owner && !op.null_equal && !parallel_build) {
+		if (!op.streaming_eager && !op.routed && op.unique_owner && !op.null_equal && !parallel_build) {
 			hash_table->SkipLookups();
 			skipped_unique_build = true;
 			if ((op.implementation == GroupJoinImplementation::PERFECT_HASH ||
@@ -303,6 +312,7 @@ public:
 	vector<unique_ptr<BloomFilter>> bloom_filters;
 	vector<unique_ptr<PrefixRangeFilter>> prefix_range_filters;
 	unique_ptr<ColumnDataCollection> filter_keys;
+	vector<Value> unmatched_values;
 	bool external;
 	bool parallel_build;
 	bool skipped_unique_build = false;
@@ -336,6 +346,7 @@ public:
 		auto &sink = op.sink_state->Cast<HashGroupJoinGlobalSinkState>();
 		owner_keys.InitializeEmpty(op.grouped_aggregate_data.group_types);
 		owner_payload.InitializeEmpty(op.owner_payload_data.payload_types);
+		eager_payload.InitializeEmpty(op.eager_payload_types);
 		final_groups.InitializeEmpty(op.output_group_types);
 		if (op.filter_pushdown) {
 			local_filter_state = op.filter_pushdown->GetLocalState(*sink.global_filter_state);
@@ -369,6 +380,7 @@ public:
 
 	DataChunk owner_keys;
 	DataChunk owner_payload;
+	DataChunk eager_payload;
 	Vector addresses;
 	SelectionVector new_groups;
 	DataChunk final_groups;
@@ -391,6 +403,10 @@ unique_ptr<LocalSinkState> PhysicalHashGroupJoin::GetLocalSinkState(ExecutionCon
 	return make_uniq<HashGroupJoinLocalSinkState>(context, *this);
 }
 
+static idx_t SelectNonNullGroupJoinKeys(DataChunk &keys, vector<UnifiedVectorFormat> &formats, SelectionVector &result);
+static void CombineEagerGroupJoinStates(GroupedAggregateHashTable &target, AggregateHTUpdateState &update_state,
+                                        Vector &addresses, DataChunk &payload, idx_t aggregate_offset);
+
 SinkResultType PhysicalHashGroupJoin::Sink(ExecutionContext &context, DataChunk &chunk,
                                            OperatorSinkInput &input) const {
 	auto &global_state = input.global_state.Cast<HashGroupJoinGlobalSinkState>();
@@ -404,6 +420,59 @@ SinkResultType PhysicalHashGroupJoin::Sink(ExecutionContext &context, DataChunk 
 		local_state.owner_keys.data[key_idx].Reference(chunk.data[key_idx]);
 	}
 	local_state.owner_keys.CheckCardinality(chunk.size());
+	if (streaming_eager) {
+		if (filter_pushdown) {
+			D_ASSERT(local_state.local_filter_state);
+			filter_pushdown->Sink(local_state.owner_keys, *local_state.local_filter_state);
+			if (local_state.filter_keys) {
+				local_state.filter_keys->Append(local_state.owner_keys);
+			}
+		}
+		vector<UnifiedVectorFormat> key_formats(grouped_aggregate_data.group_types.size());
+		SelectionVector non_null_sel(STANDARD_VECTOR_SIZE);
+		auto sink_count = SelectNonNullGroupJoinKeys(local_state.owner_keys, key_formats, non_null_sel);
+		if (sink_count == 0) {
+			return SinkResultType::NEED_MORE_INPUT;
+		}
+		if (sink_count != chunk.size()) {
+			local_state.owner_keys.Slice(non_null_sel, sink_count);
+		}
+		auto &build_table = local_state.hash_table ? *local_state.hash_table : *global_state.hash_table;
+		auto new_group_count =
+		    build_table.FindOrCreateGroups(local_state.owner_keys, local_state.addresses, local_state.new_groups);
+		if (!streaming_eager_raw && new_group_count != sink_count) {
+			throw InternalException("Streaming eager HASH_GROUP_JOIN received duplicate grouped probe keys");
+		}
+		auto addresses = FlatVector::GetData<data_ptr_t>(local_state.addresses);
+		if (!streaming_eager_raw) {
+			for (idx_t new_idx = 0; new_idx < new_group_count; new_idx++) {
+				auto row_idx = local_state.new_groups.get_index_unsafe(new_idx);
+				auto group_id = global_state.group_addresses.size();
+				StoreGroupJoinId(build_table.GetLayout(), addresses[row_idx], group_id);
+				global_state.group_addresses.push_back(addresses[row_idx]);
+			}
+		}
+		local_state.eager_payload.Reset();
+		for (idx_t payload_idx = 0; payload_idx < eager_payload_types.size(); payload_idx++) {
+			if (sink_count == chunk.size()) {
+				local_state.eager_payload.data[payload_idx].Reference(chunk.data[key_count + payload_idx]);
+			} else {
+				local_state.eager_payload.data[payload_idx].Slice(chunk.data[key_count + payload_idx], non_null_sel,
+				                                                  sink_count);
+			}
+		}
+		local_state.eager_payload.SetChildCardinality(sink_count);
+		if (streaming_eager_raw) {
+			build_table.UpdateAggregatesAtAddressesRange(
+			    *local_state.update_state, local_state.addresses, local_state.eager_payload,
+			    GetHashGroupJoinAggregateOffset(*this), grouped_aggregate_data.aggregates.size(), non_distinct_filter);
+		} else {
+			CombineEagerGroupJoinStates(build_table, *local_state.update_state, local_state.addresses,
+			                            local_state.eager_payload, GetHashGroupJoinAggregateOffset(*this));
+		}
+		local_state.owner_rows += sink_count;
+		return SinkResultType::NEED_MORE_INPUT;
+	}
 	if (filter_pushdown) {
 		D_ASSERT(local_state.local_filter_state);
 		filter_pushdown->Sink(local_state.owner_keys, *local_state.local_filter_state);
@@ -616,6 +685,23 @@ static void BuildGroupJoinRuntimeFilters(const PhysicalHashGroupJoin &op, Client
 	state.filter_keys.reset();
 }
 
+static void FinalizeHashGroupJoinRuntimeFilters(const PhysicalHashGroupJoin &op, ClientContext &context,
+                                                HashGroupJoinGlobalSinkState &state) {
+	if (!op.filter_pushdown) {
+		return;
+	}
+	D_ASSERT(state.global_filter_state);
+	vector<string> key_names;
+	for (auto &group : op.grouped_aggregate_data.groups) {
+		key_names.push_back(group->GetName().GetIdentifierName());
+	}
+	auto final_min_max = op.filter_pushdown->FinalizeMinMax(*state.global_filter_state);
+	BuildGroupJoinRuntimeFilters(op, context, state, *final_min_max);
+	op.filter_pushdown->FinalizeGroupJoinFilters(context, op, op.grouped_aggregate_data.group_types, key_names,
+	                                             state.bloom_filters, state.prefix_range_filters,
+	                                             std::move(final_min_max));
+}
+
 class HashGroupJoinBuildFinalizeTask : public ExecutorTask {
 public:
 	HashGroupJoinBuildFinalizeTask(shared_ptr<Event> event_p, ClientContext &context, const PhysicalHashGroupJoin &op_p,
@@ -705,18 +791,63 @@ SinkFinalizeType PhysicalHashGroupJoin::Finalize(Pipeline &pipeline, Event &even
 		}
 		state.hash_table->VerifyUniqueFinalize();
 	}
-	if (filter_pushdown) {
-		D_ASSERT(state.global_filter_state);
-		vector<string> key_names;
-		for (auto &group : grouped_aggregate_data.groups) {
-			key_names.push_back(group->GetName().GetIdentifierName());
+	if (streaming_eager) {
+		FinalizeHashGroupJoinRuntimeFilters(*this, context, state);
+		if (unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD && state.hash_table->Count() == 0) {
+			return SinkFinalizeType::NO_OUTPUT_POSSIBLE;
 		}
-		auto final_min_max = filter_pushdown->FinalizeMinMax(*state.global_filter_state);
-		BuildGroupJoinRuntimeFilters(*this, context, state, *final_min_max);
-		filter_pushdown->FinalizeGroupJoinFilters(context, *this, grouped_aggregate_data.group_types, key_names,
-		                                          state.bloom_filters, state.prefix_range_filters,
-		                                          std::move(final_min_max));
+		if (unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD) {
+			return SinkFinalizeType::READY;
+		}
+		DataChunk unmatched_keys;
+		unmatched_keys.Initialize(Allocator::Get(context), grouped_aggregate_data.group_types);
+		for (idx_t key_idx = 0; key_idx < grouped_aggregate_data.group_types.size(); key_idx++) {
+			unmatched_keys.data[key_idx].Reference(Value(grouped_aggregate_data.group_types[key_idx]), count_t(1));
+		}
+		unmatched_keys.SetChildCardinality(1);
+		Vector unmatched_addresses(LogicalType::POINTER);
+		SelectionVector new_groups(STANDARD_VECTOR_SIZE);
+		auto new_count = state.hash_table->FindOrCreateGroups(unmatched_keys, unmatched_addresses, new_groups);
+		if (new_count != 1) {
+			throw InternalException("Streaming eager HASH_GROUP_JOIN null sentinel collided with a build key");
+		}
+		auto unmatched_address = FlatVector::GetData<data_ptr_t>(unmatched_addresses)[0];
+		StoreGroupJoinId(state.hash_table->GetLayout(), unmatched_address, state.group_addresses.size());
+		if (unmatched_policy == HashGroupJoinUnmatchedPolicy::NULL_EXTENDED_ROW) {
+			ExpressionExecutor executor(context);
+			for (auto &expression : unmatched_payload_expressions) {
+				executor.AddExpression(*expression);
+			}
+			DataChunk null_probe;
+			null_probe.Initialize(Allocator::Get(context), unmatched_probe_types);
+			for (idx_t column_idx = 0; column_idx < unmatched_probe_types.size(); column_idx++) {
+				null_probe.data[column_idx].Reference(Value(unmatched_probe_types[column_idx]), count_t(1));
+			}
+			null_probe.SetChildCardinality(1);
+			DataChunk unmatched_payload;
+			unmatched_payload.Initialize(Allocator::Get(context), grouped_aggregate_data.payload_types);
+			executor.Execute(null_probe, unmatched_payload);
+			AggregateHTUpdateState update_state(*state.hash_table);
+			state.hash_table->UpdateAggregatesAtAddressesRange(
+			    update_state, unmatched_addresses, unmatched_payload, GetHashGroupJoinAggregateOffset(*this),
+			    grouped_aggregate_data.aggregates.size(), non_distinct_filter);
+		}
+		DataChunk unmatched_result;
+		unmatched_result.Initialize(Allocator::Get(context), GetTypes());
+		unmatched_result.SetChildCardinality(1);
+		ArenaAllocator arena(Allocator::Get(context));
+		RowOperationsState row_state(arena);
+		const auto user_aggregate_count = grouped_aggregate_data.aggregates.size() - 1;
+		RowOperations::FinalizeStatesRange(row_state, *state.hash_table->GetLayoutPtr(), unmatched_addresses,
+		                                   unmatched_result, output_groups.size(),
+		                                   GetHashGroupJoinAggregateOffset(*this) + 1, user_aggregate_count);
+		state.unmatched_values.reserve(user_aggregate_count);
+		for (idx_t aggregate_idx = 0; aggregate_idx < user_aggregate_count; aggregate_idx++) {
+			state.unmatched_values.push_back(unmatched_result.GetValue(output_groups.size() + aggregate_idx, 0));
+		}
+		return SinkFinalizeType::READY;
 	}
+	FinalizeHashGroupJoinRuntimeFilters(*this, context, state);
 	if (state.external) {
 		return state.owner_rows == 0 ? SinkFinalizeType::NO_OUTPUT_POSSIBLE : SinkFinalizeType::READY;
 	}
@@ -824,7 +955,9 @@ public:
 	    : non_null_sel(STANDARD_VECTOR_SIZE), found_sel(STANDARD_VECTOR_SIZE), matched_input_sel(STANDARD_VECTOR_SIZE),
 	      route_input_sel(STANDARD_VECTOR_SIZE), owner_sel(STANDARD_VECTOR_SIZE), local_sel(STANDARD_VECTOR_SIZE),
 	      matched_addresses(LogicalType::POINTER), routed_addresses(LogicalType::POINTER),
-	      owner_addresses(LogicalType::POINTER), key_formats(op.grouped_aggregate_data.group_types.size()) {
+	      owner_addresses(LogicalType::POINTER), streaming_addresses(LogicalType::POINTER),
+	      key_formats(op.grouped_aggregate_data.group_types.size()), finalize_arena(Allocator::Get(context.client)),
+	      finalize_state(finalize_arena) {
 		auto &global_state = op.op_state->Cast<HashGroupJoinGlobalOperatorState>();
 		auto &sink = op.sink_state->Cast<HashGroupJoinGlobalSinkState>();
 		execution_mode = global_state.execution_mode;
@@ -851,6 +984,11 @@ public:
 		payload.InitializeEmpty(payload_types);
 		routed_payload.InitializeEmpty(payload_types);
 		selected_payload.InitializeEmpty(payload_types);
+		vector<LogicalType> streaming_aggregate_types;
+		for (idx_t output_idx = op.output_groups.size(); output_idx < op.GetTypes().size(); output_idx++) {
+			streaming_aggregate_types.push_back(op.GetTypes()[output_idx]);
+		}
+		streaming_aggregate_results.Initialize(Allocator::Get(context.client), streaming_aggregate_types);
 		group_ids.Initialize(Allocator::Get(context.client), {LogicalType::UBIGINT});
 		selected_group_ids.InitializeEmpty({LogicalType::UBIGINT});
 		auto aggregate_objects = CreateLocalGroupJoinAggregates(op);
@@ -905,6 +1043,7 @@ public:
 	DataChunk payload;
 	DataChunk routed_payload;
 	DataChunk selected_payload;
+	DataChunk streaming_aggregate_results;
 	DataChunk group_ids;
 	DataChunk selected_group_ids;
 	SelectionVector non_null_sel;
@@ -913,6 +1052,7 @@ public:
 	SelectionVector route_input_sel;
 	SelectionVector owner_sel;
 	SelectionVector local_sel;
+	SelectionVector streaming_output_sel {STANDARD_VECTOR_SIZE};
 	vector<uint64_t> acquired_groups;
 	Vector matched_addresses;
 	Vector lookup_group_ids {LogicalType::UBIGINT};
@@ -922,6 +1062,7 @@ public:
 	Vector selected_hashes {LogicalType::HASH};
 	Vector routed_addresses;
 	Vector owner_addresses;
+	Vector streaming_addresses;
 	Vector local_addresses {LogicalType::POINTER};
 	SelectionVector local_new_groups {STANDARD_VECTOR_SIZE};
 	AggregateHTLookupState lookup_state;
@@ -941,6 +1082,8 @@ public:
 	Vector partition_hashes {LogicalType::HASH};
 	shared_ptr<PartitionedColumnData> probe_partition;
 	shared_ptr<PartitionedColumnDataAppendState> probe_append_state;
+	ArenaAllocator finalize_arena;
+	RowOperationsState finalize_state;
 };
 
 unique_ptr<OperatorState> PhysicalHashGroupJoin::GetOperatorState(ExecutionContext &context) const {
@@ -1157,11 +1300,102 @@ static void SinkHashGroupJoinMatches(const PhysicalHashGroupJoin &op, HashGroupJ
 	sink.matched_rows.fetch_add(match_count, std::memory_order_relaxed);
 }
 
+static OperatorResultType ExecuteStreamingEagerGroupJoin(const PhysicalHashGroupJoin &op, DataChunk &input,
+                                                         DataChunk &chunk, HashGroupJoinGlobalSinkState &sink,
+                                                         HashGroupJoinOperatorState &state) {
+	D_ASSERT(op.streaming_eager);
+	const auto key_count = op.grouped_aggregate_data.group_types.size();
+	state.probe_keys.Reset();
+	for (idx_t key_idx = 0; key_idx < key_count; key_idx++) {
+		state.probe_keys.data[key_idx].Reference(input.data[key_idx]);
+	}
+	state.probe_keys.CheckCardinality(input.size());
+	const auto non_null_count = SelectNonNullGroupJoinKeys(state.probe_keys, state.key_formats, state.non_null_sel);
+	state.lookup_keys.Reset();
+	if (non_null_count == input.size()) {
+		state.lookup_keys.Reference(state.probe_keys);
+	} else if (non_null_count != 0) {
+		state.lookup_keys.Slice(state.probe_keys, state.non_null_sel, non_null_count);
+	}
+	idx_t match_count = 0;
+	if (non_null_count != 0) {
+		match_count = sink.hash_table->LookupGroups(state.lookup_keys, state.lookup_state, state.found_sel);
+	}
+	const auto output_count = op.unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD ? match_count : input.size();
+	if (output_count == 0) {
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
+
+	state.streaming_addresses.SetVectorType(VectorType::FLAT_VECTOR);
+	auto output_addresses = FlatVector::GetDataMutable<data_ptr_t>(state.streaming_addresses);
+	auto lookup_addresses = FlatVector::GetData<data_ptr_t>(state.lookup_state.addresses);
+	for (idx_t match_idx = 0; match_idx < match_count; match_idx++) {
+		auto lookup_idx = state.found_sel.get_index_unsafe(match_idx);
+		auto input_idx = non_null_count == input.size() ? lookup_idx : state.non_null_sel.get_index_unsafe(lookup_idx);
+		state.streaming_output_sel.set_index(match_idx, input_idx);
+		output_addresses[match_idx] = lookup_addresses[lookup_idx];
+	}
+	FlatVector::SetSize(state.streaming_addresses, match_count);
+
+	chunk.Reset();
+	for (idx_t group_idx = 0; group_idx < op.output_groups.size(); group_idx++) {
+		auto &output = op.output_groups[group_idx];
+		idx_t input_idx;
+		switch (output.source) {
+		case HashGroupJoinOutputSource::KEY:
+			input_idx = output.index;
+			break;
+		case HashGroupJoinOutputSource::OWNER_PAYLOAD:
+			input_idx = key_count + output.index;
+			break;
+		default:
+			throw InternalException("Streaming eager HASH_GROUP_JOIN encountered a non-owner output group");
+		}
+		if (op.unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD && match_count != input.size()) {
+			chunk.data[group_idx].Slice(input.data[input_idx], state.streaming_output_sel, match_count);
+		} else {
+			chunk.data[group_idx].Reference(input.data[input_idx]);
+		}
+	}
+	chunk.SetChildCardinality(output_count);
+	const auto user_aggregate_count = op.grouped_aggregate_data.aggregates.size() - 1;
+	if (op.unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD || match_count == output_count) {
+		RowOperations::FinalizeStatesRange(state.finalize_state, *sink.hash_table->GetLayoutPtr(),
+		                                   state.streaming_addresses, chunk, op.output_groups.size(),
+		                                   GetHashGroupJoinAggregateOffset(op) + 1, user_aggregate_count);
+	} else {
+		if (sink.unmatched_values.size() != user_aggregate_count) {
+			throw InternalException("Streaming eager HASH_GROUP_JOIN has incomplete unmatched aggregate values");
+		}
+		state.streaming_aggregate_results.Reset();
+		state.streaming_aggregate_results.SetChildCardinality(match_count);
+		if (match_count != 0) {
+			RowOperations::FinalizeStatesRange(state.finalize_state, *sink.hash_table->GetLayoutPtr(),
+			                                   state.streaming_addresses, state.streaming_aggregate_results, 0,
+			                                   GetHashGroupJoinAggregateOffset(op) + 1, user_aggregate_count);
+		}
+		for (idx_t aggregate_idx = 0; aggregate_idx < user_aggregate_count; aggregate_idx++) {
+			auto output_idx = op.output_groups.size() + aggregate_idx;
+			chunk.data[output_idx].Reference(sink.unmatched_values[aggregate_idx], count_t(output_count));
+			chunk.data[output_idx].Flatten();
+			for (idx_t match_idx = 0; match_idx < match_count; match_idx++) {
+				auto output_row = state.streaming_output_sel.get_index_unsafe(match_idx);
+				chunk.data[output_idx].SetValue(output_row,
+				                                state.streaming_aggregate_results.GetValue(aggregate_idx, match_idx));
+			}
+		}
+	}
+	return OperatorResultType::NEED_MORE_INPUT;
+}
+
 OperatorResultType PhysicalHashGroupJoin::ExecuteInternal(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
                                                           GlobalOperatorState &gstate, OperatorState &state_p) const {
 	auto &sink = sink_state->Cast<HashGroupJoinGlobalSinkState>();
 	auto &state = state_p.Cast<HashGroupJoinOperatorState>();
 	D_ASSERT(sink.build_finalized);
+	if (streaming_eager) {
+		return ExecuteStreamingEagerGroupJoin(*this, input, chunk, sink, state);
+	}
 	chunk.Reset();
 	sink.probe_rows.fetch_add(input.size(), std::memory_order_relaxed);
 
@@ -2724,9 +2958,15 @@ InsertionOrderPreservingMap<string> PhysicalHashGroupJoin::ParamsToString() cons
 		result["Unmatched Policy"] = "NULL_EXTENDED_ROW";
 		break;
 	}
-	result["Build Side"] = "OWNER";
-	result["Owner Build"] = parallel_owner_build ? "PARALLEL" : "SERIAL";
+	result["Build Side"] = streaming_eager ? "GROUPED_PROBE" : "OWNER";
+	if (!streaming_eager) {
+		result["Owner Build"] = parallel_owner_build ? "PARALLEL" : "SERIAL";
+	}
 	result["Implementation"] = EnumUtil::ToString(implementation);
+	result["Pipeline"] = streaming_eager ? "STREAMING_OWNER" : "MATERIALIZED_OWNER";
+	if (streaming_eager) {
+		result["Probe Aggregation"] = streaming_eager_raw ? "INLINE" : "EXPORTED_STATE";
+	}
 	string groups;
 	for (idx_t group_idx = 0; group_idx < output_group_names.size(); group_idx++) {
 		if (group_idx > 0) {

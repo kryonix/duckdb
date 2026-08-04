@@ -1,0 +1,95 @@
+# name: test/sql/aggregate/group/test_factorized_group_join_compressed.test
+# description: Factorized GroupJoin on compressed factor and driver keys
+# group: [group]
+
+load {TEST_DIR}/factorized_group_join_compressed.db
+
+statement ok
+SET threads = 1
+
+statement ok
+SET debug_group_join_strategy = 'factorized'
+
+# Dictionary factor keys exercise compressed eager grouping. The non-unique driver and ordered aggregate keep
+# one branch in the factor-reference path, so its driver probe also consumes the storage dictionary directly.
+statement ok
+PRAGMA force_compression = 'dictionary'
+
+statement ok
+CREATE TABLE dict_driver(id INTEGER, k VARCHAR)
+
+statement ok
+INSERT INTO dict_driver
+SELECT i, CASE i % 4 WHEN 0 THEN 'A' WHEN 1 THEN 'B' WHEN 2 THEN 'C' ELSE 'D' END
+FROM range(5000) t(i)
+
+statement ok
+CREATE TABLE dict_left(k VARCHAR, x INTEGER)
+
+statement ok
+INSERT INTO dict_left
+SELECT CASE i % 4 WHEN 0 THEN 'A' WHEN 1 THEN 'B' WHEN 2 THEN 'C' ELSE 'D' END, i
+FROM range(400) t(i)
+
+statement ok
+CREATE TABLE dict_right(k VARCHAR, y INTEGER)
+
+statement ok
+INSERT INTO dict_right VALUES ('A', 10), ('B', 20), ('C', 30), ('D', 40)
+
+statement ok
+CHECKPOINT
+
+query II
+EXPLAIN SELECT d.id, count(*), list(l.x ORDER BY l.x), sum(r.y)
+FROM dict_driver d JOIN dict_left l USING (k) JOIN dict_right r USING (k)
+GROUP BY d.k, d.id
+----
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*Driver: NON_UNIQUE.*Routing: ROUTED.*
+
+query II
+SELECT count(*), sum(n) FROM (
+	SELECT d.id, count(*) AS n, list(l.x ORDER BY l.x), sum(r.y)
+	FROM dict_driver d JOIN dict_left l USING (k) JOIN dict_right r USING (k)
+	GROUP BY d.k, d.id
+)
+----
+5000	500000
+
+# RLE emits constant vectors for complete runs. This covers both constant eager grouping and factor-reference probes.
+statement ok
+PRAGMA force_compression = 'rle'
+
+statement ok
+CREATE TABLE rle_driver AS SELECT i::INTEGER AS id, 1::INTEGER AS k FROM range(5000) t(i)
+
+statement ok
+CREATE TABLE rle_left AS SELECT 1::INTEGER AS k, i::INTEGER AS x FROM range(100) t(i)
+
+statement ok
+CREATE TABLE rle_right AS SELECT 1::INTEGER AS k, i::INTEGER AS y FROM range(3) t(i)
+
+statement ok
+CHECKPOINT
+
+query II
+EXPLAIN SELECT d.id, count(*), list(l.x ORDER BY l.x), sum(r.y)
+FROM rle_driver d JOIN rle_left l USING (k) JOIN rle_right r USING (k)
+GROUP BY d.k, d.id
+----
+physical_plan	<REGEX>:(?s).*Factorized Group Join.*Driver: NON_UNIQUE.*Routing: ROUTED.*
+
+query II
+SELECT count(*), sum(n) FROM (
+	SELECT d.id, count(*) AS n, list(l.x ORDER BY l.x), sum(r.y)
+	FROM rle_driver d JOIN rle_left l USING (k) JOIN rle_right r USING (k)
+	GROUP BY d.k, d.id
+)
+----
+5000	1500000
+
+statement ok
+RESET debug_group_join_strategy
+
+statement ok
+RESET force_compression

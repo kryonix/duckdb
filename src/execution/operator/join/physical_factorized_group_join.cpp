@@ -156,8 +156,11 @@ PhysicalFactorizedGroupJoin::PhysicalFactorizedGroupJoin(
 	estimated_spill_cost = logical_group_join.factorized_spill_cost;
 	estimated_factorized_cost = logical_group_join.factorized_cost;
 	estimated_best_existing_cost = logical_group_join.factorized_best_existing_cost;
+	estimated_driver_first_cost = logical_group_join.factorized_driver_first_cost;
+	estimated_factors_first_cost = logical_group_join.factorized_factors_first_cost;
 	estimated_cost_reliable = logical_group_join.factorized_cost_reliable;
 	auto_selected = logical_group_join.factorized_auto_selected;
+	driver_first = logical_group_join.factorized_driver_first;
 	if (aggregates.size() != aggregate_sources.size()) {
 		throw InternalException("Factorized GroupJoin aggregate source count does not match aggregate count");
 	}
@@ -367,8 +370,7 @@ public:
 	                        vector<LogicalType> key_types_p, vector<LogicalType> payload_types_p, bool preaggregate,
 	                        vector<AggregateObject> preaggregate_objects)
 	    : context(context_p), key_types(std::move(key_types_p)), payload_types(std::move(payload_types_p)),
-	      key_formats(key_types.size()), addresses(LogicalType::POINTER), new_groups(STANDARD_VECTOR_SIZE),
-	      selected_rows(STANDARD_VECTOR_SIZE) {
+	      key_formats(key_types.size()), selected_rows(STANDARD_VECTOR_SIZE) {
 		preaggregated = preaggregate;
 		if (!preaggregated) {
 			vector<LogicalType> layout_types(key_types);
@@ -395,26 +397,14 @@ public:
 		aggregates.push_back(CreateFactorizedGroupJoinIdAggregate());
 		aggregates.push_back(CreateFactorizedCountAggregate());
 		if (preaggregated) {
-			vector<AggregateObject> update_objects;
-			update_objects.reserve(preaggregate_objects.size() + 1);
-			update_objects.push_back(CreateFactorizedCountAggregate());
 			for (auto &aggregate : preaggregate_objects) {
-				update_objects.push_back(aggregate);
 				aggregates.push_back(aggregate);
 			}
-			preaggregate_filter_set.Initialize(context, update_objects, payload_types);
-			for (idx_t aggregate_idx = 0; aggregate_idx < update_objects.size(); aggregate_idx++) {
-				if (update_objects[aggregate_idx].aggr_type != AggregateType::DISTINCT) {
-					preaggregate_filter.push_back(aggregate_idx);
-				}
-			}
-			preaggregate_count = update_objects.size();
 		}
 		directory = make_uniq<GroupedAggregateHashTable>(
 		    context, BufferAllocator::Get(context), key_types, preaggregated ? payload_types : vector<LogicalType> {},
 		    std::move(aggregates), GroupedAggregateHashTable::InitialCapacity(), idx_t(0),
 		    TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
-		update_state = make_uniq<AggregateHTUpdateState>(*directory);
 		selected_keys.InitializeEmpty(key_types);
 		selected_payload.InitializeEmpty(payload_types);
 		generation = next_generation.fetch_add(1, std::memory_order_relaxed);
@@ -448,11 +438,8 @@ public:
 				selected_payload.Slice(payload, selected_rows, non_null_count);
 			}
 		}
-		directory->FindOrCreateGroups(selected_keys, addresses, new_groups);
+		directory->AddChunk(selected_keys, selected_payload, AggregateType::NON_DISTINCT);
 		row_count += non_null_count;
-		directory->UpdateAggregatesAtAddressesRangeWithFilterSet(*update_state, addresses, selected_payload, 1,
-		                                                         preaggregate_count, preaggregate_filter,
-		                                                         preaggregate_filter_set);
 	}
 
 	void Merge(FactorizedJoinHashTable &local) {
@@ -707,21 +694,15 @@ private:
 	unique_ptr<JoinHashTable> join_table;
 	PartitionedTupleDataAppendState join_append_state;
 	unique_ptr<GroupedAggregateHashTable> directory;
-	unique_ptr<AggregateHTUpdateState> update_state;
 	vector<UnifiedVectorFormat> key_formats;
 	DataChunk selected_keys;
 	DataChunk selected_payload;
-	Vector addresses;
-	SelectionVector new_groups;
 	SelectionVector selected_rows;
 	vector<idx_t> factor_offsets;
 	vector<data_ptr_t> factor_rows;
 	vector<data_ptr_t> factor_addresses;
-	AggregateFilterDataSet preaggregate_filter_set;
-	unsafe_vector<idx_t> preaggregate_filter;
 	idx_t factor_count = 0;
 	idx_t row_count = 0;
-	idx_t preaggregate_count = 0;
 	idx_t generation;
 	bool preaggregated = false;
 	bool append_finalized = false;
@@ -959,7 +940,11 @@ public:
 	FactorizedGroupJoinGlobalSinkState(const PhysicalFactorizedGroupJoin &op, ClientContext &context,
 	                                   idx_t source_idx_p)
 	    : source_idx(source_idx_p), external(UseExternalFactorizedGroupJoin(op, context)),
-	      direct_factor_updates(!external && op.unique_driver && !op.routed) {
+	      direct_factor_updates(!external && op.driver_first) {
+		if (source_idx == FactorizedSourceIndex(FactorizedAggregateSource::DRIVER)) {
+			runtime_branch_modes = op.branch_modes;
+			branch_mode_selected = {true, true};
+		}
 		if (source_idx == FactorizedSourceIndex(FactorizedAggregateSource::DRIVER) && direct_factor_updates) {
 			for (idx_t factor_idx = 0; factor_idx < driver_filter_states.size(); factor_idx++) {
 				if (!op.driver_filter_pushdown[factor_idx]) {
@@ -1023,6 +1008,8 @@ public:
 	unique_ptr<FactorizedJoinHashTable> factor_hash_table;
 	vector<data_ptr_t> group_addresses;
 	vector<vector<data_ptr_t>> routes;
+	vector<idx_t> route_offsets;
+	vector<data_ptr_t> route_addresses;
 	array<unique_ptr<atomic<idx_t>[]>, PhysicalFactorizedGroupJoin::SOURCE_COUNT - 1> owners;
 	vector<unique_ptr<GroupedAggregateHashTable>> local_tables;
 	vector<unique_ptr<DenseFactorizedAggregateTable>> local_dense_tables;
@@ -1237,7 +1224,7 @@ public:
 		if (!op.source_argument_types[source_idx].empty()) {
 			selected_arguments.Initialize(Allocator::Get(context.client), op.source_argument_types[source_idx]);
 		}
-		if (UseDenseFactorizedAggregateTables(op, context.client, driver_state.group_addresses.size())) {
+		if (!op.routed && UseDenseFactorizedAggregateTables(op, context.client, driver_state.group_addresses.size())) {
 			dense_table = make_uniq<DenseFactorizedAggregateTable>(context.client, driver_state.group_addresses.size(),
 			                                                       op.source_argument_types[source_idx],
 			                                                       std::move(source_aggregates));
@@ -2048,10 +2035,12 @@ SinkResultType PhysicalFactorizedGroupJoinSink::Sink(ExecutionContext &context, 
 		};
 		for (idx_t match_idx = 0; match_idx < found_count; match_idx++) {
 			auto route_id = NumericCast<idx_t>(route_ids[match_idx]);
-			if (route_id >= driver_state.routes.size()) {
+			if (route_id + 1 >= driver_state.route_offsets.size()) {
 				throw InternalException("Factorized GroupJoin lookup route exceeds route count");
 			}
-			for (auto target_address : driver_state.routes[route_id]) {
+			for (idx_t route_idx = driver_state.route_offsets[route_id];
+			     route_idx < driver_state.route_offsets[route_id + 1]; route_idx++) {
+				auto target_address = driver_state.route_addresses[route_idx];
 				routed_addresses[routed_count] = target_address;
 				routed_ids[routed_count] = LoadFactorizedGroupJoinId(driver_state.target->GetLayout(), target_address);
 				state.routed_input.set_index(routed_count, match_idx);
@@ -2113,10 +2102,12 @@ static void MergeFactorizedLocalTable(const PhysicalFactorizedGroupJoin &op, idx
 			};
 			for (idx_t row_idx = 0; row_idx < group_ids.size(); row_idx++) {
 				auto route_id = NumericCast<idx_t>(ids[row_idx]);
-				if (route_id >= driver_state.routes.size()) {
+				if (route_id + 1 >= driver_state.route_offsets.size()) {
 					throw InternalException("Factorized GroupJoin cached route exceeds route count");
 				}
-				for (auto target_address : driver_state.routes[route_id]) {
+				for (idx_t route_idx = driver_state.route_offsets[route_id];
+				     route_idx < driver_state.route_offsets[route_id + 1]; route_idx++) {
+					auto target_address = driver_state.route_addresses[route_idx];
 					routed_sources[routed_count] = sources[row_idx];
 					routed_targets[routed_count] = target_address;
 					if (++routed_count == STANDARD_VECTOR_SIZE) {
@@ -2221,10 +2212,12 @@ static void MergeFactorizedDistinct(const PhysicalFactorizedGroupJoin &op, idx_t
 				};
 				for (idx_t row_idx = 0; row_idx < distinct_rows.size(); row_idx++) {
 					auto route_id = NumericCast<idx_t>(ids[row_idx]);
-					if (route_id >= driver_state.routes.size()) {
+					if (route_id + 1 >= driver_state.route_offsets.size()) {
 						throw InternalException("Factorized GroupJoin distinct route exceeds route count");
 					}
-					for (auto target_address : driver_state.routes[route_id]) {
+					for (idx_t route_idx = driver_state.route_offsets[route_id];
+					     route_idx < driver_state.route_offsets[route_id + 1]; route_idx++) {
+						auto target_address = driver_state.route_addresses[route_idx];
 						targets[routed_count] = target_address;
 						routed_input.set_index(routed_count, row_idx);
 						if (++routed_count == STANDARD_VECTOR_SIZE) {
@@ -2571,6 +2564,15 @@ SinkFinalizeType PhysicalFactorizedGroupJoinSink::Finalize(Pipeline &, Event &, 
 				throw InternalException("Factorized GroupJoin did not publish every driver group address");
 			}
 		}
+		if (op.routed) {
+			global_state.route_offsets.reserve(global_state.routes.size() + 1);
+			for (auto &route : global_state.routes) {
+				global_state.route_offsets.push_back(global_state.route_addresses.size());
+				global_state.route_addresses.insert(global_state.route_addresses.end(), route.begin(), route.end());
+			}
+			global_state.route_offsets.push_back(global_state.route_addresses.size());
+			vector<vector<data_ptr_t>>().swap(global_state.routes);
+		}
 		MergeFactorizedDistinct(op, source_idx, global_state, global_state, context);
 		if (!global_state.direct_factor_updates) {
 			MergeFactorizedDistinct(op, FactorizedSourceIndex(FactorizedAggregateSource::LEFT_FACTOR), global_state,
@@ -2626,8 +2628,7 @@ void PhysicalFactorizedGroupJoin::BuildPipelines(Pipeline &current, MetaPipeline
 	left_sink->sink_state.reset();
 	right_sink->sink_state.reset();
 	meta_pipeline.GetState().SetPipelineSource(current, *this);
-	const auto direct_factor_updates =
-	    unique_driver && !routed && planned_execution_mode != GroupJoinExecutionMode::EXTERNAL;
+	const auto direct_factor_updates = driver_first && planned_execution_mode != GroupJoinExecutionMode::EXTERNAL;
 	if (direct_factor_updates) {
 		auto &driver_meta = meta_pipeline.CreateChildMetaPipeline(current, *driver_sink, MetaPipelineType::REGULAR);
 		driver_meta.Build(driver_sink->children[0]);
@@ -3869,8 +3870,9 @@ InsertionOrderPreservingMap<string> PhysicalFactorizedGroupJoin::ParamsToString(
 	result["Aggregates"] = StringUtil::Join(aggregate_names, "\n");
 	result["Execution"] = planned_execution_mode == GroupJoinExecutionMode::EXTERNAL
 	                          ? "common-radix external partitions"
-	                      : unique_driver && !routed ? "driver-first target + task-local dense factor states"
-	                                                 : "factors-first adaptive linear-chain directories";
+	                      : !driver_first ? "factors-first adaptive linear-chain directories"
+	                      : routed        ? "driver-first target + compact routed factor updates"
+	                                      : "driver-first target + task-local dense factor states";
 	result["Strategy"] = EnumUtil::ToString(planned_execution_mode);
 	result["Driver"] = unique_driver ? "UNIQUE" : "NON_UNIQUE";
 	result["Routing"] = routed ? "ROUTED" : "DIRECT";
@@ -3887,10 +3889,10 @@ InsertionOrderPreservingMap<string> PhysicalFactorizedGroupJoin::ParamsToString(
 	    estimated_right_scan_rows, estimated_join_rows, estimated_matched_drivers);
 	result["Estimated Costs"] = StringUtil::Format(
 	    "build=%.2f, filter=%.2f, probe=%.2f, scan=%.2f, cache=%.2f, eager=%.2f, routing=%.2f, spill=%.2f, "
-	    "total=%.2f, best existing=%.2f",
+	    "driver-first=%.2f, factors-first=%.2f, total=%.2f, best existing=%.2f",
 	    estimated_build_cost, estimated_filter_cost, estimated_probe_cost, estimated_scan_cost, estimated_cache_cost,
-	    estimated_eager_work_cost, estimated_routing_cost, estimated_spill_cost, estimated_factorized_cost,
-	    estimated_best_existing_cost);
+	    estimated_eager_work_cost, estimated_routing_cost, estimated_spill_cost, estimated_driver_first_cost,
+	    estimated_factors_first_cost, estimated_factorized_cost, estimated_best_existing_cost);
 	result["Decision"] = auto_selected             ? "AUTO SELECTED"
 	                     : estimated_cost_reliable ? "FORCED (AUTO COST AVAILABLE)"
 	                                               : "FORCED (UNRELIABLE STATISTICS)";

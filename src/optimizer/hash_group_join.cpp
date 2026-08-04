@@ -925,11 +925,14 @@ struct FactorizedGroupJoinCostEstimate {
 	double routing_cost = 0;
 	double spill_cost = 0;
 	double factorized_cost = 0;
+	double driver_first_cost = 0;
+	double factors_first_cost = 0;
 	double separate_cost = 0;
 	double eager_cost = 0;
 	double best_existing_cost = 0;
 	bool reliable = false;
 	bool selected = false;
+	bool driver_first = true;
 };
 
 static constexpr double FACTORIZED_MIN_CACHE_AMORTIZATION_RATIO = 64.0;
@@ -1613,12 +1616,6 @@ static FactorizedGroupJoinCostEstimate EstimateFactorizedGroupJoinCost(LogicalAg
 	idx_t perfect_range;
 	const auto exact_driver_filter = TryGetFactorizedPerfectGroupJoinBounds(
 	    aggregate, inputs.driver, candidate, context, perfect_min, perfect_max, perfect_range);
-	result.reliable = direct_driver_edge && inner_edges && candidate.unique_driver && !candidate.routed &&
-	                  exact_driver_filter && aggregates_supported && inputs.driver.has_estimated_cardinality &&
-	                  inputs.left_factor.has_estimated_cardinality && inputs.right_factor.has_estimated_cardinality &&
-	                  inputs.nested_join.has_estimated_cardinality && inputs.top_join.has_estimated_cardinality &&
-	                  aggregate.has_estimated_cardinality;
-
 	if (direct_driver_edge) {
 		result.left_scan_rows = MinValue(result.left_rows, inputs.nested_join.estimated_cardinality);
 		const auto left_fanout = static_cast<double>(result.left_scan_rows) /
@@ -1631,6 +1628,15 @@ static FactorizedGroupJoinCostEstimate EstimateFactorizedGroupJoinCost(LogicalAg
 		result.left_scan_rows = result.left_rows;
 		result.right_scan_rows = result.right_rows;
 	}
+	const auto factor_rows = static_cast<double>(result.left_rows) + static_cast<double>(result.right_rows);
+	const auto scan_rows = static_cast<double>(result.left_scan_rows) + static_cast<double>(result.right_scan_rows);
+	const auto selective_driver =
+	    static_cast<double>(result.driver_rows) <= factor_rows / 10.0 && scan_rows <= factor_rows / 4.0;
+	result.reliable = direct_driver_edge && inner_edges && (exact_driver_filter || selective_driver) &&
+	                  aggregates_supported && inputs.driver.has_estimated_cardinality &&
+	                  inputs.left_factor.has_estimated_cardinality && inputs.right_factor.has_estimated_cardinality &&
+	                  inputs.nested_join.has_estimated_cardinality && inputs.top_join.has_estimated_cardinality &&
+	                  aggregate.has_estimated_cardinality;
 
 	const auto key_cost = MaxValue<double>(static_cast<double>(key_width) / 8.0, 1.0);
 	array<double, 3> state_costs;
@@ -1649,6 +1655,7 @@ static FactorizedGroupJoinCostEstimate EstimateFactorizedGroupJoinCost(LogicalAg
 	const auto thread_count = MaxValue<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads(), 1);
 	result.cache_cost =
 	    static_cast<double>(result.driver_rows) * static_cast<double>(thread_count) * (state_costs[1] + state_costs[2]);
+	const auto direct_state_cost = result.cache_cost;
 	const auto minimum_amortized_factor_rows =
 	    static_cast<double>(result.driver_rows) * FACTORIZED_MIN_CACHE_AMORTIZATION_RATIO;
 	const auto cached_factor_rows = static_cast<double>(result.driver_rows) * FACTORIZED_MAX_CACHE_FACTOR_DRIVER_RATIO;
@@ -1667,20 +1674,33 @@ static FactorizedGroupJoinCostEstimate EstimateFactorizedGroupJoinCost(LogicalAg
 	if (candidate.routed) {
 		result.routing_cost = static_cast<double>(result.driver_rows + result.matched_drivers) * (key_cost + 2.0);
 	}
-	result.factorized_cost = result.build_cost + result.filter_cost + result.probe_cost + result.scan_cost +
-	                         result.cache_cost + result.eager_work_cost + result.routing_cost;
+	result.driver_first_cost = result.build_cost + result.filter_cost + result.probe_cost + result.scan_cost +
+	                           direct_state_cost + result.routing_cost;
+	const auto retained_factor_rows =
+	    static_cast<double>(result.left_scan_rows) + static_cast<double>(result.right_scan_rows);
+	const auto factor_row_count = static_cast<double>(result.left_rows) + static_cast<double>(result.right_rows);
+	if (retained_factor_rows > factor_row_count / 4.0) {
+		result.driver_first_cost += (retained_factor_rows - factor_row_count / 4.0) * 1.5;
+	}
+	result.factors_first_cost = result.build_cost + result.filter_cost + result.probe_cost + result.scan_cost +
+	                            result.cache_cost + result.eager_work_cost + result.routing_cost;
 
 	const auto intermediate_rows =
 	    direct_driver_edge ? inputs.nested_join.estimated_cardinality : result.left_rows + result.right_rows;
 	const auto total_payload_cost = payload_costs[0] + payload_costs[1] + payload_costs[2];
 	const auto total_state_cost = state_costs[0] + state_costs[1] + state_costs[2];
-	result.separate_cost = static_cast<double>(result.driver_rows + result.left_rows + result.right_rows) * key_cost +
+	const auto separate_factor_rows = direct_driver_edge
+	                                      ? static_cast<double>(result.left_scan_rows) + result.right_scan_rows
+	                                      : static_cast<double>(result.left_rows) + result.right_rows;
+	result.separate_cost = (static_cast<double>(result.driver_rows) + separate_factor_rows) * key_cost +
 	                       static_cast<double>(intermediate_rows) * (key_cost + 1.0) +
 	                       static_cast<double>(result.join_rows) * (total_payload_cost + total_state_cost + 2.0);
 	result.eager_cost = static_cast<double>(result.left_rows) * (key_cost + payload_costs[1] + state_costs[1] + 1.0) +
 	                    static_cast<double>(result.right_rows) * (key_cost + payload_costs[2] + state_costs[2] + 1.0) +
 	                    result.build_cost + static_cast<double>(result.matched_drivers) * (key_cost + 1.0);
 	result.best_existing_cost = MinValue(result.separate_cost, result.eager_cost);
+	result.driver_first = result.driver_first_cost <= result.factors_first_cost;
+	result.factorized_cost = MinValue(result.driver_first_cost, result.factors_first_cost);
 
 	idx_t estimated_memory_rows = 0;
 	idx_t estimated_memory = 0;
@@ -1711,8 +1731,7 @@ bool HasPotentialFactorizedGroupJoinCandidate(LogicalAggregate &aggregate, Clien
 	array<idx_t, 3> payload_widths;
 	const auto inner_edges =
 	    inputs.nested_join.join_type == JoinType::INNER && inputs.top_join.join_type == JoinType::INNER;
-	if (candidate->driver_child == DConstants::INVALID_INDEX || !inner_edges || !candidate->unique_driver ||
-	    candidate->routed ||
+	if (candidate->driver_child == DConstants::INVALID_INDEX || !inner_edges ||
 	    !AutoFactorizedGroupJoinAggregatesSupported(aggregate, *candidate, state_widths, payload_widths)) {
 		return false;
 	}
@@ -1723,6 +1742,12 @@ bool HasPotentialFactorizedGroupJoinCandidate(LogicalAggregate &aggregate, Clien
 	const auto factor_rows = static_cast<double>(inputs.left_factor.EstimateCardinality(context)) +
 	                         static_cast<double>(inputs.right_factor.EstimateCardinality(context));
 	const auto factor_driver_ratio = factor_rows / static_cast<double>(driver_rows);
+	if (factor_driver_ratio >= 10.0) {
+		return true;
+	}
+	if (!candidate->unique_driver || candidate->routed) {
+		return false;
+	}
 	return factor_driver_ratio >= FACTORIZED_MIN_CACHE_AMORTIZATION_RATIO &&
 	       factor_driver_ratio <= FACTORIZED_MAX_CACHE_FACTOR_DRIVER_RATIO;
 }
@@ -1809,22 +1834,22 @@ static unique_ptr<JoinFilterPushdownInfo> TakeFactorizedRuntimeFilter(LogicalCom
 	return std::move(join.filter_pushdown);
 }
 
-static unique_ptr<JoinFilterPushdownInfo> CreateFactorizedDriverRuntimeFilter(LogicalOperator &factor,
-                                                                              const vector<idx_t> &factor_keys,
-                                                                              const vector<LogicalType> &key_types,
-                                                                              ClientContext &context) {
-	if (factor_keys.size() != key_types.size()) {
-		throw InternalException("Factorized GroupJoin runtime-filter key counts differ");
+static unique_ptr<JoinFilterPushdownInfo> CreateGroupJoinRuntimeFilter(LogicalOperator &probe,
+                                                                       const vector<idx_t> &probe_keys,
+                                                                       const vector<LogicalType> &key_types,
+                                                                       ClientContext &context) {
+	if (probe_keys.size() != key_types.size()) {
+		throw InternalException("GroupJoin runtime-filter key counts differ");
 	}
-	auto bindings = factor.GetColumnBindings();
+	auto bindings = probe.GetColumnBindings();
 	auto result = make_uniq<JoinFilterPushdownInfo>();
 	vector<JoinFilterPushdownColumn> columns;
-	columns.reserve(factor_keys.size());
-	for (idx_t key_idx = 0; key_idx < factor_keys.size(); key_idx++) {
-		if (factor_keys[key_idx] >= bindings.size()) {
+	columns.reserve(probe_keys.size());
+	for (idx_t key_idx = 0; key_idx < probe_keys.size(); key_idx++) {
+		if (probe_keys[key_idx] >= bindings.size()) {
 			return nullptr;
 		}
-		BoundColumnRefExpression key_expression(key_types[key_idx], bindings[factor_keys[key_idx]]);
+		BoundColumnRefExpression key_expression(key_types[key_idx], bindings[probe_keys[key_idx]]);
 		JoinFilterPushdownColumn column;
 		if (!JoinFilterPushdownUtil::PushdownJoinFilterExpression(key_expression, column)) {
 			return nullptr;
@@ -1835,7 +1860,7 @@ static unique_ptr<JoinFilterPushdownInfo> CreateFactorizedDriverRuntimeFilter(Lo
 	}
 
 	vector<PushdownFilterTarget> targets;
-	JoinFilterPushdownOptimizer::GetPushdownFilterTargets(factor, std::move(columns), targets);
+	JoinFilterPushdownOptimizer::GetPushdownFilterTargets(probe, std::move(columns), targets);
 	for (auto &target : targets) {
 		auto &get = target.get;
 		if (!get.dynamic_filters) {
@@ -1940,7 +1965,8 @@ static void PlanFactorizedGroupJoin(unique_ptr<LogicalOperator> &root, LogicalAg
 	if (Settings::Get<DebugForceExternalSetting>(context) || configured_execution == GroupJoinExecutionMode::EXTERNAL) {
 		result->execution_mode = GroupJoinExecutionMode::EXTERNAL;
 	}
-	if (candidate.unique_driver && !candidate.routed && result->execution_mode != GroupJoinExecutionMode::EXTERNAL) {
+	result->factorized_driver_first = cost.driver_first;
+	if (result->factorized_driver_first && result->execution_mode != GroupJoinExecutionMode::EXTERNAL) {
 		vector<LogicalType> driver_key_types;
 		driver_key_types.reserve(result->factorized_driver_key_indices.size());
 		for (auto key_idx : result->factorized_driver_key_indices) {
@@ -1949,9 +1975,9 @@ static void PlanFactorizedGroupJoin(unique_ptr<LogicalOperator> &root, LogicalAg
 			}
 			driver_key_types.push_back(driver->types[key_idx]);
 		}
-		result->factorized_left_driver_filter_pushdown = CreateFactorizedDriverRuntimeFilter(
-		    *left_factor, result->factorized_left_key_indices, driver_key_types, context);
-		result->factorized_right_driver_filter_pushdown = CreateFactorizedDriverRuntimeFilter(
+		result->factorized_left_driver_filter_pushdown =
+		    CreateGroupJoinRuntimeFilter(*left_factor, result->factorized_left_key_indices, driver_key_types, context);
+		result->factorized_right_driver_filter_pushdown = CreateGroupJoinRuntimeFilter(
 		    *right_factor, result->factorized_right_key_indices, driver_key_types, context);
 	}
 	result->estimated_owner_rows = driver_rows;
@@ -1971,6 +1997,8 @@ static void PlanFactorizedGroupJoin(unique_ptr<LogicalOperator> &root, LogicalAg
 	result->factorized_spill_cost = cost.spill_cost;
 	result->factorized_cost = cost.factorized_cost;
 	result->factorized_best_existing_cost = cost.best_existing_cost;
+	result->factorized_driver_first_cost = cost.driver_first_cost;
+	result->factorized_factors_first_cost = cost.factors_first_cost;
 	result->factorized_cost_reliable = cost.reliable;
 	result->factorized_auto_selected = auto_selected;
 	if (candidate.driver_child != DConstants::INVALID_INDEX) {
@@ -2086,8 +2114,36 @@ void PlanHashGroupJoins(unique_ptr<LogicalOperator> &root, ClientContext &contex
 	result->perfect_cost = cost.perfect_cost;
 	result->memoizing_cost = cost.memoizing_cost;
 	result->index_cost = cost.index_cost;
-	if (candidate->owner_child == 1) {
+	const auto streaming_eager =
+	    result->implementation == GroupJoinImplementation::EAGER_HASH && result->unique_owner && !result->routed;
+	if (streaming_eager) {
+		if (result->unmatched_policy == HashGroupJoinUnmatchedPolicy::DISCARD) {
+			vector<LogicalType> probe_key_types;
+			probe_key_types.reserve(result->probe_key_indices.size());
+			auto &probe_types = join.children[candidate->probe_child]->types;
+			for (auto key_idx : result->probe_key_indices) {
+				if (key_idx >= probe_types.size()) {
+					throw InternalException("GroupJoin runtime-filter probe key is out of bounds");
+				}
+				probe_key_types.push_back(probe_types[key_idx]);
+			}
+			result->filter_pushdown = CreateGroupJoinRuntimeFilter(*join.children[candidate->owner_child],
+			                                                       result->owner_key_indices, probe_key_types, context);
+		}
+	} else if (candidate->owner_child == 1 && join.filter_pushdown) {
 		result->filter_pushdown = std::move(join.filter_pushdown);
+	} else {
+		vector<LogicalType> owner_key_types;
+		owner_key_types.reserve(result->owner_key_indices.size());
+		auto &owner_types = join.children[candidate->owner_child]->types;
+		for (auto key_idx : result->owner_key_indices) {
+			if (key_idx >= owner_types.size()) {
+				throw InternalException("GroupJoin runtime-filter owner key is out of bounds");
+			}
+			owner_key_types.push_back(owner_types[key_idx]);
+		}
+		result->filter_pushdown = CreateGroupJoinRuntimeFilter(*join.children[candidate->probe_child],
+		                                                       result->probe_key_indices, owner_key_types, context);
 	}
 	result->children = std::move(join.children);
 	root = std::move(result);

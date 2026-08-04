@@ -623,8 +623,16 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalGroupJoin &op) {
 	vector<LogicalType> eager_payload_types;
 	vector<LogicalType> unmatched_probe_types;
 	vector<unique_ptr<Expression>> unmatched_payload_expressions;
+	bool streaming_eager_raw = false;
 	reference<PhysicalOperator> group_join_probe = probe;
 	if (use_eager) {
+		streaming_eager_raw = candidate.unique_owner && !candidate.routed;
+		for (idx_t aggregate_idx = 1; aggregate_idx < aggregates.size(); aggregate_idx++) {
+			if (aggregates[aggregate_idx]->Cast<BoundAggregateExpression>().IsDistinct()) {
+				streaming_eager_raw = false;
+				break;
+			}
+		}
 		unmatched_probe_types = probe.get().GetTypes();
 		for (idx_t payload_idx = candidate.probe_key_indices.size(); payload_idx < probe_expressions.size();
 		     payload_idx++) {
@@ -633,44 +641,52 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalGroupJoin &op) {
 		auto &raw_projection = Make<PhysicalProjection>(std::move(probe_types), std::move(probe_expressions),
 		                                                probe.get().estimated_cardinality);
 		raw_projection.children.push_back(probe);
-
-		vector<unique_ptr<Expression>> eager_groups;
-		vector<unique_ptr<Expression>> eager_aggregates;
-		vector<LogicalType> eager_types;
-		for (idx_t key_idx = 0; key_idx < candidate.probe_key_indices.size(); key_idx++) {
-			auto type = raw_projection.GetTypes()[key_idx];
-			eager_groups.push_back(make_uniq<BoundReferenceExpression>(type, key_idx));
-			eager_types.push_back(type);
-		}
-		for (idx_t aggregate_idx = 1; aggregate_idx < aggregates.size(); aggregate_idx++) {
-			auto eager_aggregate =
-			    unique_ptr_cast<Expression, BoundAggregateExpression>(aggregates[aggregate_idx]->Copy());
-			if (eager_aggregate->GetFilter()) {
-				D_ASSERT(probe_filter_indices[aggregate_idx - 1].IsValid());
-				eager_aggregate->GetFilterMutable()->Cast<BoundReferenceExpression>().IndexMutable() =
-				    probe_filter_indices[aggregate_idx - 1].GetIndex();
+		if (streaming_eager_raw) {
+			for (idx_t payload_idx = candidate.probe_key_indices.size(); payload_idx < raw_projection.GetTypes().size();
+			     payload_idx++) {
+				eager_payload_types.push_back(raw_projection.GetTypes()[payload_idx]);
 			}
-			auto exported = ExportAggregateFunction::Bind(std::move(eager_aggregate));
-			eager_payload_types.push_back(exported->GetReturnType());
-			eager_types.push_back(exported->GetReturnType());
-			eager_aggregates.push_back(std::move(exported));
+			group_join_probe = raw_projection;
+		} else {
+			vector<unique_ptr<Expression>> eager_groups;
+			vector<unique_ptr<Expression>> eager_aggregates;
+			vector<LogicalType> eager_types;
+			for (idx_t key_idx = 0; key_idx < candidate.probe_key_indices.size(); key_idx++) {
+				auto type = raw_projection.GetTypes()[key_idx];
+				eager_groups.push_back(make_uniq<BoundReferenceExpression>(type, key_idx));
+				eager_types.push_back(type);
+			}
+			for (idx_t aggregate_idx = 1; aggregate_idx < aggregates.size(); aggregate_idx++) {
+				auto eager_aggregate =
+				    unique_ptr_cast<Expression, BoundAggregateExpression>(aggregates[aggregate_idx]->Copy());
+				if (eager_aggregate->GetFilter()) {
+					D_ASSERT(probe_filter_indices[aggregate_idx - 1].IsValid());
+					eager_aggregate->GetFilterMutable()->Cast<BoundReferenceExpression>().IndexMutable() =
+					    probe_filter_indices[aggregate_idx - 1].GetIndex();
+				}
+				auto exported = ExportAggregateFunction::Bind(std::move(eager_aggregate));
+				eager_payload_types.push_back(exported->GetReturnType());
+				eager_types.push_back(exported->GetReturnType());
+				eager_aggregates.push_back(std::move(exported));
+			}
+			auto eager_cardinality = op.estimated_distinct_probe_keys == 0 ? raw_projection.estimated_cardinality
+			                                                               : op.estimated_distinct_probe_keys;
+			auto &eager_aggregate =
+			    Make<PhysicalHashAggregate>(context, std::move(eager_types), std::move(eager_aggregates),
+			                                std::move(eager_groups), eager_cardinality);
+			eager_aggregate.children.push_back(raw_projection);
+			vector<LogicalType> eager_projection_types = eager_aggregate.GetTypes();
+			vector<unique_ptr<Expression>> eager_projection_expressions;
+			for (idx_t column_idx = 0; column_idx < eager_projection_types.size(); column_idx++) {
+				eager_projection_expressions.push_back(
+				    make_uniq<BoundReferenceExpression>(eager_projection_types[column_idx], column_idx));
+			}
+			auto &eager_projection =
+			    Make<PhysicalProjection>(std::move(eager_projection_types), std::move(eager_projection_expressions),
+			                             eager_aggregate.estimated_cardinality);
+			eager_projection.children.push_back(eager_aggregate);
+			group_join_probe = eager_projection;
 		}
-		auto eager_cardinality = op.estimated_distinct_probe_keys == 0 ? raw_projection.estimated_cardinality
-		                                                               : op.estimated_distinct_probe_keys;
-		auto &eager_aggregate = Make<PhysicalHashAggregate>(
-		    context, std::move(eager_types), std::move(eager_aggregates), std::move(eager_groups), eager_cardinality);
-		eager_aggregate.children.push_back(raw_projection);
-		vector<LogicalType> eager_projection_types = eager_aggregate.GetTypes();
-		vector<unique_ptr<Expression>> eager_projection_expressions;
-		for (idx_t column_idx = 0; column_idx < eager_projection_types.size(); column_idx++) {
-			eager_projection_expressions.push_back(
-			    make_uniq<BoundReferenceExpression>(eager_projection_types[column_idx], column_idx));
-		}
-		auto &eager_projection =
-		    Make<PhysicalProjection>(std::move(eager_projection_types), std::move(eager_projection_expressions),
-		                             eager_aggregate.estimated_cardinality);
-		eager_projection.children.push_back(eager_aggregate);
-		group_join_probe = eager_projection;
 	} else {
 		auto &probe_projection = Make<PhysicalProjection>(std::move(probe_types), std::move(probe_expressions),
 		                                                  probe.get().estimated_cardinality);
@@ -683,7 +699,7 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalGroupJoin &op) {
 	    candidate.unique_owner, candidate.single_match, std::move(op.filter_pushdown), actual_implementation,
 	    op.execution_mode, std::move(op.perfect_min), std::move(op.perfect_max), op.perfect_range,
 	    std::move(eager_payload_types), std::move(unmatched_probe_types), std::move(unmatched_payload_expressions),
-	    op.estimated_cardinality);
+	    streaming_eager_raw, op.estimated_cardinality);
 }
 
 PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalAggregate &op) {
