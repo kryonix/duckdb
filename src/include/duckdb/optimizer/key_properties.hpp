@@ -28,4 +28,8 @@ struct UniqueKeyProperty {
 //! Proves that the output columns are a complete non-NULL unique key of one base table.
 optional<UniqueKeyProperty> GetUniqueKeyProperty(LogicalOperator &owner, const vector<idx_t> &output_columns);
 
+//! Proves that foreign_columns are a declared foreign key referencing primary_columns.
+bool HasForeignKeyProperty(LogicalOperator &foreign, const vector<idx_t> &foreign_columns, LogicalOperator &primary,
+                           const vector<idx_t> &primary_columns);
+
 } // namespace duckdb

@@ -1880,14 +1880,15 @@ SinkResultType PhysicalFactorizedGroupJoinSink::Sink(ExecutionContext &context, 
 			throw InternalException("Factorized GroupJoin driver key was not unique");
 		}
 		auto addresses = FlatVector::GetData<data_ptr_t>(state.addresses);
-		const auto group_id_begin = driver_state.parallel_driver
+		const auto group_id_begin = op.streaming_driver ? idx_t(0)
+		                            : driver_state.parallel_driver
 		                                ? driver_state.next_group_id.fetch_add(new_count, std::memory_order_relaxed)
 		                                : driver_state.group_addresses.size();
 		for (idx_t new_idx = 0; new_idx < new_count; new_idx++) {
 			auto input_idx = state.new_groups.get_index_unsafe(new_idx);
 			auto group_id = group_id_begin + new_idx;
 			StoreFactorizedGroupJoinId(target.GetLayout(), addresses[input_idx], group_id);
-			if (!driver_state.parallel_driver) {
+			if (!driver_state.parallel_driver && !op.streaming_driver) {
 				driver_state.group_addresses.push_back(addresses[input_idx]);
 			}
 		}

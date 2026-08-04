@@ -1,0 +1,65 @@
+# description: Parameterized coarse-group factorized GroupJoin comparison
+# group: [groupjoin]
+
+name Factorized GroupJoin coarse ${LABEL} (R=${driver_rows}, groups=${bucket_count}, left=${left_fanout}, right=${right_fanout}, match=${match_rate}%)
+group micro
+subgroup groupjoin
+
+argument driver_rows 20000
+argument bucket_count 100
+argument left_fanout 16
+argument right_fanout 16
+argument match_rate 100
+argument key_spacing 4
+argument groupjoin_threads 4
+
+load
+SET threads TO ${groupjoin_threads};
+SET debug_group_join_strategy TO '${STRATEGY}';
+SET disabled_optimizers TO 'top_n';
+CREATE TABLE factor_driver(k BIGINT PRIMARY KEY, bucket BIGINT, payload BIGINT);
+INSERT INTO factor_driver SELECT i * ${key_spacing}, i % ${bucket_count}, i % 1000
+FROM range(${driver_rows}) t(i);
+CREATE TABLE factor_left(k BIGINT NOT NULL REFERENCES factor_driver(k), x BIGINT);
+INSERT INTO factor_left
+SELECT k * ${key_spacing}, repeat_index
+FROM range((${driver_rows} * ${match_rate}) // 100) keys(k), range(${left_fanout}) repeats(repeat_index);
+CREATE TABLE factor_right(k BIGINT NOT NULL REFERENCES factor_driver(k), y BIGINT);
+INSERT INTO factor_right
+SELECT k * ${key_spacing}, repeat_index
+FROM range((${driver_rows} * ${match_rate}) // 100) keys(k), range(${right_fanout}) repeats(repeat_index);
+
+run
+SELECT count(*), sum(pair_count), sum(driver_sum), sum(left_sum), sum(right_sum), sum(driver_keys)
+FROM (
+	SELECT r.bucket, count(*) AS pair_count, sum(r.payload) AS driver_sum,
+	       sum(s.x) AS left_sum, sum(t.y) AS right_sum, count(DISTINCT r.k) AS driver_keys
+	FROM factor_driver r
+	JOIN factor_left s USING (k)
+	JOIN factor_right t USING (k)
+	GROUP BY r.bucket
+) groups;
+
+result_query I
+WITH parameters AS (
+	SELECT ((${driver_rows}::HUGEINT * ${match_rate}) // 100) AS driver_count,
+	       ${bucket_count}::HUGEINT AS bucket_count,
+	       ${left_fanout}::HUGEINT AS left_fanout,
+	       ${right_fanout}::HUGEINT AS right_fanout
+), expected AS (
+	SELECT least(driver_count, bucket_count)::BIGINT AS group_count,
+	       driver_count * left_fanout * right_fanout AS pair_count,
+	       (SELECT sum((k % 1000)::HUGEINT * left_fanout * right_fanout)
+	        FROM range(driver_count::BIGINT) keys(k)) AS driver_sum,
+	       driver_count * right_fanout * (left_fanout * (left_fanout - 1) // 2) AS left_sum,
+	       driver_count * left_fanout * (right_fanout * (right_fanout - 1) // 2) AS right_sum,
+	       driver_count AS driver_keys
+	FROM parameters
+)
+SELECT count(*) FROM (
+	(SELECT * FROM __answer EXCEPT ALL SELECT * FROM expected)
+	UNION ALL
+	(SELECT * FROM expected EXCEPT ALL SELECT * FROM __answer)
+) differences;
+----
+0

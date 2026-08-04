@@ -1027,6 +1027,114 @@ SELECT count(*) FROM (
 ----
 0
 
+# AUTO requires exact declared driver containment on both factor edges before preserving the conceptual shape.
+statement ok
+SET debug_group_join_strategy = 'auto'
+
+query II
+EXPLAIN SELECT r.bucket, count(*), count(DISTINCT r.k), sum(s.x), sum(t.y)
+FROM fg_stream_driver r JOIN fg_stream_left s USING (k) JOIN fg_stream_right t USING (k)
+GROUP BY r.bucket
+----
+physical_plan	<!REGEX>:.*Factorized Group Join.*
+
+statement ok
+CREATE TABLE fg_stream_fk_left(k BIGINT NOT NULL REFERENCES fg_stream_driver(k), x BIGINT)
+
+statement ok
+INSERT INTO fg_stream_fk_left SELECT * FROM fg_stream_left
+
+statement ok
+CREATE TABLE fg_stream_fk_right(k BIGINT NOT NULL REFERENCES fg_stream_driver(k), y BIGINT)
+
+statement ok
+INSERT INTO fg_stream_fk_right SELECT * FROM fg_stream_right
+
+# One declared edge is insufficient: both independently built factors must have exact driver containment.
+query II
+EXPLAIN SELECT r.bucket, count(*), count(DISTINCT r.k), sum(s.x), sum(t.y)
+FROM fg_stream_driver r JOIN fg_stream_fk_left s USING (k) JOIN fg_stream_right t USING (k)
+GROUP BY r.bucket
+----
+physical_plan	<!REGEX>:.*Factorized Group Join.*
+
+# A nullable foreign key does not prove complete factor coverage because NULL rows need not match the driver.
+statement ok
+CREATE TABLE fg_stream_nullable_fk_right(k BIGINT REFERENCES fg_stream_driver(k), y BIGINT)
+
+statement ok
+INSERT INTO fg_stream_nullable_fk_right SELECT * FROM fg_stream_right
+
+query II
+EXPLAIN SELECT r.bucket, count(*), count(DISTINCT r.k), sum(s.x), sum(t.y)
+FROM fg_stream_driver r JOIN fg_stream_fk_left s USING (k) JOIN fg_stream_nullable_fk_right t USING (k)
+GROUP BY r.bucket
+----
+physical_plan	<!REGEX>:.*Factorized Group Join.*
+
+query II
+EXPLAIN SELECT r.bucket, count(*), sum(r.payload), sum(s.x), sum(t.y), count(DISTINCT r.k)
+FROM fg_stream_driver r JOIN fg_stream_fk_left s USING (k) JOIN fg_stream_fk_right t USING (k)
+GROUP BY r.bucket
+----
+physical_plan	<REGEX>:(?s).*combine_aggr.*Factorized Group Join.*EXPORT_STATE.*Pipeline: STREAMING_DRIVER.*Decision: AUTO SELECTED.*
+
+# Without the DISTINCT driver-key state, the existing double-eager plan is cheaper and must remain unchanged.
+query II
+EXPLAIN SELECT r.bucket, count(*), sum(r.payload), sum(s.x), sum(t.y)
+FROM fg_stream_driver r JOIN fg_stream_fk_left s USING (k) JOIN fg_stream_fk_right t USING (k)
+GROUP BY r.bucket
+----
+physical_plan	<!REGEX>:.*Factorized Group Join.*
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM fg_coarse_baseline EXCEPT ALL
+	 SELECT r.bucket, count(*), sum(r.payload), sum(s.x), sum(t.y), count(DISTINCT r.k)
+	 FROM fg_stream_driver r JOIN fg_stream_fk_left s USING (k) JOIN fg_stream_fk_right t USING (k)
+	 GROUP BY r.bucket)
+	UNION ALL
+	(SELECT r.bucket, count(*), sum(r.payload), sum(s.x), sum(t.y), count(DISTINCT r.k)
+	 FROM fg_stream_driver r JOIN fg_stream_fk_left s USING (k) JOIN fg_stream_fk_right t USING (k)
+	 GROUP BY r.bucket
+	 EXCEPT ALL SELECT * FROM fg_coarse_baseline)
+) differences
+----
+0
+
+# More than one driver row group exercises parallel streaming without publishing chunk-local addresses globally.
+statement ok
+CREATE TABLE fg_coarse_parallel_driver(k BIGINT PRIMARY KEY, bucket BIGINT)
+
+statement ok
+INSERT INTO fg_coarse_parallel_driver SELECT i, i % 10 FROM range(130000) t(i)
+
+statement ok
+CREATE TABLE fg_coarse_parallel_left(k BIGINT NOT NULL REFERENCES fg_coarse_parallel_driver(k), x BIGINT)
+
+statement ok
+INSERT INTO fg_coarse_parallel_left SELECT i, i FROM range(130000) t(i)
+
+statement ok
+CREATE TABLE fg_coarse_parallel_right(k BIGINT NOT NULL REFERENCES fg_coarse_parallel_driver(k), y BIGINT)
+
+statement ok
+INSERT INTO fg_coarse_parallel_right SELECT i, i FROM range(130000) t(i)
+
+query II
+SELECT sum(pair_count), sum(driver_keys) FROM (
+	SELECT r.bucket, count(*) AS pair_count, count(DISTINCT r.k) AS driver_keys
+	FROM fg_coarse_parallel_driver r
+	JOIN fg_coarse_parallel_left s USING (k)
+	JOIN fg_coarse_parallel_right t USING (k)
+	GROUP BY r.bucket
+) groups
+----
+130000	130000
+
+statement ok
+SET debug_group_join_strategy = 'factorized'
+
 # DISTINCT state is local to the streamed chunk because the driver key is unique.
 query II
 EXPLAIN SELECT r.k, count(DISTINCT r.payload), count(DISTINCT s.x), count(DISTINCT t.y)

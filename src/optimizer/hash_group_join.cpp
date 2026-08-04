@@ -1585,11 +1585,18 @@ static bool AutoFactorizedGroupJoinAggregatesSupported(const LogicalAggregate &a
 	for (idx_t aggregate_idx = 0; aggregate_idx < aggregate.expressions.size(); aggregate_idx++) {
 		auto &aggr = aggregate.expressions[aggregate_idx]->Cast<BoundAggregateExpression>();
 		auto &callbacks = aggr.Function().GetCallbacks();
-		if (aggr.IsDistinct() || aggr.GetFilter() || aggr.GetOrderBys() || callbacks.HasStateDestructorCallback() ||
+		auto source_idx = NumericCast<idx_t>(candidate.aggregate_sources[aggregate_idx]);
+		const auto distinct_driver_key_state = aggr.IsDistinct() && candidate.unique_driver &&
+		                                       aggr.StateExportMode() == AggregateStateExportMode::STATE_EXPORT &&
+		                                       source_idx == 0;
+		if ((aggr.IsDistinct() && !distinct_driver_key_state) || aggr.GetFilter() || aggr.GetOrderBys() ||
+		    callbacks.HasStateDestructorCallback() || !callbacks.HasStateSizeCallback() ||
+		    !callbacks.HasStateUpdateCallback() || !callbacks.HasStateCombineCallback() ||
+		    !callbacks.HasStateFinalizeCallback() || !aggr.Function().HasGetStateTypeCallback() ||
+		    aggr.Function().HasExportAggregateStateCallback() != aggr.Function().HasImportAggregateStateCallback() ||
 		    aggr.Function().GetName() == "combine_aggr") {
 			return false;
 		}
-		auto source_idx = NumericCast<idx_t>(candidate.aggregate_sources[aggregate_idx]);
 		if (source_idx >= state_widths.size()) {
 			return false;
 		}
@@ -1633,6 +1640,22 @@ static FactorizedGroupJoinCostEstimate EstimateFactorizedGroupJoinCost(LogicalAg
 	array<idx_t, 3> payload_widths;
 	const auto aggregates_supported =
 	    AutoFactorizedGroupJoinAggregatesSupported(aggregate, candidate, state_widths, payload_widths);
+	const auto driver_grain_state_export =
+	    candidate.unique_driver && candidate.routed &&
+	    std::all_of(aggregate.expressions.begin(), aggregate.expressions.end(),
+	                [](const unique_ptr<Expression> &expression) {
+		                return expression->Cast<BoundAggregateExpression>().StateExportMode() ==
+		                       AggregateStateExportMode::STATE_EXPORT;
+	                });
+	bool has_distinct_driver_key_state = false;
+	for (idx_t aggregate_idx = 0; aggregate_idx < aggregate.expressions.size(); aggregate_idx++) {
+		auto &aggr = aggregate.expressions[aggregate_idx]->Cast<BoundAggregateExpression>();
+		if (aggr.IsDistinct() && aggr.StateExportMode() == AggregateStateExportMode::STATE_EXPORT &&
+		    candidate.aggregate_sources[aggregate_idx] == FactorizedAggregateSource::DRIVER) {
+			has_distinct_driver_key_state = true;
+			break;
+		}
+	}
 	idx_t key_width = 0;
 	for (auto key_idx : candidate.driver_key_indices) {
 		if (key_idx >= inputs.driver.types.size()) {
@@ -1667,7 +1690,13 @@ static FactorizedGroupJoinCostEstimate EstimateFactorizedGroupJoinCost(LogicalAg
 	    exact_driver_filter &&
 	    static_cast<double>(perfect_range) >= static_cast<double>(MaxValue<idx_t>(result.driver_rows, 1)) * 2.0;
 	const auto selective_driver = compact_driver_domain && scan_rows <= factor_rows / 4.0;
-	result.reliable = direct_driver_edge && inner_edges && (exact_driver_filter || selective_driver) &&
+	const auto declared_factor_containment = driver_grain_state_export && has_distinct_driver_key_state &&
+	                                         HasForeignKeyProperty(inputs.left_factor, candidate.left_key_indices,
+	                                                               inputs.driver, candidate.driver_key_indices) &&
+	                                         HasForeignKeyProperty(inputs.right_factor, candidate.right_key_indices,
+	                                                               inputs.driver, candidate.driver_key_indices);
+	result.reliable = direct_driver_edge && inner_edges &&
+	                  (exact_driver_filter || selective_driver || declared_factor_containment) &&
 	                  aggregates_supported && inputs.driver.has_estimated_cardinality &&
 	                  inputs.left_factor.has_estimated_cardinality && inputs.right_factor.has_estimated_cardinality &&
 	                  inputs.nested_join.has_estimated_cardinality && inputs.top_join.has_estimated_cardinality &&
@@ -1720,6 +1749,18 @@ static FactorizedGroupJoinCostEstimate EstimateFactorizedGroupJoinCost(LogicalAg
 	}
 	result.factors_first_cost = result.build_cost + result.filter_cost + result.probe_cost + result.scan_cost +
 	                            result.cache_cost + result.eager_work_cost + result.routing_cost;
+	if (driver_grain_state_export) {
+		const auto factors_first_probe_cost = factor_rows * DIRECTORY_PROBE_COST * key_cost;
+		const auto factors_first_scan_cost =
+		    static_cast<double>(result.left_rows) * (payload_costs[1] + state_costs[1]) +
+		    static_cast<double>(result.right_rows) * (payload_costs[2] + state_costs[2]);
+		double outer_combine_cost = 0;
+		for (auto state_cost : state_costs) {
+			outer_combine_cost += static_cast<double>(result.driver_rows) * state_cost;
+		}
+		result.factors_first_cost = result.build_cost + result.filter_cost + factors_first_probe_cost +
+		                            factors_first_scan_cost + outer_combine_cost;
+	}
 
 	const auto intermediate_rows =
 	    direct_driver_edge ? inputs.nested_join.estimated_cardinality : result.left_rows + result.right_rows;
@@ -1735,18 +1776,12 @@ static FactorizedGroupJoinCostEstimate EstimateFactorizedGroupJoinCost(LogicalAg
 	                    static_cast<double>(result.right_rows) * (key_cost + payload_costs[2] + state_costs[2] + 1.0) +
 	                    result.build_cost + static_cast<double>(result.matched_drivers) * (key_cost + 1.0);
 	result.best_existing_cost = MinValue(result.separate_cost, result.eager_cost);
-	const auto driver_grain_state_export =
-	    candidate.unique_driver && candidate.routed &&
-	    std::all_of(aggregate.expressions.begin(), aggregate.expressions.end(),
-	                [](const unique_ptr<Expression> &expression) {
-		                return expression->Cast<BoundAggregateExpression>().StateExportMode() ==
-		                       AggregateStateExportMode::STATE_EXPORT;
-	                });
 	result.driver_first = driver_grain_state_export ? false
 	                      : compact_driver_domain && sparse_driver_domain
 	                          ? driver_first_orientation_cost <= result.factors_first_cost
 	                          : result.driver_first_cost <= result.factors_first_cost;
-	result.factorized_cost = MinValue(result.driver_first_cost, result.factors_first_cost);
+	result.factorized_cost = driver_grain_state_export ? result.factors_first_cost
+	                                                   : MinValue(result.driver_first_cost, result.factors_first_cost);
 
 	idx_t estimated_memory_rows = 0;
 	idx_t estimated_memory = 0;
@@ -1807,11 +1842,53 @@ optional<HashGroupJoinOrderContext> GetFactorizedGroupJoinOrderContext(LogicalAg
 		}
 	} else {
 		auto strategy = Settings::Get<DebugGroupJoinStrategySetting>(context);
-		if (strategy != GroupJoinStrategy::FACTORIZED || !GetFactorizedCoarseGroupInfo(aggregate, context)) {
+		auto coarse_info = GetFactorizedCoarseGroupInfo(aggregate, context);
+		if (!coarse_info || (strategy != GroupJoinStrategy::FACTORIZED && strategy != GroupJoinStrategy::AUTO)) {
 			return nullopt;
 		}
 		candidate = TryAnalyzeFactorizedGroupJoinCandidate(aggregate, context, false);
 		D_ASSERT(candidate);
+		if (strategy == GroupJoinStrategy::AUTO) {
+			bool has_distinct_driver_key = false;
+			for (auto &expression : aggregate.expressions) {
+				auto &aggr = expression->Cast<BoundAggregateExpression>();
+				auto &function = aggr.Function();
+				auto &callbacks = function.GetCallbacks();
+				if (aggr.GetFilter() || aggr.GetOrderBys() ||
+				    aggr.StateExportMode() != AggregateStateExportMode::NONE ||
+				    callbacks.HasStateDestructorCallback() || !callbacks.HasStateSizeCallback() ||
+				    !callbacks.HasStateUpdateCallback() || !callbacks.HasStateCombineCallback() ||
+				    !callbacks.HasStateFinalizeCallback() || !function.HasGetStateTypeCallback() ||
+				    function.HasExportAggregateStateCallback() != function.HasImportAggregateStateCallback()) {
+					return nullopt;
+				}
+				if (!aggr.IsDistinct()) {
+					continue;
+				}
+				if (coarse_info->missing_driver_keys.size() != 1 || aggr.GetChildren().size() != 1 ||
+				    aggr.GetChildren()[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
+				    aggr.GetChildren()[0]->Cast<BoundColumnRefExpression>().Binding() !=
+				        coarse_info->missing_driver_keys[0]) {
+					return nullopt;
+				}
+				has_distinct_driver_key = true;
+			}
+			if (!has_distinct_driver_key) {
+				return nullopt;
+			}
+			auto coarse_inputs = GetFactorizedGroupJoinInputs(aggregate, *candidate);
+			if (candidate->driver_child == DConstants::INVALID_INDEX ||
+			    coarse_inputs.nested_join.join_type != JoinType::INNER ||
+			    coarse_inputs.top_join.join_type != JoinType::INNER) {
+				return nullopt;
+			}
+			if (!HasForeignKeyProperty(coarse_inputs.left_factor, candidate->left_key_indices, coarse_inputs.driver,
+			                           candidate->driver_key_indices) ||
+			    !HasForeignKeyProperty(coarse_inputs.right_factor, candidate->right_key_indices, coarse_inputs.driver,
+			                           candidate->driver_key_indices)) {
+				return nullopt;
+			}
+		}
 	}
 	auto inputs = GetFactorizedGroupJoinInputs(aggregate, *candidate);
 	HashGroupJoinOrderContext result;

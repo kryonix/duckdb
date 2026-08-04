@@ -1,0 +1,6 @@
+# name: benchmark/micro/groupjoin/factorized_coarse_auto.benchmark
+# group: [groupjoin]
+
+template benchmark/micro/groupjoin/factorized_coarse.benchmark.in
+LABEL=auto
+STRATEGY=auto
