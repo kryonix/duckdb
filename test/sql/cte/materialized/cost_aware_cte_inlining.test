@@ -21,6 +21,24 @@ statement ok
 CREATE TABLE cte_cost_corr_b AS SELECT i FROM range(750, 1000) t(i)
 
 statement ok
+CREATE TABLE cte_cost_customer AS SELECT i AS customer_sk, i::VARCHAR AS customer_id FROM range(10000) t(i)
+
+statement ok
+CREATE TABLE cte_cost_date AS SELECT i AS date_sk, 2001 + i % 2 AS year FROM range(2) t(i)
+
+statement ok
+CREATE TABLE cte_cost_store_sales AS
+SELECT i % 10000 AS customer_sk, (i // 10000) % 2 AS sold_date_sk,
+       i % 100 + 10 AS list_price, i % 10 AS discount
+FROM range(100000) t(i)
+
+statement ok
+CREATE TABLE cte_cost_web_sales AS
+SELECT i % 10000 AS customer_sk, (i // 10000) % 2 AS sold_date_sk,
+       i % 100 + 10 AS list_price, i % 10 AS discount
+FROM range(60000) t(i)
+
+statement ok
 ANALYZE
 
 # The selective join reader would be materialized by the exchange, so it is inlined while both direct readers share
@@ -132,6 +150,57 @@ ORDER BY g
 4	36	22446
 5	36	22482
 6	36	22518
+
+# Recomputing aggregate or window producers is not selected until blocking-work estimates are reliable.
+query II
+EXPLAIN WITH year_total AS (
+	SELECT customer_id, year, sum(list_price - discount) AS total, 's' AS sale_type
+	FROM cte_cost_customer
+	JOIN cte_cost_store_sales USING (customer_sk)
+	JOIN cte_cost_date ON sold_date_sk = date_sk
+	GROUP BY customer_id, year
+	UNION ALL
+	SELECT customer_id, year, sum(list_price - discount) AS total, 'w' AS sale_type
+	FROM cte_cost_customer
+	JOIN cte_cost_web_sales USING (customer_sk)
+	JOIN cte_cost_date ON sold_date_sk = date_sk
+	GROUP BY customer_id, year
+)
+SELECT count(*)
+FROM year_total a, year_total b, year_total c, year_total d
+WHERE a.customer_id = b.customer_id
+  AND a.customer_id = c.customer_id
+  AND a.customer_id = d.customer_id
+  AND a.sale_type = 's' AND b.sale_type = 's' AND c.sale_type = 'w' AND d.sale_type = 'w'
+  AND a.year = 2001 AND b.year = 2002 AND c.year = 2001 AND d.year = 2002
+  AND a.total > 0 AND c.total > 0
+----
+logical_opt	<REGEX>:(?s)(?:.*CTE Scan){4}.*
+
+query I
+WITH year_total AS (
+	SELECT customer_id, year, sum(list_price - discount) AS total, 's' AS sale_type
+	FROM cte_cost_customer
+	JOIN cte_cost_store_sales USING (customer_sk)
+	JOIN cte_cost_date ON sold_date_sk = date_sk
+	GROUP BY customer_id, year
+	UNION ALL
+	SELECT customer_id, year, sum(list_price - discount) AS total, 'w' AS sale_type
+	FROM cte_cost_customer
+	JOIN cte_cost_web_sales USING (customer_sk)
+	JOIN cte_cost_date ON sold_date_sk = date_sk
+	GROUP BY customer_id, year
+)
+SELECT count(*)
+FROM year_total a, year_total b, year_total c, year_total d
+WHERE a.customer_id = b.customer_id
+  AND a.customer_id = c.customer_id
+  AND a.customer_id = d.customer_id
+  AND a.sale_type = 's' AND b.sale_type = 's' AND c.sale_type = 'w' AND d.sale_type = 'w'
+  AND a.year = 2001 AND b.year = 2002 AND c.year = 2001 AND d.year = 2002
+  AND a.total > 0 AND c.total > 0
+----
+10000
 
 # The corresponding materialized plan uses one buffered and two direct exchange consumers.
 query II

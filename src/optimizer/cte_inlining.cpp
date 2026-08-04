@@ -220,6 +220,25 @@ static bool ContainsDelimGet(const LogicalOperator &op) {
 	return false;
 }
 
+static bool ContainsCostSensitiveBlockingOperator(const LogicalOperator &op) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+	case LogicalOperatorType::LOGICAL_DISTINCT:
+	case LogicalOperatorType::LOGICAL_WINDOW:
+	case LogicalOperatorType::LOGICAL_ORDER_BY:
+	case LogicalOperatorType::LOGICAL_TOP_N:
+		return true;
+	default:
+		break;
+	}
+	for (auto &child : op.children) {
+		if (ContainsCostSensitiveBlockingOperator(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static bool HasCTEReferenceBelowDelimJoin(const LogicalOperator &op, TableIndex cte_index,
                                           bool below_delim_join = false) {
 	if (op.type == LogicalOperatorType::LOGICAL_CTE_REF) {
@@ -350,6 +369,9 @@ void CTEInlining::TryInlining(unique_ptr<LogicalOperator> &op, bool cost_aware) 
 
 bool CTEInlining::TryCostAwareInlining(unique_ptr<LogicalOperator> &op) {
 	auto &cte = op->Cast<LogicalMaterializedCTE>();
+	if (ContainsCostSensitiveBlockingOperator(*cte.children[0])) {
+		return false;
+	}
 	vector<CTEConsumerInfo> consumers;
 	FindCTEConsumers(op->children[1], cte.table_index, consumers);
 	if (consumers.size() < 2) {
