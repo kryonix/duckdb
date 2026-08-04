@@ -461,7 +461,8 @@ static void RewriteFactorizedAggregateReferences(unique_ptr<Expression> &express
 	});
 }
 
-static PhysicalOperator &CreateFactorizedGroupJoinPlan(PhysicalPlanGenerator &generator, LogicalGroupJoin &op) {
+static PhysicalOperator &CreateFactorizedGroupJoinPlan(PhysicalPlanGenerator &generator, ClientContext &context,
+                                                       LogicalGroupJoin &op) {
 	D_ASSERT(op.children.size() == 3);
 	D_ASSERT(op.factorized_aggregate_sources.size() == op.expressions.size());
 	reference<PhysicalOperator> driver = generator.CreatePlan(*op.children[0]);
@@ -508,6 +509,11 @@ static PhysicalOperator &CreateFactorizedGroupJoinPlan(PhysicalPlanGenerator &ge
 	            std::move(op.factorized_left_driver_filter_pushdown),
 	            std::move(op.factorized_right_driver_filter_pushdown), op.estimated_cardinality)
 	        .Cast<PhysicalFactorizedGroupJoin>();
+	auto configured_execution = Settings::Get<DebugGroupJoinExecutionSetting>(context);
+	if (Settings::Get<DebugForceExternalSetting>(context) || configured_execution == GroupJoinExecutionMode::EXTERNAL) {
+		result.streaming_driver = false;
+		result.planned_execution_mode = GroupJoinExecutionMode::EXTERNAL;
+	}
 	result.InitializeSinks();
 	return result;
 }
@@ -520,7 +526,7 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalGroupJoin &op) {
 		}
 	}
 	if (op.IsFactorized()) {
-		return CreateFactorizedGroupJoinPlan(*this, op);
+		return CreateFactorizedGroupJoinPlan(*this, context, op);
 	}
 	D_ASSERT(op.children.size() == 2);
 	auto candidate = GetHashGroupJoinCandidate(op);

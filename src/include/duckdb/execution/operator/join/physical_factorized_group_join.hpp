@@ -107,6 +107,7 @@ public:
 	bool estimated_cost_reliable = false;
 	bool auto_selected = false;
 	bool driver_first = true;
+	bool streaming_driver = false;
 	PhysicalPlan &physical_plan;
 	optional_ptr<PhysicalOperator> driver_input;
 	optional_ptr<PhysicalOperator> left_input;
@@ -116,6 +117,11 @@ public:
 	optional_ptr<PhysicalOperator> right_sink;
 
 public:
+	unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) const override;
+	unique_ptr<GlobalOperatorState> GetGlobalOperatorState(ClientContext &context) const override;
+	OperatorResultType Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
+	                           GlobalOperatorState &gstate, OperatorState &state) const override;
+
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
 	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
 	                                                 GlobalSourceState &gstate) const override;
@@ -123,6 +129,9 @@ public:
 	                                 OperatorSourceInput &input) const override;
 
 	bool IsSource() const override {
+		return !streaming_driver;
+	}
+	bool ParallelOperator() const override {
 		return true;
 	}
 	bool ParallelSource() const override {

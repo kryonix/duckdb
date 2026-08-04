@@ -304,6 +304,8 @@ PhysicalFactorizedGroupJoin::PhysicalFactorizedGroupJoin(
 			branch_modes[factor_idx] = FactorizedGroupJoinBranchMode::LAZY;
 		}
 	}
+	streaming_driver = !driver_first && unique_driver && !routed &&
+	                   planned_execution_mode != GroupJoinExecutionMode::EXTERNAL && distinct_aggregates.empty();
 }
 
 vector<AggregateObject> PhysicalFactorizedGroupJoin::CreateHashTableAggregates() const {
@@ -1036,6 +1038,18 @@ public:
 	bool finalized = false;
 };
 
+class FactorizedGroupJoinGlobalOperatorState : public GlobalOperatorState {
+public:
+	FactorizedGroupJoinGlobalOperatorState(const PhysicalFactorizedGroupJoin &op, ClientContext &context)
+	    : driver_state(op, context, FactorizedSourceIndex(FactorizedAggregateSource::DRIVER)) {
+		if (!op.streaming_driver || driver_state.external || driver_state.direct_factor_updates) {
+			throw InternalException("Invalid streaming factorized GroupJoin state");
+		}
+	}
+
+	FactorizedGroupJoinGlobalSinkState driver_state;
+};
+
 class PhysicalFactorizedGroupJoinSink : public PhysicalOperator {
 public:
 	PhysicalFactorizedGroupJoinSink(PhysicalPlan &physical_plan, PhysicalFactorizedGroupJoin &op_p,
@@ -1070,6 +1084,12 @@ public:
 };
 
 static FactorizedGroupJoinGlobalSinkState &GetFactorizedDriverState(const PhysicalFactorizedGroupJoin &op) {
+	if (op.streaming_driver) {
+		if (!op.op_state) {
+			throw InternalException("Factorized GroupJoin operator state is not initialized");
+		}
+		return op.op_state->Cast<FactorizedGroupJoinGlobalOperatorState>().driver_state;
+	}
 	if (!op.driver_sink || !op.driver_sink->sink_state) {
 		throw InternalException("Factorized GroupJoin driver sink is not initialized");
 	}
@@ -1093,12 +1113,23 @@ static int64_t CheckedFactorizedMultiplicity(idx_t value);
 class FactorizedGroupJoinLocalSinkState : public LocalSinkState {
 public:
 	FactorizedGroupJoinLocalSinkState(ExecutionContext &context, const PhysicalFactorizedGroupJoinSink &sink)
-	    : source_idx(sink.source_idx), addresses(LogicalType::POINTER), matched_addresses(LogicalType::POINTER),
+	    : FactorizedGroupJoinLocalSinkState(
+	          context, sink.op, sink.source_idx, sink.sink_state->Cast<FactorizedGroupJoinGlobalSinkState>(),
+	          sink.source_idx == FactorizedSourceIndex(FactorizedAggregateSource::DRIVER) ||
+	                  (sink.op.driver_first && sink.op.planned_execution_mode != GroupJoinExecutionMode::EXTERNAL)
+	              ? &GetFactorizedDriverState(sink.op)
+	              : nullptr,
+	          false) {
+	}
+
+	FactorizedGroupJoinLocalSinkState(ExecutionContext &context, const PhysicalFactorizedGroupJoin &op,
+	                                  idx_t source_idx_p, FactorizedGroupJoinGlobalSinkState &factor_state,
+	                                  optional_ptr<FactorizedGroupJoinGlobalSinkState> driver_state, bool streaming)
+	    : source_idx(source_idx_p), addresses(LogicalType::POINTER), matched_addresses(LogicalType::POINTER),
 	      owner_addresses(LogicalType::POINTER), local_addresses(LogicalType::POINTER),
 	      new_groups(STANDARD_VECTOR_SIZE), non_null_sel(STANDARD_VECTOR_SIZE), found_groups(STANDARD_VECTOR_SIZE),
-	      owner_sel(STANDARD_VECTOR_SIZE), local_sel(STANDARD_VECTOR_SIZE), left_factor_probe_state(sink.op.key_types),
-	      right_factor_probe_state(sink.op.key_types), key_formats(sink.op.key_types.size()) {
-		auto &op = sink.op;
+	      owner_sel(STANDARD_VECTOR_SIZE), local_sel(STANDARD_VECTOR_SIZE), left_factor_probe_state(op.key_types),
+	      right_factor_probe_state(op.key_types), key_formats(op.key_types.size()) {
 		key_executor = make_uniq<ExpressionExecutor>(context.client);
 		for (auto &expression : op.key_expressions[source_idx]) {
 			key_executor->AddExpression(*expression);
@@ -1121,7 +1152,6 @@ public:
 			arguments.Initialize(Allocator::Get(context.client), op.source_argument_types[source_idx]);
 		}
 		lookup_arguments.InitializeEmpty(op.source_argument_types[source_idx]);
-		auto &factor_state = sink.sink_state->Cast<FactorizedGroupJoinGlobalSinkState>();
 		if (source_idx == FactorizedSourceIndex(FactorizedAggregateSource::DRIVER) &&
 		    factor_state.direct_factor_updates) {
 			for (idx_t factor_idx = 0; factor_idx < driver_filter_states.size(); factor_idx++) {
@@ -1179,17 +1209,18 @@ public:
 			distinct_groups[distinct_idx]->Initialize(Allocator::Get(context.client), distinct_types);
 		}
 
-		auto &driver_state = GetFactorizedDriverState(op);
 		if (source_idx == FactorizedSourceIndex(FactorizedAggregateSource::DRIVER)) {
-			if (driver_state.parallel_driver) {
+			D_ASSERT(driver_state);
+			if (driver_state->parallel_driver || streaming) {
 				local_driver_target = make_uniq<GroupedAggregateHashTable>(
 				    context.client, BufferAllocator::Get(context.client), op.group_types, vector<LogicalType> {},
 				    op.CreateHashTableAggregates(), GroupedAggregateHashTable::InitialCapacity(),
-				    FACTORIZED_GROUP_JOIN_RADIX_BITS, TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
+				    streaming ? idx_t(0) : FACTORIZED_GROUP_JOIN_RADIX_BITS,
+				    TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 				local_driver_target->SkipLookups();
 				update_state = make_uniq<AggregateHTUpdateState>(*local_driver_target);
 			} else {
-				update_state = make_uniq<AggregateHTUpdateState>(*driver_state.target);
+				update_state = make_uniq<AggregateHTUpdateState>(*driver_state->target);
 			}
 			if (!op.source_argument_types[FactorizedSourceIndex(FactorizedAggregateSource::LEFT_FACTOR)].empty()) {
 				left_factor_payload.Initialize(
@@ -1224,8 +1255,9 @@ public:
 		if (!op.source_argument_types[source_idx].empty()) {
 			selected_arguments.Initialize(Allocator::Get(context.client), op.source_argument_types[source_idx]);
 		}
-		if (!op.routed && UseDenseFactorizedAggregateTables(op, context.client, driver_state.group_addresses.size())) {
-			dense_table = make_uniq<DenseFactorizedAggregateTable>(context.client, driver_state.group_addresses.size(),
+		D_ASSERT(driver_state);
+		if (!op.routed && UseDenseFactorizedAggregateTables(op, context.client, driver_state->group_addresses.size())) {
+			dense_table = make_uniq<DenseFactorizedAggregateTable>(context.client, driver_state->group_addresses.size(),
 			                                                       op.source_argument_types[source_idx],
 			                                                       std::move(source_aggregates));
 			dense_update_state = dense_table->CreateUpdateState(context.client);
@@ -1238,10 +1270,10 @@ public:
 		    TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 		update_state = make_uniq<AggregateHTUpdateState>(*local_table);
 		direct_allocator = make_shared_ptr<ArenaAllocator>(Allocator::Get(context.client));
-		direct_update_state = make_uniq<AggregateHTUpdateState>(*driver_state.target, direct_allocator);
+		direct_update_state = make_uniq<AggregateHTUpdateState>(*driver_state->target, direct_allocator);
 		{
-			lock_guard<mutex> guard(driver_state.lock);
-			driver_state.target->StoreAggregateAllocator(direct_allocator);
+			lock_guard<mutex> guard(driver_state->lock);
+			driver_state->target->StoreAggregateAllocator(direct_allocator);
 		}
 		token = factor_state.next_token.fetch_add(1, std::memory_order_relaxed);
 		if (token == 0) {
@@ -1815,7 +1847,7 @@ SinkResultType PhysicalFactorizedGroupJoinSink::Sink(ExecutionContext &context, 
 
 	auto &range = op.source_ranges[source_idx];
 	if (source_idx == FactorizedSourceIndex(FactorizedAggregateSource::DRIVER)) {
-		auto &driver_state = GetFactorizedDriverState(op);
+		auto &driver_state = input.global_state.Cast<FactorizedGroupJoinGlobalSinkState>();
 		auto &target = state.local_driver_target ? *state.local_driver_target : *driver_state.target;
 		idx_t left_match_count = 0;
 		idx_t right_match_count = 0;
@@ -2615,18 +2647,38 @@ void PhysicalFactorizedGroupJoin::InitializeSinks() {
 	driver_sink = &physical_plan.Make<PhysicalFactorizedGroupJoinSink>(*this, *driver_input, idx_t(0));
 	left_sink = &physical_plan.Make<PhysicalFactorizedGroupJoinSink>(*this, *left_input, idx_t(1));
 	right_sink = &physical_plan.Make<PhysicalFactorizedGroupJoinSink>(*this, *right_input, idx_t(2));
+	if (streaming_driver) {
+		children.push_back(*driver_input);
+		return;
+	}
 	children.push_back(*driver_sink);
 	children.push_back(*left_sink);
 	children.push_back(*right_sink);
 }
 
 void PhysicalFactorizedGroupJoin::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) {
-	D_ASSERT(children.size() == SOURCE_COUNT);
 	D_ASSERT(driver_sink && left_sink && right_sink);
 	op_state.reset();
 	driver_sink->sink_state.reset();
 	left_sink->sink_state.reset();
 	right_sink->sink_state.reset();
+	if (streaming_driver) {
+		D_ASSERT(children.size() == 1);
+		auto &left_meta = meta_pipeline.CreateChildMetaPipeline(current, *left_sink, MetaPipelineType::JOIN_BUILD);
+		left_meta.Build(left_sink->children[0]);
+		auto left_pipeline = left_meta.GetBasePipeline();
+
+		auto &right_meta = meta_pipeline.CreateChildMetaPipeline(current, *right_sink, MetaPipelineType::JOIN_BUILD);
+		right_meta.Build(right_sink->children[0]);
+		auto right_pipeline = right_meta.GetBasePipeline();
+
+		current.AddDependency(left_pipeline);
+		current.AddDependency(right_pipeline);
+		meta_pipeline.GetState().AddPipelineOperator(current, *this);
+		children[0].get().BuildPipelines(current, meta_pipeline);
+		return;
+	}
+	D_ASSERT(children.size() == SOURCE_COUNT);
 	meta_pipeline.GetState().SetPipelineSource(current, *this);
 	const auto direct_factor_updates = driver_first && planned_execution_mode != GroupJoinExecutionMode::EXTERNAL;
 	if (direct_factor_updates) {
@@ -2658,6 +2710,10 @@ void PhysicalFactorizedGroupJoin::BuildPipelines(Pipeline &current, MetaPipeline
 }
 
 vector<const_reference<PhysicalOperator>> PhysicalFactorizedGroupJoin::GetSources() const {
+	if (streaming_driver) {
+		D_ASSERT(children.size() == 1);
+		return children[0].get().GetSources();
+	}
 	return {*this};
 }
 
@@ -2706,6 +2762,144 @@ public:
 	unsafe_unique_array<data_t> data;
 	bool initialized = false;
 };
+
+class FactorizedGroupJoinOperatorState : public OperatorState {
+public:
+	FactorizedGroupJoinOperatorState(ExecutionContext &context, const PhysicalFactorizedGroupJoin &op)
+	    : driver(context, op, FactorizedSourceIndex(FactorizedAggregateSource::DRIVER),
+	             op.op_state->Cast<FactorizedGroupJoinGlobalOperatorState>().driver_state,
+	             op.op_state->Cast<FactorizedGroupJoinGlobalOperatorState>().driver_state, true),
+	      selected_addresses(LogicalType::POINTER), selected_rows(STANDARD_VECTOR_SIZE),
+	      left_multiplicities(LogicalType::BIGINT), right_multiplicities(LogicalType::BIGINT),
+	      product_multiplicities(LogicalType::BIGINT), output(context.client, op.target_layout) {
+	}
+
+	FactorizedGroupJoinLocalSinkState driver;
+	Vector selected_addresses;
+	SelectionVector selected_rows;
+	Vector left_multiplicities;
+	Vector right_multiplicities;
+	Vector product_multiplicities;
+	FactorizedGroupJoinOutputBuffer output;
+	InterruptState interrupt_state;
+};
+
+unique_ptr<GlobalOperatorState> PhysicalFactorizedGroupJoin::GetGlobalOperatorState(ClientContext &context) const {
+	if (!streaming_driver) {
+		return PhysicalOperator::GetGlobalOperatorState(context);
+	}
+	return make_uniq<FactorizedGroupJoinGlobalOperatorState>(*this, context);
+}
+
+unique_ptr<OperatorState> PhysicalFactorizedGroupJoin::GetOperatorState(ExecutionContext &context) const {
+	if (!streaming_driver) {
+		return PhysicalOperator::GetOperatorState(context);
+	}
+	return make_uniq<FactorizedGroupJoinOperatorState>(context, *this);
+}
+
+OperatorResultType PhysicalFactorizedGroupJoin::Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
+                                                        GlobalOperatorState &gstate_p, OperatorState &state_p) const {
+	if (!streaming_driver) {
+		throw InternalException("Materialized factorized GroupJoin cannot execute as an operator");
+	}
+	auto &gstate = gstate_p.Cast<FactorizedGroupJoinGlobalOperatorState>();
+	auto &state = state_p.Cast<FactorizedGroupJoinOperatorState>();
+	auto &driver = state.driver;
+	auto &target = *driver.local_driver_target;
+	target.ResetForNewIteration(0);
+	target.SkipLookups();
+	driver.update_state = make_uniq<AggregateHTUpdateState>(target);
+	chunk.Reset();
+
+	OperatorSinkInput sink_input {gstate.driver_state, driver, state.interrupt_state};
+	auto sink_result = driver_sink->Sink(context, input, sink_input);
+	D_ASSERT(sink_result == SinkResultType::NEED_MORE_INPUT);
+	if (input.size() == 0) {
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
+
+	auto layout = target.GetLayoutPtr();
+	auto &left_range = source_ranges[FactorizedSourceIndex(FactorizedAggregateSource::LEFT_FACTOR)];
+	auto &right_range = source_ranges[FactorizedSourceIndex(FactorizedAggregateSource::RIGHT_FACTOR)];
+	D_ASSERT(unique_driver && left_range.multiplicity_index.IsValid() && right_range.multiplicity_index.IsValid());
+
+	driver.addresses.Flatten();
+	auto addresses = FlatVector::GetData<data_ptr_t>(driver.addresses);
+	auto left_values = FlatVector::GetDataMutable<int64_t>(state.left_multiplicities);
+	auto right_values = FlatVector::GetDataMutable<int64_t>(state.right_multiplicities);
+	auto product_values = FlatVector::GetDataMutable<int64_t>(state.product_multiplicities);
+	idx_t result_count = 0;
+	for (idx_t row_idx = 0; row_idx < input.size(); row_idx++) {
+		auto left_count = LoadFactorizedCount(*layout, addresses[row_idx], left_range.multiplicity_index.GetIndex());
+		auto right_count = LoadFactorizedCount(*layout, addresses[row_idx], right_range.multiplicity_index.GetIndex());
+		if (semi_left && left_count != 0) {
+			left_count = 1;
+		}
+		if (semi_right && right_count != 0) {
+			right_count = 1;
+		}
+		if ((!preserve_left && left_count == 0) || (!preserve_right && right_count == 0)) {
+			continue;
+		}
+		left_count = left_count == 0 ? 1 : left_count;
+		right_count = right_count == 0 ? 1 : right_count;
+		idx_t product;
+		if (!TryMultiplyOperator::Operation(left_count, right_count, product)) {
+			throw OutOfRangeException("Overflow in factorized GroupJoin multiplicity");
+		}
+		state.selected_rows.set_index(result_count, row_idx);
+		left_values[result_count] = CheckedFactorizedMultiplicity(right_count);
+		right_values[result_count] = CheckedFactorizedMultiplicity(left_count);
+		product_values[result_count] = CheckedFactorizedMultiplicity(product);
+		result_count++;
+	}
+	if (result_count == 0) {
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
+
+	FlatVector::SetSize(state.left_multiplicities, count_t(result_count));
+	FlatVector::SetSize(state.right_multiplicities, count_t(result_count));
+	FlatVector::SetSize(state.product_multiplicities, count_t(result_count));
+	state.selected_addresses.Slice(driver.addresses, state.selected_rows, result_count);
+	state.selected_addresses.Flatten();
+	state.output.Initialize(result_count);
+	try {
+		for (idx_t aggregate_idx = 0; aggregate_idx < aggregate_expressions.size(); aggregate_idx++) {
+			auto source_idx = FactorizedSourceIndex(aggregate_sources[aggregate_idx]);
+			Vector *multiplicities;
+			switch (source_idx) {
+			case 0:
+				multiplicities = &state.product_multiplicities;
+				break;
+			case 1:
+				multiplicities = &state.left_multiplicities;
+				break;
+			case 2:
+				multiplicities = &state.right_multiplicities;
+				break;
+			default:
+				throw InternalException("Invalid factorized aggregate source");
+			}
+			RowOperations::CombineStatesRange(state.output.row_state, *layout, state.selected_addresses,
+			                                  partial_indexes[aggregate_idx], state.output.layout,
+			                                  state.output.addresses, aggregate_idx, 1, *multiplicities,
+			                                  AggregateCombineType::PRESERVE_INPUT);
+		}
+		for (idx_t group_idx = 0; group_idx < output_group_key_indices.size(); group_idx++) {
+			chunk.data[group_idx].Slice(driver.keys.data[output_group_key_indices[group_idx]], state.selected_rows,
+			                            result_count);
+		}
+		chunk.SetChildCardinality(result_count);
+		RowOperations::FinalizeStates(state.output.row_state, state.output.layout, state.output.addresses, chunk,
+		                              output_group_key_indices.size());
+	} catch (...) {
+		state.output.Destroy();
+		throw;
+	}
+	state.output.Destroy();
+	return OperatorResultType::NEED_MORE_INPUT;
+}
 
 class ExternalFactorizedDistinctState {
 public:
@@ -3874,6 +4068,7 @@ InsertionOrderPreservingMap<string> PhysicalFactorizedGroupJoin::ParamsToString(
 	                      : routed        ? "driver-first target + compact routed factor updates"
 	                                      : "driver-first target + task-local dense factor states";
 	result["Strategy"] = EnumUtil::ToString(planned_execution_mode);
+	result["Pipeline"] = streaming_driver ? "STREAMING_DRIVER" : "MATERIALIZED_TARGET";
 	result["Driver"] = unique_driver ? "UNIQUE" : "NON_UNIQUE";
 	result["Routing"] = routed ? "ROUTED" : "DIRECT";
 	result["Lookup"] = planned_execution_mode == GroupJoinExecutionMode::EXTERNAL ? "PARTITIONED HASH"
