@@ -1392,6 +1392,79 @@ physical_plan	<!REGEX>:.*Factorized Group Join.*
 statement ok
 RESET debug_group_join_strategy
 
+# A factorized GroupJoin in a recursive term is rebuilt for each iteration; unreliable recursive statistics keep it
+# force-only.
+statement ok
+SET debug_group_join_strategy = 'factorized'
+
+statement ok
+CREATE TABLE fg_recursive_driver(k INTEGER PRIMARY KEY)
+
+statement ok
+INSERT INTO fg_recursive_driver VALUES (1), (2)
+
+statement ok
+CREATE TABLE fg_recursive_factor(k INTEGER, v INTEGER)
+
+statement ok
+INSERT INTO fg_recursive_factor VALUES (1, 10), (1, 20), (2, 30)
+
+query II
+EXPLAIN WITH RECURSIVE r(step, k, n) AS (
+	SELECT 0, k, 0::BIGINT FROM (VALUES (1), (2)) seed(k)
+	UNION ALL
+	SELECT r.step + 1, d.k, count(*)
+	FROM r
+	JOIN fg_recursive_driver d ON r.k = d.k
+	JOIN fg_recursive_factor f ON d.k = f.k
+	WHERE r.step < 2
+	GROUP BY r.step, d.k
+)
+SELECT * FROM r
+----
+physical_plan	<REGEX>:(?s).*Rec CTE.*Factorized Group Join.*
+
+query III rowsort
+WITH RECURSIVE r(step, k, n) AS (
+	SELECT 0, k, 0::BIGINT FROM (VALUES (1), (2)) seed(k)
+	UNION ALL
+	SELECT r.step + 1, d.k, count(*)
+	FROM r
+	JOIN fg_recursive_driver d ON r.k = d.k
+	JOIN fg_recursive_factor f ON d.k = f.k
+	WHERE r.step < 2
+	GROUP BY r.step, d.k
+)
+SELECT * FROM r
+----
+0	1	0
+0	2	0
+1	1	2
+1	2	1
+2	1	2
+2	2	1
+
+statement ok
+SET debug_group_join_strategy = 'auto'
+
+query II
+EXPLAIN WITH RECURSIVE r(step, k, n) AS (
+	SELECT 0, k, 0::BIGINT FROM (VALUES (1), (2)) seed(k)
+	UNION ALL
+	SELECT r.step + 1, d.k, count(*)
+	FROM r
+	JOIN fg_recursive_driver d ON r.k = d.k
+	JOIN fg_recursive_factor f ON d.k = f.k
+	WHERE r.step < 2
+	GROUP BY r.step, d.k
+)
+SELECT * FROM r
+----
+physical_plan	<!REGEX>:.*Factorized Group Join.*
+
+statement ok
+RESET debug_group_join_strategy
+
 # Grouping proves driver uniqueness without proving that the key is non-NULL.
 statement ok
 SET threads = 4
