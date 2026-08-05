@@ -12,6 +12,7 @@
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/common/enums/optimizer_type.hpp"
+#include "duckdb/common/unordered_set.hpp"
 
 #include <functional>
 
@@ -32,6 +33,8 @@ public:
 	static bool OptimizerDisabled(ClientContext &context, OptimizerType type);
 	//! Consume one speculative physical CTE plan from the per-query budget.
 	bool ConsumeCTECandidateBudget(idx_t count = 1);
+	//! Returns true when this CTE has not been considered by an earlier cost-aware pass.
+	bool BeginCTECosting(TableIndex cte_index);
 
 	//! Pre-binder statement-level optimization pass
 	void OptimizeStatement(unique_ptr<SQLStatement> &statement);
@@ -57,6 +60,7 @@ public:
 private:
 	unique_ptr<LogicalOperator> plan;
 	idx_t cte_candidate_budget = 16;
+	unordered_set<TableIndex> costed_ctes;
 
 private:
 	unique_ptr<Expression> BindScalarFunction(const Identifier &name, vector<unique_ptr<Expression>> children);

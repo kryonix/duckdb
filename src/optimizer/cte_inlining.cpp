@@ -42,7 +42,6 @@ struct CTEConsumerInfo {
 	optional_ptr<LogicalOperator> filter;
 	bool filtered;
 	bool early_stop;
-	bool below_delim_join;
 };
 
 static bool IsCTEReference(const LogicalOperator &op, TableIndex cte_index) {
@@ -51,10 +50,9 @@ static bool IsCTEReference(const LogicalOperator &op, TableIndex cte_index) {
 
 static void FindCTEConsumers(unique_ptr<LogicalOperator> &op, TableIndex cte_index, vector<CTEConsumerInfo> &consumers,
                              optional_ptr<LogicalOperator> filter = nullptr, bool filtered = false,
-                             bool early_stop = false, bool below_delim_join = false) {
-	const bool child_below_delim_join = below_delim_join || op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN;
+                             bool early_stop = false) {
 	if (IsCTEReference(*op, cte_index)) {
-		consumers.push_back({op, filter, filtered, early_stop, below_delim_join});
+		consumers.push_back({op, filter, filtered, early_stop});
 		return;
 	}
 	const bool unary_path = op->children.size() == 1;
@@ -66,8 +64,7 @@ static void FindCTEConsumers(unique_ptr<LogicalOperator> &op, TableIndex cte_ind
 	}
 	const bool child_early_stop = (unary_path && early_stop) || op->type == LogicalOperatorType::LOGICAL_LIMIT;
 	for (auto &child : op->children) {
-		FindCTEConsumers(child, cte_index, consumers, child_filter, child_filtered, child_early_stop,
-		                 child_below_delim_join);
+		FindCTEConsumers(child, cte_index, consumers, child_filter, child_filtered, child_early_stop);
 	}
 }
 
@@ -121,10 +118,8 @@ unique_ptr<LogicalOperator> CTEInlining::OptimizeStructural(unique_ptr<LogicalOp
 	return op;
 }
 
-unique_ptr<LogicalOperator> CTEInlining::OptimizeCostAware(unique_ptr<LogicalOperator> op,
-                                                           bool optimizer_generated_only) {
+unique_ptr<LogicalOperator> CTEInlining::OptimizeCostAware(unique_ptr<LogicalOperator> op) {
 	has_changes = false;
-	generated_only = optimizer_generated_only;
 	TryInlining(op, true);
 	return op;
 }
@@ -241,7 +236,7 @@ void CTEInlining::TryInlining(unique_ptr<LogicalOperator> &op, bool cost_aware) 
 			if (!cost_aware) {
 				return;
 			}
-			if (generated_only && !cte.optimizer_generated) {
+			if (!optimizer.BeginCTECosting(cte.table_index)) {
 				return;
 			}
 			// check if we can inline this CTE
@@ -280,32 +275,13 @@ bool CTEInlining::TryCostAwareInlining(unique_ptr<LogicalOperator> &op) {
 
 	const idx_t consumer_count = consumers.size();
 	set<idx_t> all_consumers;
-	set<idx_t> mandatory_materialized;
-	const bool producer_contains_delim_get = ContainsDelimGet(*cte.children[0]);
 	for (idx_t consumer_idx = 0; consumer_idx < consumer_count; consumer_idx++) {
 		all_consumers.insert(consumer_idx);
-		if (producer_contains_delim_get && consumers[consumer_idx].below_delim_join) {
-			mandatory_materialized.insert(consumer_idx);
-		}
 	}
 
 	const set<idx_t> origin_set;
 	auto valid_subset = [&](const set<idx_t> &inline_set) {
-		for (auto consumer_idx : mandatory_materialized) {
-			if (inline_set.find(consumer_idx) != inline_set.end()) {
-				return false;
-			}
-		}
-		const auto residual_count = consumer_count - inline_set.size();
-		if (residual_count != 1) {
-			return true;
-		}
-		for (idx_t consumer_idx = 0; consumer_idx < consumer_count; consumer_idx++) {
-			if (inline_set.find(consumer_idx) == inline_set.end()) {
-				return mandatory_materialized.find(consumer_idx) != mandatory_materialized.end();
-			}
-		}
-		return false;
+		return consumer_count - inline_set.size() != 1;
 	};
 
 	auto apply_set = [&](unique_ptr<LogicalOperator> &candidate, const set<idx_t> &inline_set) {
@@ -446,9 +422,6 @@ bool CTEInlining::TryCostAwareInlining(unique_ptr<LogicalOperator> &op) {
 	optional_idx strongest_reader;
 	idx_t strongest_score = 0;
 	for (idx_t consumer_idx = 0; consumer_idx < consumer_count; consumer_idx++) {
-		if (mandatory_materialized.find(consumer_idx) != mandatory_materialized.end()) {
-			continue;
-		}
 		const idx_t score = (consumers[consumer_idx].filtered ? 1 : 0) + (consumers[consumer_idx].early_stop ? 2 : 0);
 		if (score > 0) {
 			reader_local_set.insert(consumer_idx);

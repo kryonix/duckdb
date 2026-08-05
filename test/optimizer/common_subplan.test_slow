@@ -236,7 +236,7 @@ LIMIT 100;
 ----
 logical_opt	<REGEX>:.*CTE.*
 
-# q44
+# q44: the cost model chooses recomputation over exchanging this common subplan
 query II
 explain
 SELECT asceding.rnk,
@@ -287,7 +287,7 @@ WHERE asceding.rnk = descending.rnk
 ORDER BY asceding.rnk
 LIMIT 100;
 ----
-logical_opt	<REGEX>:.*CTE.*
+logical_opt	<!REGEX>:.*CTE.*
 
 # q61
 query II
@@ -436,7 +436,7 @@ use tpch;
 statement ok
 call dbgen(sf=0.01, schema='tpch');
 
-# q11
+# q11: the cost model chooses to recompute instead of exchanging the wide join result
 query II
 explain
 SELECT
@@ -467,13 +467,12 @@ HAVING
 ORDER BY
     value DESC;
 ----
-logical_opt	<REGEX>:.*CTE.*
+logical_opt	<!REGEX>:.*CTE.*
 
 statement ok
 RESET disabled_optimizers
 
-# TPCH Q2 with delimiter joins rewritten to CTEs should still expose the
-# repeated supplier/nation/region subtree to common subplan elimination.
+# TPCH Q2 recomputes the repeated supplier/nation/region subtree when the exchange is estimated to cost more.
 query II
 explain
 SELECT
@@ -520,4 +519,4 @@ ORDER BY
     p_partkey
 LIMIT 100;
 ----
-logical_opt	<REGEX>:.*__common_subplan_.*__duckdb_delim_.*
+logical_opt	<!REGEX>:.*__common_subplan_.*

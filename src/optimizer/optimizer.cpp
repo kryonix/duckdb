@@ -384,13 +384,13 @@ void Optimizer::RunBuiltInOptimizers() {
 			CommonSubplanOptimizer common_subplan_optimizer(*this);
 			plan = common_subplan_optimizer.Optimize(std::move(plan));
 		});
-		bool generated_cte_changed = false;
+		bool late_cte_changed = false;
 		RunOptimizer(OptimizerType::CTE_INLINING, [&]() {
 			CTEInlining cte_inlining(*this);
-			plan = cte_inlining.OptimizeCostAware(std::move(plan), true);
-			generated_cte_changed = cte_inlining.HasChanges();
+			plan = cte_inlining.OptimizeCostAware(std::move(plan));
+			late_cte_changed = cte_inlining.HasChanges();
 		});
-		if (generated_cte_changed) {
+		if (late_cte_changed) {
 			RunOptimizer(OptimizerType::FILTER_PUSHDOWN, [&]() {
 				FilterPushdown filter_pushdown(*this);
 				unordered_set<TableIndex> top_bindings;
@@ -537,6 +537,10 @@ bool Optimizer::ConsumeCTECandidateBudget(idx_t count) {
 	}
 	cte_candidate_budget -= count;
 	return true;
+}
+
+bool Optimizer::BeginCTECosting(TableIndex cte_index) {
+	return costed_ctes.insert(cte_index).second;
 }
 
 unique_ptr<Expression> Optimizer::BindScalarFunction(const Identifier &name, unique_ptr<Expression> c1) {
