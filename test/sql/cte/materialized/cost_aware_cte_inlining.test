@@ -80,7 +80,7 @@ logical_opt	<REGEX>:(?s)(?:.*CTE Scan){3}.*
 statement ok
 RESET disabled_optimizers
 
-# More than four direct exchange readers use bounded greedy search and remain shared.
+# More than four direct exchange readers use bounded candidate search and remain shared.
 query II
 EXPLAIN WITH cte AS (
 	SELECT * FROM cte_cost_a JOIN cte_cost_b USING (i) JOIN cte_cost_c USING (i)
@@ -151,7 +151,7 @@ ORDER BY g
 5	36	22482
 6	36	22518
 
-# Recomputing aggregate or window producers is not selected until blocking-work estimates are reliable.
+# Input-side aggregate work is charged, so recomputing this blocking producer is not selected.
 query II
 EXPLAIN WITH year_total AS (
 	SELECT customer_id, year, sum(list_price - discount) AS total, 's' AS sale_type

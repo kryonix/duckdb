@@ -1,7 +1,6 @@
 #include "duckdb/optimizer/common_subplan_optimizer.hpp"
 
 #include "duckdb/optimizer/optimizer.hpp"
-#include "duckdb/optimizer/cte_inlining.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/planner/operator/list.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
@@ -9,12 +8,17 @@
 #include "duckdb/common/arena_containers/arena_unordered_map.hpp"
 #include "duckdb/common/arena_containers/arena_vector.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "duckdb/common/vector_size.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
 
 #include <algorithm>
 
 namespace duckdb {
+
+static constexpr double COMMON_SUBPLAN_MATERIALIZED_EXCHANGE_COST = 2;
+static constexpr double COMMON_SUBPLAN_COST_IMPROVEMENT_THRESHOLD = 0.01;
+static constexpr double COMMON_SUBPLAN_PIPELINE_SETUP_WORK = STANDARD_VECTOR_SIZE * 16;
 
 //===--------------------------------------------------------------------===//
 // Subplan Signature/Info
@@ -678,17 +682,6 @@ private:
 		idx_t child_index;
 	};
 
-	struct SubplanStats {
-		idx_t base_table_count;
-		idx_t max_base_table_cardinality;
-
-		void Combine(const SubplanStats &other) {
-			this->base_table_count += other.base_table_count;
-			this->max_base_table_cardinality =
-			    MaxValue(this->max_base_table_cardinality, other.max_base_table_cardinality);
-		}
-	};
-
 public:
 	void FindCommonSubplans(reference<unique_ptr<LogicalOperator>> root) {
 		// Find first operator with more than 1 child
@@ -857,10 +850,9 @@ public:
 		bool converted_subplans = false;
 		for (auto &entry : sorted_subplans) {
 			auto &subplan_info = entry.get().second;
-			if (!ShouldMaterialize(subplan_info)) {
-				continue; // No longer worth materializing due to other materializations
+			if (!SharingCanPayOff(subplan_info)) {
+				continue;
 			}
-
 			const auto cte_index = optimizer.binder.GenerateTableIndex();
 			const auto cte_name = StringUtil::Format("__common_subplan_%llu", index++);
 			if (!min_cte_idx.IsValid()) {
@@ -995,7 +987,7 @@ public:
 			materialized_projection->children.emplace_back(std::move(materialized_subplan));
 			auto cte = make_uniq<LogicalMaterializedCTE>(Identifier(cte_name), cte_index, materialized_column_count,
 			                                             std::move(materialized_projection), std::move(remainder),
-			                                             CTEMaterialize::CTE_MATERIALIZE_DEFAULT);
+			                                             CTEMaterialize::CTE_MATERIALIZE_DEFAULT, true);
 			for (idx_t subplan_idx = 0; subplan_idx < subplan_info.subplans.size(); subplan_idx++) {
 				const auto &subplan = subplan_info.subplans[subplan_idx];
 				subplan.op.get() = std::move(cte_refs[subplan_idx]);
@@ -1033,6 +1025,49 @@ public:
 			// Invalidate them here; column lifetime runs again later and rebuilds the maps.
 			ClearProjectionMaps(*op);
 		}
+	}
+
+	static double EstimateLogicalWork(const LogicalOperator &op) {
+		double children_work = 0;
+		idx_t maximum_child_cardinality = 0;
+		for (auto &child : op.children) {
+			children_work += EstimateLogicalWork(*child);
+			if (child->has_estimated_cardinality) {
+				maximum_child_cardinality = MaxValue(maximum_child_cardinality, child->estimated_cardinality);
+			}
+		}
+		const auto cardinality = op.has_estimated_cardinality ? op.estimated_cardinality : maximum_child_cardinality;
+		const auto row_work = static_cast<double>(cardinality) * MaxValue<idx_t>(op.types.size(), 1);
+		switch (op.type) {
+		case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+		case LogicalOperatorType::LOGICAL_DISTINCT:
+		case LogicalOperatorType::LOGICAL_WINDOW:
+		case LogicalOperatorType::LOGICAL_ORDER_BY:
+		case LogicalOperatorType::LOGICAL_TOP_N:
+			return children_work + row_work * 2;
+		case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+		case LogicalOperatorType::LOGICAL_ANY_JOIN:
+		case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+			return children_work + row_work * 1.5;
+		default:
+			return children_work + row_work;
+		}
+	}
+
+	static bool SharingCanPayOff(const SubplanInfo &subplan_info) {
+		auto &subplan = subplan_info.subplans[0].op.get();
+		if (!subplan->has_estimated_cardinality) {
+			return false;
+		}
+		const auto producer_work = EstimateLogicalWork(*subplan);
+		const auto consumer_count = static_cast<double>(subplan_info.subplans.size());
+		const auto output_work =
+		    static_cast<double>(subplan->estimated_cardinality) * MaxValue<idx_t>(subplan->types.size(), 1);
+		const auto duplicated_cost = producer_work * consumer_count;
+		const auto shared_cost = producer_work +
+		                         output_work * (consumer_count + 1) * COMMON_SUBPLAN_MATERIALIZED_EXCHANGE_COST +
+		                         COMMON_SUBPLAN_PIPELINE_SETUP_WORK * (consumer_count + 1);
+		return shared_cost <= duplicated_cost * (1.0 - COMMON_SUBPLAN_COST_IMPROVEMENT_THRESHOLD);
 	}
 
 private:
@@ -1168,49 +1203,6 @@ private:
 		for (auto &child : op.children) {
 			ClearProjectionMaps(*child);
 		}
-	}
-
-	bool ShouldMaterialize(const SubplanInfo &subplan_info) const {
-		auto &subplan = subplan_info.subplans[0].op.get();
-		return CTEInlining::EndsInAggregateOrDistinct(*subplan) || IsSelectiveMultiTablePlan(subplan);
-	}
-
-	static SubplanStats GetSubplanStats(const LogicalOperator &op) {
-		SubplanStats subplan_stats;
-		if (op.children.empty()) {
-			subplan_stats.base_table_count = 1;
-			subplan_stats.max_base_table_cardinality = op.has_estimated_cardinality ? op.estimated_cardinality : 0;
-		} else {
-			subplan_stats = GetSubplanStats(*op.children[0]);
-			for (idx_t i = 1; i < op.children.size(); i++) {
-				subplan_stats.Combine(GetSubplanStats(*op.children[i]));
-			}
-		}
-		return subplan_stats;
-	}
-
-	static bool IsSelectiveMultiTablePlan(unique_ptr<LogicalOperator> &op) {
-		static constexpr idx_t CARDINALITY_THRESHOLD = 2048;
-		static constexpr idx_t CARDINALITY_RATIO = 2;
-
-		// Must have an estimated cardinality
-		if (!op->has_estimated_cardinality) {
-			return false;
-		}
-
-		// Must select more than 1 base table
-		const auto subplan_stats = GetSubplanStats(*op);
-		if (subplan_stats.base_table_count < 2) {
-			return false;
-		}
-
-		// If it has this cardinality or less, just materialize
-		if (op->estimated_cardinality <= CARDINALITY_THRESHOLD) {
-			return true;
-		}
-
-		// Otherwise, materialize if it is selective enough
-		return op->estimated_cardinality < subplan_stats.max_base_table_cardinality / CARDINALITY_RATIO;
 	}
 
 	vector<reference<subplan_map_t::value_type>> GetSortedSubplans() {

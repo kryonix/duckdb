@@ -44,6 +44,10 @@ SELECT 'y', count(*) FROM csp_filter_key WHERE a > 1;
 x	3
 y	3
 
+# Make repeated scan and aggregate work large enough to pay for the shared pipeline
+statement ok
+INSERT INTO csp_filter_key SELECT i, i FROM range(1000000) t(i);
+
 statement ok
 PRAGMA explain_output='optimized_only';
 

@@ -18,8 +18,8 @@ from (select sum(range) s from range(10)) t1,
 
 query II
 explain select t1.s + t2.s
-from (select sum(range) s from range(10)) t1,
-     (select sum(range) s from range(10)) t2
+from (select sum(range) s from range(1000000)) t1,
+     (select sum(range) s from range(1000000)) t2
 ----
 logical_opt	<REGEX>:.*CTE.*
 
@@ -45,11 +45,11 @@ from cte t1,
 
 query II
 explain with cte as materialized (
-    select sum(range) s from range(10)
+    select sum(range) s from range(1000000)
 )
 select t1.s + t2.s
 from cte t1,
-     (select sum(range) s from range(10)) t2
+     (select sum(range) s from range(1000000)) t2
 ----
 logical_opt	<REGEX>:.*CTE.*CTE.*
 
@@ -57,13 +57,13 @@ logical_opt	<REGEX>:.*CTE.*CTE.*
 statement ok
 create table build as
 select range a, range * 2 b, range * 3 c, range * 4 d
-from (select range::utinyint as range from range(11))
+from (select range::integer as range from range(100000))
 where range % 5 = 0
 
 statement ok
 create table probe as
 select range e, range * 2 f, range * 3 g, range * 4 h
-from (select range::utinyint as range from range(11))
+from (select range::integer as range from range(100000))
 
 statement ok
 create view my_view as
@@ -104,32 +104,31 @@ select greatest(d, h) from my_view
 ----
 logical_opt	<REGEX>:(?:.*CTE_SCAN){10}.*$
 
-# One common subplan contains another, we get 2 CTEs and 3 CTE scans
-# this also tests that we set up the CTEs in the correct order for scheduling pipeline dependencies
+# Only the low-output aggregate pays for sharing; the high-output distinct is recomputed
 query II
 explain
-select count(*) from (select distinct range from range(10))
+select count(*) from (select distinct range % 10 as range from range(1000000))
 union all
-select count(*) from (select distinct range from range(10))
+select count(*) from (select distinct range % 10 as range from range(1000000))
 union all
-select * from (select distinct range from range(10))
+select * from (select distinct range % 10 as range from range(1000000))
 ----
-logical_opt	<REGEX>:(?:.*CTE){2}.*(?:.*CTE_SCAN){4}.*
+logical_opt	<REGEX>:(?:.*CTE){1}.*(?:.*CTE_SCAN){2}.*
 
 # same as above but with 3 levels of nested CTEs that are recognized
 query II
 explain
-select distinct range from range(10)
+select distinct range % 10 as range from range(1000000)
 union all
-select distinct range from range(10)
+select distinct range % 10 as range from range(1000000)
 union all
-select range % 2 as range from (select distinct range from range(10)) group by range
+select range % 2 as range from (select distinct range % 10 as range from range(1000000)) group by range
 union all
-select range % 2 as range from (select distinct range from range(10)) group by range
+select range % 2 as range from (select distinct range % 10 as range from range(1000000)) group by range
 union all
-select count(*) from (select range % 2 as range from (select distinct range from range(10)) group by range)
+select count(*) from (select range % 2 as range from (select distinct range % 10 as range from range(1000000)) group by range)
 union all
-select count(*) from (select range % 2 as range from (select distinct range from range(10)) group by range)
+select count(*) from (select range % 2 as range from (select distinct range % 10 as range from range(1000000)) group by range)
 ----
 logical_opt	<REGEX>:(?:.*CTE){3}.*(?:.*CTE_SCAN){8}.*
 
@@ -140,29 +139,29 @@ logical_opt	<REGEX>:(?:.*CTE){3}.*(?:.*CTE_SCAN){8}.*
 # a useless projection is created, which again creates a small plan difference
 query II
 explain
-select r1.range from range(10) r1 join range(1) r2 on (r1.range::varchar = r2.range::varchar)
+select r1.range from range(1000000) r1 join range(1) r2 on (r1.range::varchar = r2.range::varchar)
 union all
-select r1.range from range(10) r1 join range(1) r2 on (r1.range::varchar = r2.range::varchar)
+select r1.range from range(1000000) r1 join range(1) r2 on (r1.range::varchar = r2.range::varchar)
 union all
-select r1.range from range(10) r1 join range(1) r2 on (r1.range::varchar = r2.range::varchar) join range(2) r3 on (r2.range::varchar = r3.range::varchar)
+select r1.range from range(1000000) r1 join range(1) r2 on (r1.range::varchar = r2.range::varchar) join range(2) r3 on (r2.range::varchar = r3.range::varchar)
 union all
-select r1.range from range(10) r1 join range(1) r2 on (r1.range::varchar = r2.range::varchar) join range(2) r3 on (r2.range::varchar = r3.range::varchar)
+select r1.range from range(1000000) r1 join range(1) r2 on (r1.range::varchar = r2.range::varchar) join range(2) r3 on (r2.range::varchar = r3.range::varchar)
 union all
-select r1.range from range(10) r1 join range(1) r2 on (r1.range::varchar = r2.range::varchar) join range(2) r3 on (r1.range::varchar = r3.range::varchar) join range(3) r4 on (r3.range::varchar = r4.range::varchar)
+select r1.range from range(1000000) r1 join range(1) r2 on (r1.range::varchar = r2.range::varchar) join range(2) r3 on (r1.range::varchar = r3.range::varchar) join range(3) r4 on (r3.range::varchar = r4.range::varchar)
 union all
-select r1.range from range(10) r1 join range(1) r2 on (r1.range::varchar = r2.range::varchar) join range(2) r3 on (r1.range::varchar = r3.range::varchar) join range(3) r4 on (r3.range::varchar = r4.range::varchar)
+select r1.range from range(1000000) r1 join range(1) r2 on (r1.range::varchar = r2.range::varchar) join range(2) r3 on (r1.range::varchar = r3.range::varchar) join range(3) r4 on (r3.range::varchar = r4.range::varchar)
 ----
-logical_opt	<REGEX>:(?:.*CTE){4}.*(?:.*CTE_SCAN){8}.*
+logical_opt	<REGEX>:(?:.*CTE){2}.*(?:.*CTE_SCAN){4}.*
 
 # A subplan inside a materialized CTE that is common with a subplan outside of the CTE, should also work
 # this also tests that we don't reorder materialized CTEs that were created by hand
 query II
 explain with cte as materialized (
-    select sum(range) s from range(10)
+    select sum(range) s from range(1000000)
 )
 select * from cte
 union all
-select sum(range) s from range(10)
+select sum(range) s from range(1000000)
 ----
 logical_opt	<REGEX>:(?:.*CTE){2}.*(?:.*CTE_SCAN){3}.*
 

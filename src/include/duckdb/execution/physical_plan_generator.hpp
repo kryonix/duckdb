@@ -35,10 +35,19 @@ struct RecursiveCTEPlanningInfo {
 
 struct PhysicalPlanCostEstimate {
 	double cost = 0;
+	double operator_work = 0;
+	double exchange_work = 0;
+	double spill_work = 0;
+	double peak_memory = 0;
+	double target_cte_producer_work = 0;
+	double target_cte_exchange_work = 0;
+	idx_t source_cardinality = 0;
+	idx_t maximum_cardinality = 0;
 	idx_t direct_cte_consumers = 0;
 	idx_t buffered_cte_consumers = 0;
 	idx_t materialized_cte_consumers = 0;
 	bool target_cte_found = false;
+	bool reliable = true;
 };
 
 class PhysicalPlan {

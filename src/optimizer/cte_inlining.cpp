@@ -20,7 +20,7 @@
 namespace duckdb {
 
 static constexpr double CTE_COST_IMPROVEMENT_THRESHOLD = 0.1;
-static constexpr idx_t CTE_CANDIDATE_BUDGET = 32;
+static constexpr idx_t CTE_LOCAL_CANDIDATE_BUDGET = 4;
 
 class TableIndexCheckpoint {
 public:
@@ -39,7 +39,9 @@ private:
 
 struct CTEConsumerInfo {
 	reference<unique_ptr<LogicalOperator>> owner;
+	optional_ptr<LogicalOperator> filter;
 	bool filtered;
+	bool early_stop;
 	bool below_delim_join;
 };
 
@@ -48,23 +50,28 @@ static bool IsCTEReference(const LogicalOperator &op, TableIndex cte_index) {
 }
 
 static void FindCTEConsumers(unique_ptr<LogicalOperator> &op, TableIndex cte_index, vector<CTEConsumerInfo> &consumers,
-                             bool below_delim_join = false) {
+                             optional_ptr<LogicalOperator> filter = nullptr, bool filtered = false,
+                             bool early_stop = false, bool below_delim_join = false) {
 	const bool child_below_delim_join = below_delim_join || op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN;
+	if (IsCTEReference(*op, cte_index)) {
+		consumers.push_back({op, filter, filtered, early_stop, below_delim_join});
+		return;
+	}
+	const bool unary_path = op->children.size() == 1;
+	const bool child_filtered = (unary_path && filtered) || op->type == LogicalOperatorType::LOGICAL_FILTER;
+	optional_ptr<LogicalOperator> child_filter;
 	if (op->type == LogicalOperatorType::LOGICAL_FILTER && op->children.size() == 1 &&
 	    IsCTEReference(*op->children[0], cte_index)) {
-		consumers.push_back({op, true, child_below_delim_join});
-		return;
+		child_filter = op.get();
 	}
-	if (IsCTEReference(*op, cte_index)) {
-		consumers.push_back({op, false, below_delim_join});
-		return;
-	}
+	const bool child_early_stop = (unary_path && early_stop) || op->type == LogicalOperatorType::LOGICAL_LIMIT;
 	for (auto &child : op->children) {
-		FindCTEConsumers(child, cte_index, consumers, child_below_delim_join);
+		FindCTEConsumers(child, cte_index, consumers, child_filter, child_filtered, child_early_stop,
+		                 child_below_delim_join);
 	}
 }
 
-static bool CostEstimateSupported(const LogicalOperator &op, TableIndex target_cte_index) {
+static bool CostEstimateSupported(const LogicalOperator &op) {
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR:
 	case LogicalOperatorType::LOGICAL_RECURSIVE_CTE:
@@ -74,16 +81,11 @@ static bool CostEstimateSupported(const LogicalOperator &op, TableIndex target_c
 	case LogicalOperatorType::LOGICAL_UPDATE:
 	case LogicalOperatorType::LOGICAL_MERGE_INTO:
 		return false;
-	case LogicalOperatorType::LOGICAL_CTE_REF:
-		if (op.Cast<LogicalCTERef>().cte_index != target_cte_index) {
-			return false;
-		}
-		break;
 	default:
 		break;
 	}
 	for (auto &child : op.children) {
-		if (!CostEstimateSupported(*child, target_cte_index)) {
+		if (!CostEstimateSupported(*child)) {
 			return false;
 		}
 	}
@@ -119,26 +121,16 @@ unique_ptr<LogicalOperator> CTEInlining::OptimizeStructural(unique_ptr<LogicalOp
 	return op;
 }
 
-unique_ptr<LogicalOperator> CTEInlining::OptimizeCostAware(unique_ptr<LogicalOperator> op) {
+unique_ptr<LogicalOperator> CTEInlining::OptimizeCostAware(unique_ptr<LogicalOperator> op,
+                                                           bool optimizer_generated_only) {
 	has_changes = false;
+	generated_only = optimizer_generated_only;
 	TryInlining(op, true);
 	return op;
 }
 
 bool CTEInlining::HasChanges() const {
 	return has_changes;
-}
-
-static idx_t CountBaseTableReferences(const LogicalOperator &op) {
-	idx_t number_of_references = 0;
-	if (op.type == LogicalOperatorType::LOGICAL_GET) {
-		number_of_references++;
-	}
-	for (auto &child : op.children) {
-		number_of_references += CountBaseTableReferences(*child);
-	}
-
-	return number_of_references;
 }
 
 static idx_t CountCTEReferences(const LogicalOperator &op, TableIndex cte_index) {
@@ -156,82 +148,12 @@ static idx_t CountCTEReferences(const LogicalOperator &op, TableIndex cte_index)
 	return number_of_references;
 }
 
-static bool ContainsLimit(const LogicalOperator &op) {
-	if (op.type == LogicalOperatorType::LOGICAL_LIMIT || op.type == LogicalOperatorType::LOGICAL_TOP_N) {
-		return true;
-	}
-	if (op.children.size() != 1) {
-		return false;
-	}
-	for (auto &child : op.children) {
-		if (ContainsLimit(*child)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-bool CTEInlining::EndsInAggregateOrDistinct(const LogicalOperator &op) {
-	switch (op.type) {
-	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
-	case LogicalOperatorType::LOGICAL_DISTINCT:
-	case LogicalOperatorType::LOGICAL_WINDOW:
-		return true;
-	default:
-		break;
-	}
-	if (op.children.size() != 1) {
-		return false;
-	}
-	for (auto &child : op.children) {
-		if (EndsInAggregateOrDistinct(*child)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static bool EndsInDummyScan(const LogicalOperator &op) {
-	if (op.type == LogicalOperatorType::LOGICAL_DUMMY_SCAN || op.type == LogicalOperatorType::LOGICAL_EMPTY_RESULT ||
-	    op.type == LogicalOperatorType::LOGICAL_CTE_REF) {
-		return true;
-	}
-	if (op.children.size() != 1) {
-		return false;
-	}
-	for (auto &child : op.children) {
-		if (EndsInDummyScan(*child)) {
-			return true;
-		}
-	}
-	return false;
-}
-
 static bool ContainsDelimGet(const LogicalOperator &op) {
 	if (op.type == LogicalOperatorType::LOGICAL_DELIM_GET) {
 		return true;
 	}
 	for (auto &child : op.children) {
 		if (ContainsDelimGet(*child)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static bool ContainsCostSensitiveBlockingOperator(const LogicalOperator &op) {
-	switch (op.type) {
-	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
-	case LogicalOperatorType::LOGICAL_DISTINCT:
-	case LogicalOperatorType::LOGICAL_WINDOW:
-	case LogicalOperatorType::LOGICAL_ORDER_BY:
-	case LogicalOperatorType::LOGICAL_TOP_N:
-		return true;
-	default:
-		break;
-	}
-	for (auto &child : op.children) {
-		if (ContainsCostSensitiveBlockingOperator(*child)) {
 			return true;
 		}
 	}
@@ -319,6 +241,9 @@ void CTEInlining::TryInlining(unique_ptr<LogicalOperator> &op, bool cost_aware) 
 			if (!cost_aware) {
 				return;
 			}
+			if (generated_only && !cte.optimizer_generated) {
+				return;
+			}
 			// check if we can inline this CTE
 			PreventInlining prevent_inlining;
 			prevent_inlining.VisitOperator(*op->children[0]);
@@ -330,47 +255,13 @@ void CTEInlining::TryInlining(unique_ptr<LogicalOperator> &op, bool cost_aware) 
 			if (TryCostAwareInlining(op)) {
 				return;
 			}
-
-			// Prevent inlining if the CTE ends in an aggregate or distinct operator
-			// This mimics the behavior of the CTE materialization in the binder
-			if (EndsInAggregateOrDistinct(*op->children[0])) {
-				return;
-			}
-
-			bool is_cheap_to_inline = op->children[0]->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT ||
-			                          op->children[0]->type == LogicalOperatorType::LOGICAL_CTE_REF ||
-			                          EndsInDummyScan(*op->children[0]);
-
-			// Check how many base table references the CTE has
-			auto base_table_references = CountBaseTableReferences(*op->children[0]);
-
-			if (!is_cheap_to_inline && base_table_references > 2 && base_table_references * ref_count > 10) {
-				return;
-			}
-
-			// CTEs require full materialization before the CTE scans begin,
-			// LIMIT and TOP_N operators cannot abort the materialization,
-			// even if only a part of the CTE result is needed.
-			// Therefore, we check if the CTE Scans are below the LIMIT or TOP_N operator
-			// and if so, we try to inline the CTE definition.
-			if (is_cheap_to_inline || ContainsLimit(*op->children[1])) {
-				// this CTE is referenced multiple times and has a limit, we want to inline it
-				bool success = Inline(op->children[1], *op, true);
-				if (success) {
-					op = std::move(op->children[1]);
-					has_changes = true;
-				}
-				return;
-			}
+			return;
 		}
 	}
 }
 
 bool CTEInlining::TryCostAwareInlining(unique_ptr<LogicalOperator> &op) {
 	auto &cte = op->Cast<LogicalMaterializedCTE>();
-	if (ContainsCostSensitiveBlockingOperator(*cte.children[0])) {
-		return false;
-	}
 	vector<CTEConsumerInfo> consumers;
 	FindCTEConsumers(op->children[1], cte.table_index, consumers);
 	if (consumers.size() < 2) {
@@ -383,7 +274,7 @@ bool CTEInlining::TryCostAwareInlining(unique_ptr<LogicalOperator> &op) {
 	    optimizer.OptimizerDisabled(OptimizerType::STATISTICS_PROPAGATION)) {
 		return false;
 	}
-	if (!CostEstimateSupported(*op, cte.table_index)) {
+	if (!CostEstimateSupported(*op)) {
 		return false;
 	}
 
@@ -398,17 +289,7 @@ bool CTEInlining::TryCostAwareInlining(unique_ptr<LogicalOperator> &op) {
 		}
 	}
 
-	bool legacy_inline = false;
-	if (!EndsInAggregateOrDistinct(*cte.children[0])) {
-		const bool cheap = cte.children[0]->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT ||
-		                   cte.children[0]->type == LogicalOperatorType::LOGICAL_CTE_REF ||
-		                   EndsInDummyScan(*cte.children[0]);
-		const auto base_table_references = CountBaseTableReferences(*cte.children[0]);
-		const bool too_expensive_to_copy =
-		    !cheap && base_table_references > 2 && base_table_references * consumer_count > 10;
-		legacy_inline = !too_expensive_to_copy && (cheap || ContainsLimit(*cte.children[1]));
-	}
-	const set<idx_t> legacy_set = legacy_inline ? all_consumers : set<idx_t>();
+	const set<idx_t> origin_set;
 	auto valid_subset = [&](const set<idx_t> &inline_set) {
 		for (auto consumer_idx : mandatory_materialized) {
 			if (inline_set.find(consumer_idx) != inline_set.end()) {
@@ -443,24 +324,13 @@ bool CTEInlining::TryCostAwareInlining(unique_ptr<LogicalOperator> &op) {
 		for (auto consumer_idx : inline_set) {
 			auto &consumer = candidate_consumers[consumer_idx];
 			auto &consumer_op = *consumer.owner.get();
-			auto &cteref =
-			    consumer.filtered ? consumer_op.children[0]->Cast<LogicalCTERef>() : consumer_op.Cast<LogicalCTERef>();
+			auto &cteref = consumer_op.Cast<LogicalCTERef>();
 			LogicalOperatorDeepCopy deep_copy(optimizer.binder, parameter_data);
 			unique_ptr<LogicalOperator> definition_copy;
 			try {
 				definition_copy = deep_copy.DeepCopy(candidate_cte.children[0]);
 			} catch (NotImplementedException &ex) {
 				return false;
-			}
-			if (consumer.filtered) {
-				vector<reference<LogicalOperator>> filters {consumer_op};
-				auto filter_expression = CTEFilterPusher::BuildFilterExpression(*definition_copy, filters);
-				auto filter = make_uniq_base<LogicalOperator, LogicalFilter>(std::move(filter_expression));
-				LogicalFilter::SplitPredicates(filter->Cast<LogicalFilter>().expressions);
-				optimizer.rewriter.VisitOperator(*filter);
-				filter->children.push_back(std::move(definition_copy));
-				FilterPushdown pushdown(optimizer, true, FilterPushdown::ProjectionMode::PRESERVE_COMPUTED_EXPRESSIONS);
-				definition_copy = pushdown.Rewrite(std::move(filter));
 			}
 			vector<unique_ptr<Expression>> projection_expressions;
 			auto bindings = definition_copy->GetColumnBindings();
@@ -484,14 +354,48 @@ bool CTEInlining::TryCostAwareInlining(unique_ptr<LogicalOperator> &op) {
 	};
 
 	map<set<idx_t>, double> costs;
+	map<idx_t, double> inline_producer_costs;
 	idx_t evaluated_candidates = 0;
-	bool legacy_all_direct = false;
+	optional<double> origin_producer_work;
+	auto estimate_inline_producer = [&](idx_t consumer_idx) -> optional<double> {
+		auto existing = inline_producer_costs.find(consumer_idx);
+		if (existing != inline_producer_costs.end()) {
+			return existing->second;
+		}
+		if (!consumers[consumer_idx].filter || !optimizer.ConsumeCTECandidateBudget()) {
+			return optional<double>();
+		}
+		TableIndexCheckpoint checkpoint(optimizer.binder);
+		try {
+			LogicalOperatorDeepCopy deep_copy(optimizer.binder, parameter_data);
+			auto producer = deep_copy.DeepCopy(cte.children[0]);
+			producer->ResolveOperatorTypes();
+			vector<reference<LogicalOperator>> filters {*consumers[consumer_idx].filter};
+			auto filter_expression = CTEFilterPusher::BuildFilterExpression(*producer, filters);
+			auto filter = make_uniq_base<LogicalOperator, LogicalFilter>(std::move(filter_expression));
+			LogicalFilter::SplitPredicates(filter->Cast<LogicalFilter>().expressions);
+			optimizer.rewriter.VisitOperator(*filter);
+			filter->children.push_back(std::move(producer));
+			producer = OptimizeCandidate(optimizer, std::move(filter));
+			auto estimate =
+			    PhysicalPlanGenerator::EstimateCandidateCost(optimizer.context, std::move(producer), cte.table_index);
+			if (!estimate || !estimate->reliable) {
+				return optional<double>();
+			}
+			inline_producer_costs.emplace(consumer_idx, estimate->cost);
+			return estimate->cost;
+		} catch (NotImplementedException &ex) {
+			return optional<double>();
+		} catch (InternalException &ex) {
+			return optional<double>();
+		}
+	};
 	auto estimate_subset = [&](const set<idx_t> &inline_set) -> optional<double> {
 		auto existing = costs.find(inline_set);
 		if (existing != costs.end()) {
 			return existing->second;
 		}
-		if (evaluated_candidates >= CTE_CANDIDATE_BUDGET) {
+		if (evaluated_candidates >= CTE_LOCAL_CANDIDATE_BUDGET || !optimizer.ConsumeCTECandidateBudget()) {
 			return optional<double>();
 		}
 		evaluated_candidates++;
@@ -504,129 +408,81 @@ bool CTEInlining::TryCostAwareInlining(unique_ptr<LogicalOperator> &op) {
 			candidate = OptimizeCandidate(optimizer, std::move(candidate));
 			auto estimate =
 			    PhysicalPlanGenerator::EstimateCandidateCost(optimizer.context, std::move(candidate), cte.table_index);
-			if (estimate) {
-				if (inline_set == legacy_set && estimate->target_cte_found) {
-					legacy_all_direct = estimate->direct_cte_consumers == consumer_count &&
-					                    estimate->buffered_cte_consumers == 0 &&
-					                    estimate->materialized_cte_consumers == 0;
+			if (estimate && estimate->reliable) {
+				double cost = estimate->cost;
+				if (inline_set == origin_set && estimate->target_cte_found) {
+					origin_producer_work = estimate->target_cte_producer_work;
 				}
-				costs.emplace(inline_set, estimate->cost);
-				return estimate->cost;
+				if (origin_producer_work) {
+					cost = estimate->target_cte_exchange_work + estimate->target_cte_producer_work;
+					for (auto consumer_idx : inline_set) {
+						auto inline_cost = estimate_inline_producer(consumer_idx);
+						cost += inline_cost ? *inline_cost : *origin_producer_work;
+					}
+				}
+				costs.emplace(inline_set, cost);
+				return cost;
 			}
 			return optional<double>();
 		} catch (NotImplementedException &ex) {
 			return optional<double>();
+		} catch (InternalException &ex) {
+			return optional<double>();
 		}
 	};
 
-	auto legacy_cost = estimate_subset(legacy_set);
-	if (!legacy_cost) {
+	auto origin_cost = estimate_subset(origin_set);
+	if (!origin_cost) {
 		return false;
-	}
-	if (legacy_set.empty() && legacy_all_direct) {
-		return true;
-	}
-	estimate_subset(set<idx_t>());
-	if (valid_subset(all_consumers)) {
-		estimate_subset(all_consumers);
 	}
 
 	set<set<idx_t>> candidates;
-	candidates.insert(legacy_set);
+	candidates.insert(origin_set);
 	candidates.insert(set<idx_t>());
 	if (valid_subset(all_consumers)) {
 		candidates.insert(all_consumers);
 	}
-	if (consumer_count <= 4) {
-		const auto subset_count = uint64_t(1) << consumer_count;
-		for (uint64_t mask = 0; mask < subset_count; mask++) {
-			set<idx_t> inline_set;
-			for (idx_t consumer_idx = 0; consumer_idx < consumer_count; consumer_idx++) {
-				if (mask & (uint64_t(1) << consumer_idx)) {
-					inline_set.insert(consumer_idx);
-				}
-			}
-			if (valid_subset(inline_set)) {
-				candidates.insert(std::move(inline_set));
-			}
+	set<idx_t> reader_local_set;
+	optional_idx strongest_reader;
+	idx_t strongest_score = 0;
+	for (idx_t consumer_idx = 0; consumer_idx < consumer_count; consumer_idx++) {
+		if (mandatory_materialized.find(consumer_idx) != mandatory_materialized.end()) {
+			continue;
 		}
-	} else {
-		set<idx_t> current_set;
-		while (current_set.size() < consumer_count) {
-			candidates.insert(current_set);
-			optional_idx best_consumer;
-			double best_next_cost = NumericLimits<double>::Maximum();
-			for (idx_t consumer_idx = 0; consumer_idx < consumer_count; consumer_idx++) {
-				if (current_set.find(consumer_idx) != current_set.end() ||
-				    mandatory_materialized.find(consumer_idx) != mandatory_materialized.end()) {
-					continue;
-				}
-				auto next_set = current_set;
-				next_set.insert(consumer_idx);
-				if (!valid_subset(next_set)) {
-					continue;
-				}
-				auto cost = estimate_subset(next_set);
-				if (cost && *cost < best_next_cost) {
-					best_next_cost = *cost;
-					best_consumer = consumer_idx;
-				}
-			}
-			if (!best_consumer.IsValid()) {
-				break;
-			}
-			current_set.insert(best_consumer.GetIndex());
+		const idx_t score = (consumers[consumer_idx].filtered ? 1 : 0) + (consumers[consumer_idx].early_stop ? 2 : 0);
+		if (score > 0) {
+			reader_local_set.insert(consumer_idx);
 		}
-
-		current_set.clear();
-		for (idx_t consumer_idx = 0; consumer_idx < consumer_count; consumer_idx++) {
-			if (mandatory_materialized.find(consumer_idx) == mandatory_materialized.end()) {
-				current_set.insert(consumer_idx);
-			}
+		if (score > strongest_score) {
+			strongest_score = score;
+			strongest_reader = consumer_idx;
 		}
-		while (!current_set.empty()) {
-			if (valid_subset(current_set)) {
-				candidates.insert(current_set);
-			}
-			optional_idx best_consumer;
-			double best_next_cost = NumericLimits<double>::Maximum();
-			for (auto consumer_idx : current_set) {
-				auto next_set = current_set;
-				next_set.erase(consumer_idx);
-				if (!valid_subset(next_set)) {
-					continue;
-				}
-				auto cost = estimate_subset(next_set);
-				if (cost && *cost < best_next_cost) {
-					best_next_cost = *cost;
-					best_consumer = consumer_idx;
-				}
-			}
-			if (!best_consumer.IsValid()) {
-				break;
-			}
-			current_set.erase(best_consumer.GetIndex());
+	}
+	if (valid_subset(reader_local_set)) {
+		candidates.insert(reader_local_set);
+	}
+	if (strongest_reader.IsValid()) {
+		set<idx_t> strongest_set {strongest_reader.GetIndex()};
+		if (valid_subset(strongest_set)) {
+			candidates.insert(std::move(strongest_set));
 		}
 	}
 
-	double best_cost = *legacy_cost;
-	set<idx_t> best_set = legacy_set;
+	double best_cost = *origin_cost;
+	set<idx_t> best_set = origin_set;
 	for (const auto &inline_set : candidates) {
-		if (!valid_subset(inline_set) && inline_set != legacy_set) {
+		if (!valid_subset(inline_set) && inline_set != origin_set) {
 			continue;
 		}
 		auto cost = estimate_subset(inline_set);
-		if (inline_set != legacy_set && (inline_set.empty() || inline_set.size() == consumer_count)) {
-			continue;
-		}
 		if (cost && *cost < best_cost) {
 			best_cost = *cost;
 			best_set = inline_set;
 		}
 	}
 
-	set<idx_t> selected_set = legacy_set;
-	if (best_set != legacy_set && best_cost <= *legacy_cost * (1.0 - CTE_COST_IMPROVEMENT_THRESHOLD)) {
+	set<idx_t> selected_set = origin_set;
+	if (best_set != origin_set && best_cost <= *origin_cost * (1.0 - CTE_COST_IMPROVEMENT_THRESHOLD)) {
 		selected_set = std::move(best_set);
 	}
 	if (selected_set.empty()) {

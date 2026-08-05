@@ -23,13 +23,15 @@ public:
 public:
 	LogicalMaterializedCTE(Identifier ctename_p, TableIndex table_index, idx_t column_count,
 	                       unique_ptr<LogicalOperator> cte, unique_ptr<LogicalOperator> child,
-	                       CTEMaterialize materialize)
+	                       CTEMaterialize materialize, bool optimizer_generated_p = false)
 	    : LogicalCTE(std::move(ctename_p), table_index, column_count, std::move(cte), std::move(child),
 	                 LogicalOperatorType::LOGICAL_MATERIALIZED_CTE),
-	      materialize(materialize) {
+	      materialize(materialize), optimizer_generated(optimizer_generated_p) {
 	}
 
 	CTEMaterialize materialize = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
+	//! Optimizer-local provenance used by the late CTE inlining pass.
+	bool optimizer_generated = false;
 
 public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;

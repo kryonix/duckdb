@@ -384,6 +384,20 @@ void Optimizer::RunBuiltInOptimizers() {
 			CommonSubplanOptimizer common_subplan_optimizer(*this);
 			plan = common_subplan_optimizer.Optimize(std::move(plan));
 		});
+		bool generated_cte_changed = false;
+		RunOptimizer(OptimizerType::CTE_INLINING, [&]() {
+			CTEInlining cte_inlining(*this);
+			plan = cte_inlining.OptimizeCostAware(std::move(plan), true);
+			generated_cte_changed = cte_inlining.HasChanges();
+		});
+		if (generated_cte_changed) {
+			RunOptimizer(OptimizerType::FILTER_PUSHDOWN, [&]() {
+				FilterPushdown filter_pushdown(*this);
+				unordered_set<TableIndex> top_bindings;
+				filter_pushdown.CheckMarkToSemi(*plan, top_bindings);
+				plan = filter_pushdown.Rewrite(std::move(plan));
+			});
+		}
 	}
 
 	// pushes LIMIT below PROJECTION
@@ -515,6 +529,14 @@ unique_ptr<LogicalOperator> Optimizer::Optimize(unique_ptr<LogicalOperator> plan
 	Planner::VerifyPlan(context, plan);
 
 	return std::move(plan);
+}
+
+bool Optimizer::ConsumeCTECandidateBudget(idx_t count) {
+	if (cte_candidate_budget < count) {
+		return false;
+	}
+	cte_candidate_budget -= count;
+	return true;
 }
 
 unique_ptr<Expression> Optimizer::BindScalarFunction(const Identifier &name, unique_ptr<Expression> c1) {

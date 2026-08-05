@@ -25,9 +25,9 @@ class CTEInlining {
 public:
 	explicit CTEInlining(Optimizer &optimizer);
 	unique_ptr<LogicalOperator> OptimizeStructural(unique_ptr<LogicalOperator> op);
-	unique_ptr<LogicalOperator> OptimizeCostAware(unique_ptr<LogicalOperator> op);
+	unique_ptr<LogicalOperator> OptimizeCostAware(unique_ptr<LogicalOperator> op,
+	                                              bool optimizer_generated_only = false);
 	bool HasChanges() const;
-	static bool EndsInAggregateOrDistinct(const LogicalOperator &op);
 
 private:
 	void TryInlining(unique_ptr<LogicalOperator> &op, bool cost_aware);
@@ -39,6 +39,7 @@ private:
 	Optimizer &optimizer;
 	optional_ptr<bound_parameter_map_t> parameter_data;
 	bool has_changes = false;
+	bool generated_only = false;
 };
 
 class PreventInlining : public LogicalOperatorVisitor {

@@ -30,6 +30,8 @@ public:
 	//! Whether the specific optimizer is disabled
 	bool OptimizerDisabled(OptimizerType type);
 	static bool OptimizerDisabled(ClientContext &context, OptimizerType type);
+	//! Consume one speculative physical CTE plan from the per-query budget.
+	bool ConsumeCTECandidateBudget(idx_t count = 1);
 
 	//! Pre-binder statement-level optimization pass
 	void OptimizeStatement(unique_ptr<SQLStatement> &statement);
@@ -54,6 +56,7 @@ public:
 
 private:
 	unique_ptr<LogicalOperator> plan;
+	idx_t cte_candidate_budget = 16;
 
 private:
 	unique_ptr<Expression> BindScalarFunction(const Identifier &name, vector<unique_ptr<Expression>> children);
