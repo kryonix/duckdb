@@ -132,7 +132,6 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_GLOBAL(DefaultSecretStorageSetting),
     DUCKDB_SETTING_CALLBACK(DefaultTransactionInvalidationPolicySetting),
     DUCKDB_SETTING(DelimJoinAsCteSetting),
-    DUCKDB_SETTING_CALLBACK(DeprecatedUsingKeySyntaxSetting),
     DUCKDB_SETTING_CALLBACK(DialectCompatibilityModeSetting),
     DUCKDB_SETTING_CALLBACK(DisableDatabaseInvalidationSetting),
     DUCKDB_SETTING(DisableTimestamptzCastsSetting),
@@ -250,12 +249,12 @@ static const ConfigurationOption internal_options[] = {
 
 static const ConfigurationAlias setting_aliases[] = {DUCKDB_SETTING_ALIAS("configure_metrics", 30),
                                                      DUCKDB_SETTING_ALIAS("custom_profiling_settings", 30),
-                                                     DUCKDB_SETTING_ALIAS("memory_limit", 129),
+                                                     DUCKDB_SETTING_ALIAS("memory_limit", 128),
                                                      DUCKDB_SETTING_ALIAS("null_order", 61),
-                                                     DUCKDB_SETTING_ALIAS("profile_output", 152),
-                                                     DUCKDB_SETTING_ALIAS("user", 171),
+                                                     DUCKDB_SETTING_ALIAS("profile_output", 151),
+                                                     DUCKDB_SETTING_ALIAS("user", 170),
                                                      DUCKDB_SETTING_ALIAS("wal_autocheckpoint", 29),
-                                                     DUCKDB_SETTING_ALIAS("worker_threads", 169),
+                                                     DUCKDB_SETTING_ALIAS("worker_threads", 168),
                                                      FINAL_ALIAS};
 
 vector<ConfigurationOption> DBConfig::GetOptions() {
