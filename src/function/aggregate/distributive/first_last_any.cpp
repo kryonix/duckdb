@@ -435,6 +435,7 @@ unique_ptr<FunctionData> BindDecimalFirst(BindAggregateFunctionInput &input) {
 	function.ReplaceImplementation(GetFirstFunction<LAST, SKIP_NULLS>(decimal_type));
 	function.SetName(std::move(name));
 	function.SetDistinctDependent(AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT);
+	function.SetSingleValueIdentity(true);
 	function.SetReturnType(decimal_type);
 	return nullptr;
 }
@@ -457,6 +458,7 @@ unique_ptr<FunctionData> BindFirst(BindAggregateFunctionInput &input) {
 	function.ReplaceImplementation(GetFirstOperator<LAST, SKIP_NULLS>(input_type));
 	function.SetName(std::move(name));
 	function.SetDistinctDependent(AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT);
+	function.SetSingleValueIdentity(true);
 	return nullptr;
 }
 
@@ -475,12 +477,14 @@ void AddFirstOperator(AggregateFunctionSet &set) {
 AggregateFunction FirstFunctionGetter::GetFunction(const LogicalType &type) {
 	auto fun = GetFirstFunction<false, false>(type);
 	fun.SetName("first");
+	fun.SetSingleValueIdentity(true);
 	return fun;
 }
 
 AggregateFunction LastFunctionGetter::GetFunction(const LogicalType &type) {
 	auto fun = GetFirstFunction<true, false>(type);
 	fun.SetName("last");
+	fun.SetSingleValueIdentity(true);
 	return fun;
 }
 
