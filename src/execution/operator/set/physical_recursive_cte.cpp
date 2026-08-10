@@ -381,6 +381,8 @@ unique_ptr<GlobalSinkState> PhysicalRecursiveCTE::GetGlobalSinkState(ClientConte
 	return make_uniq<RecursiveCTEState>(context, *this);
 }
 
+enum class RecursiveCTELocalPreaggregationDecision : uint8_t { DEFER, PREAGGREGATE, DIRECT };
+
 class RecursiveCTELocalPreaggregationState {
 public:
 	RecursiveCTELocalPreaggregationState(ClientContext &context_p, const PhysicalRecursiveCTE &op_p)
@@ -406,26 +408,34 @@ public:
 		input.Initialize(Allocator::Get(context), op.internal_types);
 	}
 
-	bool ShouldPreaggregate(ColumnDataCollection &candidates) {
+	RecursiveCTELocalPreaggregationDecision Classify(ColumnDataCollection &candidates) {
 		const auto candidate_count = candidates.Count();
-		if (candidate_count < STANDARD_VECTOR_SIZE) {
-			return false;
-		}
-		HyperLogLog cardinality;
-		const auto group_limit = candidate_count / 4;
+		D_ASSERT(candidate_count >= STANDARD_VECTOR_SIZE);
+		sampled_candidate_count += candidate_count;
 		ColumnDataScanState scan_state;
 		candidates.InitializeScan(scan_state);
 		while (candidates.Scan(scan_state, input)) {
 			ExtractKeys(input);
 			keys.Hash(hashes);
 			cardinality.Update(hashes);
-			const auto distinct_upper_bound =
-			    LossyNumericCast<idx_t>((1 + HyperLogLog::GetErrorRate()) * static_cast<double>(cardinality.Count()));
-			if (distinct_upper_bound >= group_limit) {
-				return false;
-			}
 		}
-		return true;
+		const auto distinct_upper_bound =
+		    LossyNumericCast<idx_t>((1 + HyperLogLog::GetErrorRate()) * static_cast<double>(cardinality.Count()));
+		if (distinct_upper_bound < sampled_candidate_count / 4) {
+			return RecursiveCTELocalPreaggregationDecision::PREAGGREGATE;
+		}
+		// Keep sampling across vector boundaries, but bound the extra hashing for unique streams.
+		static constexpr idx_t MAX_SAMPLE_VECTORS = 8;
+		const auto sample_size = MaxValue<idx_t>(STANDARD_VECTOR_SIZE, 16);
+		if (sampled_candidate_count >= sample_size * MAX_SAMPLE_VECTORS) {
+			return RecursiveCTELocalPreaggregationDecision::DIRECT;
+		}
+		return RecursiveCTELocalPreaggregationDecision::DEFER;
+	}
+
+	void ResetClassification() {
+		cardinality = HyperLogLog();
+		sampled_candidate_count = 0;
 	}
 
 	unique_ptr<GroupedAggregateHashTable> Preaggregate(ColumnDataCollection &candidates) {
@@ -473,6 +483,8 @@ private:
 	DataChunk payload;
 	DataChunk input;
 	Vector hashes;
+	HyperLogLog cardinality;
+	idx_t sampled_candidate_count = 0;
 };
 
 class RecursiveCTELocalState : public LocalSinkState {
@@ -533,7 +545,7 @@ public:
 			return;
 		}
 		ClassifyBufferedUsingKeyOutput();
-		if (direct_using_key_output) {
+		if (!buffer_using_key_output) {
 			gstate.CombineOutput(*output);
 			output->ResetForReuse();
 			output->InitializeAppend(append_state);
@@ -547,11 +559,12 @@ public:
 			using_key_preaggregation = make_uniq<RecursiveCTELocalPreaggregationState>(context, op);
 		}
 		const auto classification_start = std::chrono::steady_clock::now();
-		buffer_using_key_output = using_key_preaggregation->ShouldPreaggregate(*output);
+		const auto decision = using_key_preaggregation->Classify(*output);
 		const auto classification_end = std::chrono::steady_clock::now();
 		using_key_classification_work_ns += NumericCast<idx_t>(
 		    std::chrono::duration_cast<std::chrono::nanoseconds>(classification_end - classification_start).count());
-		direct_using_key_output = !buffer_using_key_output;
+		buffer_using_key_output = decision == RecursiveCTELocalPreaggregationDecision::PREAGGREGATE;
+		direct_using_key_output = decision == RecursiveCTELocalPreaggregationDecision::DIRECT;
 	}
 
 	void BufferUsingKeyOutput(DataChunk &chunk) {
@@ -595,6 +608,9 @@ public:
 		using_key_classification_work_ns = 0;
 		buffer_using_key_output = false;
 		direct_using_key_output = false;
+		if (using_key_preaggregation) {
+			using_key_preaggregation->ResetClassification();
+		}
 		if (!output) {
 			return;
 		}
