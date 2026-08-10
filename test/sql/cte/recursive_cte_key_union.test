@@ -174,6 +174,61 @@ TABLE t;
 ----
 1	0
 
+# Change-aware append aggregates do not report state updates that leave their finalized value unchanged.
+query II
+WITH RECURSIVE t(k, v) USING KEY (k, string_agg(v, '') AS v) AS (
+	VALUES (1, '')
+	UNION
+	SELECT k, '' FROM t
+)
+TABLE t;
+----
+1	(empty)
+
+# Direct change reporting composes across independent irreversible aggregate states.
+query IIIIIIIIIIITT
+WITH RECURSIVE t(k, step, lo, hi, n, even_n, all_pos, any_zero, mask_and, mask_or, first_v, vals, text)
+USING KEY (k, max(step), min(lo), max(hi), count(n) AS n, countif(even_n) AS even_n,
+	bool_and(all_pos), bool_or(any_zero), bit_and(mask_and), bit_or(mask_or), first(first_v),
+	list(vals), string_agg(text, '') AS text) AS (
+	SELECT 1, 0, 10, 10, 1, true, true, false, 15, 1, 100, 0, 'a'
+	UNION
+	SELECT k, step + 1, lo - 1, hi + 1, n, step % 2 = 0, all_pos AND step < 2,
+	       any_zero OR step = 1, mask_and >> 1, mask_or << 1, first_v + 1, step + 1, 'b'
+	FROM t
+	WHERE step < 3
+)
+TABLE t;
+----
+1	3	7	13	4	3	false	true	1	15	100	[0, 1, 2, 3]	abbb
+
+# Nested extrema, top-N heaps, bit strings, histograms, and binary counters remain reusable after each delta drain.
+query IITTTTI
+WITH RECURSIVE t(k, step, nested_v, top_v, bits, hist, pairs)
+USING KEY (k, max(step), min(nested_v), min(top_v, 2) AS top_v, bitstring_agg(bits, 0, 2),
+	histogram(hist), regr_count(pairs, pairs) AS pairs) AS (
+	SELECT 1, 0, [3], 5, 0, 0, 0::DOUBLE
+	UNION
+	SELECT k, step + 1, [nested_v[1] - 1], 4 - step, step + 1, step + 1, step + 1
+	FROM t
+	WHERE step < 2
+)
+SELECT k, step, nested_v, top_v, bits, hist, pairs FROM t;
+----
+1	2	[1]	[3, 4]	111	{0=1, 1=1, 2=1}	3
+
+# The generic arg-min fallback also updates correctly after its top-N heap has been finalized.
+query IITI
+WITH RECURSIVE t(k, step, arg_v, rank_v)
+USING KEY (k, max(step), arg_min(arg_v, rank_v, 2) AS arg_v) AS (
+	SELECT 1, 0, 50, 5
+	UNION
+	SELECT k, step + 1, 40 - step * 10, 4 - step FROM t WHERE step < 2
+)
+TABLE t;
+----
+1	2	[30, 40]	3
+
 # Hidden aggregate-state changes do not form work when the finalized value is unchanged.
 query II
 WITH RECURSIVE t(k, v) USING KEY (k, avg(v) AS v) AS (

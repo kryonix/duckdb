@@ -106,7 +106,9 @@ RecursiveCTEKeyDeltaState::RecursiveCTEKeyDeltaState(ClientContext &context, con
 
 void RecursiveCTEKeyDeltaState::Reset() {
 	touched_addresses.Reset();
+	changed_addresses.Reset();
 	new_group_addresses.clear();
+	changed_group_addresses.clear();
 	new_group_address_set.Reset();
 	new_group_address_set_built = false;
 	collections_initialized = false;
@@ -260,6 +262,50 @@ void RecursiveCTEState::SnapshotUsingKeyDelta(const Vector &group_addresses, con
 	const auto defer_append = allow_candidate_reuse && can_reuse_changed_group_candidates &&
 	                          row_count == candidate_count && new_group_count == 0 && matched_count == row_count;
 	SnapshotExistingUsingKeyDeltaAddresses(delta.matched_addresses, matched_count, defer_append);
+}
+
+void RecursiveCTEState::TrackUsingKeyChanges(const Vector &group_addresses, const SelectionVector &new_groups,
+                                             idx_t new_group_count, const SelectionVector &changed_groups,
+                                             idx_t changed_group_count, idx_t row_count) {
+	D_ASSERT(key_delta && new_group_count <= row_count && changed_group_count <= row_count);
+	auto &delta = *key_delta;
+	group_addresses.Flatten();
+	auto addresses = FlatVector::GetData<data_ptr_t>(group_addresses);
+	if (!delta.new_group_address_set_built) {
+		delta.new_group_address_set.Reserve(delta.new_group_addresses.size() + new_group_count);
+		for (auto address : delta.new_group_addresses) {
+			delta.new_group_address_set.Insert(address);
+		}
+		delta.new_group_address_set_built = true;
+	}
+	for (idx_t new_group_idx = 0; new_group_idx < new_group_count; new_group_idx++) {
+		const auto input_idx = new_groups.get_index_unsafe(new_group_idx);
+		const auto address = addresses[input_idx];
+		if (delta.new_group_address_set.Insert(address)) {
+			delta.new_group_addresses.push_back(address);
+			delta.new_count++;
+			delta.touched_count++;
+		}
+	}
+
+	delta.touched_addresses.Reserve(delta.touched_count + row_count);
+	for (idx_t row_idx = 0; row_idx < row_count; row_idx++) {
+		const auto address = addresses[row_idx];
+		if (!delta.new_group_address_set.Contains(address) && delta.touched_addresses.Insert(address)) {
+			delta.touched_count++;
+		}
+	}
+
+	delta.changed_addresses.Reserve(delta.changed_group_addresses.size() + changed_group_count);
+	for (idx_t changed_idx = 0; changed_idx < changed_group_count; changed_idx++) {
+		const auto input_idx = changed_groups.get_index_unsafe(changed_idx);
+		const auto address = addresses[input_idx];
+		if (delta.new_group_address_set.Contains(address) || !delta.changed_addresses.Insert(address)) {
+			continue;
+		}
+		delta.changed_group_addresses.push_back(address);
+		delta.changed_count++;
+	}
 }
 
 void RecursiveCTEState::ValidateDeferredUsingKeyCandidateReuse(DataChunk &candidates) {
@@ -476,10 +522,10 @@ idx_t RecursiveCTEState::FinalizeUsingKeyDelta(bool update_partial_indexes, bool
 	}
 
 	idx_t index_work_ns = 0;
-	auto finalize_new_groups = [&](Vector &group_addresses, idx_t row_count) {
+	auto finalize_groups = [&](Vector &group_addresses, idx_t row_count, bool new_groups) {
 		ht->GatherGroups(delta.lookup_state, group_addresses, *FlatVector::IncrementalSelectionVector(), row_count,
 		                 delta.key_scan_rows);
-		if (update_partial_indexes) {
+		if (new_groups && update_partial_indexes) {
 			const auto index_start =
 			    collect_metrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 			for (auto &index : partial_key_indexes) {
@@ -502,11 +548,18 @@ idx_t RecursiveCTEState::FinalizeUsingKeyDelta(bool update_partial_indexes, bool
 		op.working_table->Append(working_append_state, delta.result_rows);
 	};
 
+	for (idx_t offset = 0; offset < delta.changed_group_addresses.size(); offset += STANDARD_VECTOR_SIZE) {
+		const auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, delta.changed_group_addresses.size() - offset);
+		Vector group_addresses(LogicalType::POINTER,
+		                       reinterpret_cast<data_ptr_t>(delta.changed_group_addresses.data() + offset), count);
+		finalize_groups(group_addresses, count, false);
+	}
+
 	for (idx_t offset = 0; offset < delta.new_group_addresses.size(); offset += STANDARD_VECTOR_SIZE) {
 		const auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, delta.new_group_addresses.size() - offset);
 		Vector group_addresses(LogicalType::POINTER,
 		                       reinterpret_cast<data_ptr_t>(delta.new_group_addresses.data() + offset), count);
-		finalize_new_groups(group_addresses, count);
+		finalize_groups(group_addresses, count, true);
 	}
 
 	ColumnDataScanState new_key_scan_state;
@@ -520,7 +573,7 @@ idx_t RecursiveCTEState::FinalizeUsingKeyDelta(bool update_partial_indexes, bool
 			throw InternalException("USING KEY delta finalization could not find %d of %d new groups",
 			                        row_count - found_count, row_count);
 		}
-		finalize_new_groups(delta.lookup_state.addresses, row_count);
+		finalize_groups(delta.lookup_state.addresses, row_count, true);
 	}
 	return index_work_ns;
 }

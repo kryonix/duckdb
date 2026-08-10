@@ -111,6 +111,9 @@ struct RecursiveCTEEpochMetrics {
 	void RecordLocalKeyPreaggregationClassification(idx_t elapsed_ns);
 	void RecordLocalKeyPreaggregation(idx_t candidate_rows, idx_t groups, idx_t elapsed_ns);
 	void RecordLocalKeyPreaggregationResidual(idx_t candidate_rows);
+	void RecordAggregateChangeUpdate(idx_t candidate_rows, idx_t reported_rows);
+	void RecordAggregateChangeCombine(idx_t candidate_groups, idx_t reported_groups);
+	void RecordAggregateChangeCandidateReuse(idx_t rows);
 	void RecordPartialIndexMaintenance(idx_t elapsed_ns);
 	void RecordKeyDelta(idx_t candidate_rows, idx_t touched_keys, idx_t new_keys, idx_t changed_keys, idx_t elapsed_ns);
 	void RecordRecurringScan(idx_t elapsed_ns);
@@ -141,6 +144,11 @@ struct RecursiveCTEEpochMetrics {
 	atomic<idx_t> local_key_preaggregation_groups {0};
 	atomic<idx_t> local_key_preaggregation_states {0};
 	atomic<idx_t> local_key_preaggregation_residual_rows {0};
+	atomic<idx_t> aggregate_change_update_candidate_rows {0};
+	atomic<idx_t> aggregate_change_update_reported_rows {0};
+	atomic<idx_t> aggregate_change_combine_candidate_groups {0};
+	atomic<idx_t> aggregate_change_combine_reported_groups {0};
+	atomic<idx_t> aggregate_change_candidate_reuse_rows {0};
 	atomic<idx_t> partial_index_maintenance_work_ns {0};
 	atomic<idx_t> key_delta_work_ns {0};
 	atomic<idx_t> key_delta_candidate_rows {0};
@@ -335,6 +343,8 @@ private:
 	bool ShouldPreaggregateUsingKeyUpdates(idx_t candidate_count);
 	void SnapshotUsingKeyDelta(const Vector &group_addresses, const SelectionVector &new_groups, idx_t new_group_count,
 	                           idx_t row_count, bool allow_candidate_reuse = true);
+	void TrackUsingKeyChanges(const Vector &group_addresses, const SelectionVector &new_groups, idx_t new_group_count,
+	                          const SelectionVector &changed_groups, idx_t changed_group_count, idx_t row_count);
 	void SnapshotPreaggregatedUsingKeyDeltaGroups(DataChunk &keys);
 	void SnapshotExistingUsingKeyDeltaAddresses(Vector &addresses, idx_t count, bool defer_append = false);
 	void AppendPreviousUsingKeyDeltaRows(Vector &addresses, idx_t count);
@@ -391,6 +401,8 @@ private:
 	bool can_preaggregate_using_key = false;
 	bool can_reuse_new_group_candidates = false;
 	bool can_reuse_changed_group_candidates = false;
+	bool can_track_using_key_update_changes = false;
+	bool can_track_using_key_combine_changes = false;
 
 	SourceResultType GetUsingKeyData(ExecutionContext &context, DataChunk &chunk);
 	template <bool COLLECT_METRICS>

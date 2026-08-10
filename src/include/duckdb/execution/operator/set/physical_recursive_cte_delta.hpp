@@ -51,7 +51,9 @@ struct RecursiveCTEKeyDeltaState {
 	ArenaAllocator arena;
 	RowOperationsState row_state;
 	unsafe_vector<data_ptr_t> new_group_addresses;
+	unsafe_vector<data_ptr_t> changed_group_addresses;
 	RecursiveCTEGroupAddressSet touched_addresses;
+	RecursiveCTEGroupAddressSet changed_addresses;
 	RecursiveCTEGroupAddressSet new_group_address_set;
 	bool new_group_address_set_built = false;
 	bool collections_initialized = false;
