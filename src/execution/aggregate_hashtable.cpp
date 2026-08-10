@@ -454,8 +454,8 @@ idx_t GroupedAggregateHashTable::AddChunkWithChanges(DataChunk &groups, DataChun
 	if (new_group_count == groups.size()) {
 		const auto aggregate_offset = layout_ptr->GetAggrOffset();
 		VectorOperations::AddInPlace(state.addresses, NumericCast<int64_t>(aggregate_offset));
-		const auto update_offset = UpdateAggregates(payload, aggregate_filter, groups.size());
-		VectorOperations::AddInPlace(state.addresses, -NumericCast<int64_t>(aggregate_offset + update_offset));
+		UpdateAggregates<true>(payload, aggregate_filter, groups.size());
+		VectorOperations::AddInPlace(state.addresses, -NumericCast<int64_t>(aggregate_offset));
 	} else {
 		changed_group_count = UpdateAggregatesWithChanges(payload, aggregate_filter, groups.size(), changed_groups);
 	}
@@ -715,24 +715,23 @@ bool GroupedAggregateHashTable::UpdateAggregatesClustered(DataChunk &payload, co
 	return true;
 }
 
-idx_t GroupedAggregateHashTable::UpdateAggregates(DataChunk &payload, const unsafe_vector<idx_t> &filter, idx_t count,
-                                                  bool ht_offsets_valid) {
+template <bool RESET_ADDRESSES>
+void GroupedAggregateHashTable::UpdateAggregates(DataChunk &payload, const unsafe_vector<idx_t> &filter, idx_t count,
+                                                 bool ht_offsets_valid) {
 	if (UpdateAggregatesClustered(payload, filter, count, ht_offsets_valid)) {
 		Verify();
-		return 0;
+		return;
 	}
 
 	auto &aggregates = layout_ptr->GetAggregates();
 	idx_t filter_idx = 0;
 	idx_t payload_idx = 0;
-	idx_t address_offset = 0;
 	for (idx_t i = 0; i < aggregates.size(); i++) {
 		auto &aggr = aggregates[i];
 		if (filter_idx >= filter.size() || i < filter[filter_idx]) {
 			// Skip all the aggregates that are not in the filter
 			payload_idx += aggr.child_count;
 			VectorOperations::AddInPlace(state.addresses, NumericCast<int64_t>(aggr.payload_size));
-			address_offset += aggr.payload_size;
 			continue;
 		}
 		D_ASSERT(i == filter[filter_idx]);
@@ -747,12 +746,13 @@ idx_t GroupedAggregateHashTable::UpdateAggregates(DataChunk &payload, const unsa
 		// Move to the next aggregate
 		payload_idx += aggr.child_count;
 		VectorOperations::AddInPlace(state.addresses, NumericCast<int64_t>(aggr.payload_size));
-		address_offset += aggr.payload_size;
 		filter_idx++;
+	}
+	if constexpr (RESET_ADDRESSES) {
+		VectorOperations::AddInPlace(state.addresses, -NumericCast<int64_t>(layout_ptr->GetAggrWidth()));
 	}
 
 	Verify();
-	return address_offset;
 }
 
 idx_t GroupedAggregateHashTable::UpdateAggregatesWithChanges(DataChunk &payload, const unsafe_vector<idx_t> &filter,

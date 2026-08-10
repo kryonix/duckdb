@@ -283,9 +283,9 @@ private:
 	//! Reinserts tuples (triggered by Resize)
 	void ReinsertTuples(PartitionedTupleData &data);
 
-	//! Returns the offset applied to state.addresses by the non-clustered path.
-	idx_t UpdateAggregates(DataChunk &payload, const unsafe_vector<idx_t> &filter, idx_t count,
-	                       bool ht_offsets_valid = true);
+	template <bool RESET_ADDRESSES = false>
+	void UpdateAggregates(DataChunk &payload, const unsafe_vector<idx_t> &filter, idx_t count,
+	                      bool ht_offsets_valid = true);
 	idx_t UpdateAggregatesWithChanges(DataChunk &payload, const unsafe_vector<idx_t> &filter, idx_t count,
 	                                  SelectionVector &changed_groups);
 	bool UpdateAggregatesClustered(DataChunk &payload, const unsafe_vector<idx_t> &filter, idx_t count,

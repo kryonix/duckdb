@@ -251,12 +251,8 @@ public:
 	aggregate_initialize_t initialize = nullptr;
 	//! The hashed aggregate update state function (may be null, if window is set)
 	aggregate_update_t update = nullptr;
-	//! Optional update callback used by change-aware incremental consumers.
-	aggregate_update_with_change_t update_with_change = nullptr;
 	//! The hashed aggregate combine states function (may be null, if window is set)
 	aggregate_combine_t combine = nullptr;
-	//! Optional combine callback used by change-aware incremental consumers.
-	aggregate_combine_with_change_t combine_with_change = nullptr;
 	//! The hashed aggregate finalization function (may be null, if window is set)
 	aggregate_finalize_t finalize = nullptr;
 	//! Initializes the local state used by the finalize (may be null)
@@ -289,6 +285,11 @@ public:
 	//! Must be set together; export acts as the finalize in state-export mode.
 	aggregate_finalize_t export_aggregate_state = nullptr;
 	aggregate_import_state_t import_aggregate_state = nullptr;
+
+	//! Optional update callback used by change-aware incremental consumers.
+	aggregate_update_with_change_t update_with_change = nullptr;
+	//! Optional combine callback used by change-aware incremental consumers.
+	aggregate_combine_with_change_t combine_with_change = nullptr;
 
 	bool operator==(const AggregateFunctionCallbacks &rhs) const;
 	bool operator!=(const AggregateFunctionCallbacks &rhs) const;
