@@ -226,8 +226,10 @@ void RecursiveCTEState::CombineOutput(ColumnDataCollection &output) {
 	    collect_metrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 	const auto row_count = output.Count();
 	CurrentOutputTable().Combine(output);
-	// Combine can replace collection segments, so later sink calls must use a freshly bound append state.
-	InitializeSharedOutputAppend();
+	// Keyed workers can resume shared appends after publishing local output.
+	if (op.using_key) {
+		InitializeSharedOutputAppend();
+	}
 	if (collect_metrics) {
 		const auto after_work = std::chrono::steady_clock::now();
 		RecordSinkMetrics(
