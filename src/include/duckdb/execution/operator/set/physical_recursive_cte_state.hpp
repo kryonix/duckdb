@@ -345,6 +345,9 @@ private:
 	                           idx_t row_count, bool allow_candidate_reuse = true);
 	void TrackUsingKeyChanges(const Vector &group_addresses, const SelectionVector &new_groups, idx_t new_group_count,
 	                          const SelectionVector &changed_groups, idx_t changed_group_count, idx_t row_count);
+	void TrackUniqueUsingKeyChanges(const Vector &group_addresses, const SelectionVector &new_groups,
+	                                idx_t new_group_count, const SelectionVector &changed_groups,
+	                                idx_t changed_group_count, idx_t row_count);
 	void SnapshotPreaggregatedUsingKeyDeltaGroups(DataChunk &keys);
 	void SnapshotExistingUsingKeyDeltaAddresses(Vector &addresses, idx_t count, bool defer_append = false);
 	void AppendPreviousUsingKeyDeltaRows(Vector &addresses, idx_t count);

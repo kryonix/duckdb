@@ -657,9 +657,10 @@ WHERE class = 'PhysicalRecursiveCTE' AND event = 'EpochSummary';
 ----
 1	1	1	1	1	1	1	1	1	1	1	1	1	1	1
 
+# All-new vectors bypass change callbacks, so this counts only rows reported by those callbacks.
 query IIIII
 SELECT info.aggregate_change_update_candidate_rows::UBIGINT = 5,
-	   info.aggregate_change_update_reported_rows::UBIGINT = 3,
+	   info.aggregate_change_update_reported_rows::UBIGINT = 2,
 	   info.aggregate_change_combine_candidate_groups::UBIGINT = 0,
 	   info.aggregate_change_combine_reported_groups::UBIGINT = 0,
 	   info.aggregate_change_candidate_reuse_rows::UBIGINT = 0
@@ -674,7 +675,11 @@ CALL enable_logging('PhysicalOperator');
 statement ok
 CALL truncate_duckdb_logs();
 
-# Duplicate-heavy epochs activate preaggregation.
+# Duplicate-heavy epochs activate preaggregation after streaming at most the current frontier.
+# Keep the exact local-versus-residual attribution independent of worker scheduling.
+statement ok
+SET threads=1;
+
 query II
 WITH RECURSIVE t(k, v) USING KEY (k, min(v)) AS (
 	SELECT i, 3
@@ -690,17 +695,17 @@ statement ok
 CALL disable_logging();
 
 query IIIIIIIIIIIII
-SELECT info.key_preaggregation_classification_work_ns::UBIGINT = 0,
+SELECT info.key_preaggregation_classification_work_ns::UBIGINT > 0,
 	   info.key_preaggregation_work_ns::UBIGINT = 0,
 	   info.key_preaggregation_combine_work_ns::UBIGINT > 0,
 	   info.key_preaggregation_candidate_rows::UBIGINT = 0,
 	   info.key_preaggregation_groups::UBIGINT = 0,
 	   info.local_key_preaggregation_classification_work_ns::UBIGINT > 0,
 	   info.local_key_preaggregation_work_ns::UBIGINT > 0,
-	   info.local_key_preaggregation_candidate_rows::UBIGINT = current_setting('standard_vector_size')::UBIGINT * 32,
+	   info.local_key_preaggregation_candidate_rows::UBIGINT = current_setting('standard_vector_size')::UBIGINT * 29,
 	   info.local_key_preaggregation_groups::UBIGINT = current_setting('standard_vector_size')::UBIGINT * 4,
 	   info.local_key_preaggregation_states::UBIGINT > 0,
-	   info.local_key_preaggregation_residual_rows::UBIGINT = 0,
+	   info.local_key_preaggregation_residual_rows::UBIGINT = current_setting('standard_vector_size')::UBIGINT * 3,
 	   info.key_delta_candidate_rows::UBIGINT = current_setting('standard_vector_size')::UBIGINT * 32,
 	   info.key_delta_touched_keys::UBIGINT = current_setting('standard_vector_size')::UBIGINT * 4
 FROM duckdb_logs_parsed('PhysicalOperator')
@@ -708,15 +713,19 @@ WHERE class = 'PhysicalRecursiveCTE' AND event = 'EpochSummary';
 ----
 1	1	1	1	1	1	1	1	1	1	1	1	1
 
+# The streamed prefix changes each state before its duplicate local aggregate is combined.
 query IIII
-SELECT info.aggregate_change_update_candidate_rows::UBIGINT = 0,
+SELECT info.aggregate_change_update_candidate_rows::UBIGINT > 0,
 	   info.aggregate_change_combine_candidate_groups::UBIGINT > 0,
-	   info.aggregate_change_combine_reported_groups::UBIGINT > 0,
+	   info.aggregate_change_combine_reported_groups::UBIGINT = 0,
 	   info.aggregate_change_candidate_reuse_rows::UBIGINT = 0
 FROM duckdb_logs_parsed('PhysicalOperator')
 WHERE class = 'PhysicalRecursiveCTE' AND event = 'EpochSummary';
 ----
 1	1	1	1
+
+statement ok
+SET threads=8;
 
 statement ok
 CALL enable_logging('PhysicalOperator');
@@ -765,11 +774,12 @@ WHERE class = 'PhysicalRecursiveCTE' AND event = 'EpochSummary';
 ----
 1	1	1	1	1	1	1	1	1
 
+# The preaggregated anchor contains only new groups, so its combine skips redundant change callbacks.
 query IIII
 SELECT info.aggregate_change_update_candidate_rows::UBIGINT > 0,
 	   info.aggregate_change_update_reported_rows::UBIGINT > 0,
 	   info.aggregate_change_combine_candidate_groups::UBIGINT > 0,
-	   info.aggregate_change_combine_reported_groups::UBIGINT > 0
+	   info.aggregate_change_combine_reported_groups::UBIGINT = 0
 FROM duckdb_logs_parsed('PhysicalOperator')
 WHERE class = 'PhysicalRecursiveCTE' AND event = 'EpochSummary';
 ----

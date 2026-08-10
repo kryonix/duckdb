@@ -271,6 +271,12 @@ void RecursiveCTEState::TrackUsingKeyChanges(const Vector &group_addresses, cons
 	auto &delta = *key_delta;
 	group_addresses.Flatten();
 	auto addresses = FlatVector::GetData<data_ptr_t>(group_addresses);
+	if (!delta.new_group_address_set_built && new_group_count == row_count && changed_group_count == 0) {
+		delta.new_group_addresses.insert(delta.new_group_addresses.end(), addresses, addresses + row_count);
+		delta.new_count += new_group_count;
+		delta.touched_count += new_group_count;
+		return;
+	}
 	if (!delta.new_group_address_set_built) {
 		delta.new_group_address_set.Reserve(delta.new_group_addresses.size() + new_group_count);
 		for (auto address : delta.new_group_addresses) {
@@ -304,6 +310,33 @@ void RecursiveCTEState::TrackUsingKeyChanges(const Vector &group_addresses, cons
 			continue;
 		}
 		delta.changed_group_addresses.push_back(address);
+		delta.changed_count++;
+	}
+}
+
+void RecursiveCTEState::TrackUniqueUsingKeyChanges(const Vector &group_addresses, const SelectionVector &new_groups,
+                                                   idx_t new_group_count, const SelectionVector &changed_groups,
+                                                   idx_t changed_group_count, idx_t row_count) {
+	D_ASSERT(key_delta && new_group_count <= row_count && changed_group_count <= row_count);
+	auto &delta = *key_delta;
+	// A preaggregated source visits every normalized key once, so no address sets are needed.
+	group_addresses.Flatten();
+	auto addresses = FlatVector::GetData<data_ptr_t>(group_addresses);
+	ValidityMask new_group_mask(row_count);
+	new_group_mask.SetAllInvalid(row_count);
+	for (idx_t new_group_idx = 0; new_group_idx < new_group_count; new_group_idx++) {
+		const auto input_idx = new_groups.get_index_unsafe(new_group_idx);
+		new_group_mask.SetValidUnsafe(input_idx);
+		delta.new_group_addresses.push_back(addresses[input_idx]);
+	}
+	delta.new_count += new_group_count;
+	delta.touched_count += row_count;
+	for (idx_t changed_idx = 0; changed_idx < changed_group_count; changed_idx++) {
+		const auto input_idx = changed_groups.get_index_unsafe(changed_idx);
+		if (new_group_mask.RowIsValidUnsafe(input_idx)) {
+			continue;
+		}
+		delta.changed_group_addresses.push_back(addresses[input_idx]);
 		delta.changed_count++;
 	}
 }
