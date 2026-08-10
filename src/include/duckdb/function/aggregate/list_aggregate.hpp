@@ -59,6 +59,32 @@ inline void ListUpdateFunction(Vector inputs[], AggregateInputData &aggr_input_d
 	}
 }
 
+template <bool IGNORE_NULLS = false>
+inline idx_t ListUpdateWithChangeFunction(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
+                                          Vector &state_vector, idx_t count, SelectionVector &changed) {
+	D_ASSERT(input_count == 1);
+	auto &input = inputs[0];
+	RecursiveUnifiedVectorFormat input_data;
+	Vector::RecursiveToUnifiedFormat(input, input_data);
+	auto states = state_vector.Values<ListAggState *>();
+	ListSegmentFunctions functions;
+	GetSegmentDataFunctions(functions, input.GetType());
+	idx_t changed_count = 0;
+	for (idx_t i = 0; i < count; i++) {
+		if (IGNORE_NULLS) {
+			const auto input_idx = input_data.unified.sel->get_index(i);
+			if (!input_data.unified.validity.RowIsValid(input_idx)) {
+				continue;
+			}
+		}
+		auto &state = *states[i].GetValue();
+		aggr_input_data.allocator.AlignNext();
+		functions.AppendRows(aggr_input_data.allocator, state.linked_list, input_data, i, 1);
+		changed.set_index(changed_count++, i);
+	}
+	return changed_count;
+}
+
 //! Clustered variant of ListUpdateFunction - appends the rows of each run to that run's state.
 //! Contiguous runs are appended in a single batch; scattered runs are appended row by row.
 template <bool IGNORE_NULLS = false>
@@ -156,6 +182,20 @@ void ListCombineFunction(Vector &states_vector, Vector &combined, AggregateInput
 		functions.AppendListEntry(aggr_input_data.allocator, target.linked_list, input_data,
 		                          list_entry_t(0, entry_count));
 	}
+}
+
+template <class OP>
+idx_t ListCombineWithChangeFunction(Vector &states_vector, Vector &combined, AggregateInputData &aggr_input_data,
+                                    idx_t count, SelectionVector &changed) {
+	auto states = states_vector.Values<ListAggState *>();
+	idx_t changed_count = 0;
+	for (idx_t i = 0; i < count; i++) {
+		if (states[i].GetValueUnsafe()->linked_list.total_capacity != 0) {
+			changed.set_index(changed_count++, i);
+		}
+	}
+	ListCombineFunction<OP>(states_vector, combined, aggr_input_data, count);
+	return changed_count;
 }
 
 } // namespace duckdb

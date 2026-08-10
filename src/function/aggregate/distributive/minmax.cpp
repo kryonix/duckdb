@@ -35,39 +35,52 @@ template <class OP>
 static AggregateFunction GetUnaryAggregate(const LogicalType &type) {
 	switch (type.InternalType()) {
 	case PhysicalType::BOOL:
-		return AggregateFunction::UnaryAggregate<MinMaxState<int8_t>, int8_t, int8_t, OP>(type, type);
+		return AggregateFunction::UnaryAggregateWithChange<MinMaxState<int8_t>, int8_t, int8_t, OP>(type, type);
 	case PhysicalType::INT8:
-		return AggregateFunction::UnaryAggregate<MinMaxState<int8_t>, int8_t, int8_t, OP>(type, type);
+		return AggregateFunction::UnaryAggregateWithChange<MinMaxState<int8_t>, int8_t, int8_t, OP>(type, type);
 	case PhysicalType::INT16:
-		return AggregateFunction::UnaryAggregate<MinMaxState<int16_t>, int16_t, int16_t, OP>(type, type);
+		return AggregateFunction::UnaryAggregateWithChange<MinMaxState<int16_t>, int16_t, int16_t, OP>(type, type);
 	case PhysicalType::INT32:
-		return AggregateFunction::UnaryAggregate<MinMaxState<int32_t>, int32_t, int32_t, OP>(type, type);
+		return AggregateFunction::UnaryAggregateWithChange<MinMaxState<int32_t>, int32_t, int32_t, OP>(type, type);
 	case PhysicalType::INT64:
-		return AggregateFunction::UnaryAggregate<MinMaxState<int64_t>, int64_t, int64_t, OP>(type, type);
+		return AggregateFunction::UnaryAggregateWithChange<MinMaxState<int64_t>, int64_t, int64_t, OP>(type, type);
 	case PhysicalType::UINT8:
-		return AggregateFunction::UnaryAggregate<MinMaxState<uint8_t>, uint8_t, uint8_t, OP>(type, type);
+		return AggregateFunction::UnaryAggregateWithChange<MinMaxState<uint8_t>, uint8_t, uint8_t, OP>(type, type);
 	case PhysicalType::UINT16:
-		return AggregateFunction::UnaryAggregate<MinMaxState<uint16_t>, uint16_t, uint16_t, OP>(type, type);
+		return AggregateFunction::UnaryAggregateWithChange<MinMaxState<uint16_t>, uint16_t, uint16_t, OP>(type, type);
 	case PhysicalType::UINT32:
-		return AggregateFunction::UnaryAggregate<MinMaxState<uint32_t>, uint32_t, uint32_t, OP>(type, type);
+		return AggregateFunction::UnaryAggregateWithChange<MinMaxState<uint32_t>, uint32_t, uint32_t, OP>(type, type);
 	case PhysicalType::UINT64:
-		return AggregateFunction::UnaryAggregate<MinMaxState<uint64_t>, uint64_t, uint64_t, OP>(type, type);
+		return AggregateFunction::UnaryAggregateWithChange<MinMaxState<uint64_t>, uint64_t, uint64_t, OP>(type, type);
 	case PhysicalType::INT128:
-		return AggregateFunction::UnaryAggregate<MinMaxState<hugeint_t>, hugeint_t, hugeint_t, OP>(type, type);
+		return AggregateFunction::UnaryAggregateWithChange<MinMaxState<hugeint_t>, hugeint_t, hugeint_t, OP>(type,
+		                                                                                                     type);
 	case PhysicalType::UINT128:
-		return AggregateFunction::UnaryAggregate<MinMaxState<uhugeint_t>, uhugeint_t, uhugeint_t, OP>(type, type);
+		return AggregateFunction::UnaryAggregateWithChange<MinMaxState<uhugeint_t>, uhugeint_t, uhugeint_t, OP>(type,
+		                                                                                                        type);
 	case PhysicalType::FLOAT:
-		return AggregateFunction::UnaryAggregate<MinMaxState<float>, float, float, OP>(type, type);
+		return AggregateFunction::UnaryAggregateWithChange<MinMaxState<float>, float, float, OP>(type, type);
 	case PhysicalType::DOUBLE:
-		return AggregateFunction::UnaryAggregate<MinMaxState<double>, double, double, OP>(type, type);
+		return AggregateFunction::UnaryAggregateWithChange<MinMaxState<double>, double, double, OP>(type, type);
 	case PhysicalType::INTERVAL:
-		return AggregateFunction::UnaryAggregate<MinMaxState<interval_t>, interval_t, interval_t, OP>(type, type);
+		return AggregateFunction::UnaryAggregateWithChange<MinMaxState<interval_t>, interval_t, interval_t, OP>(type,
+		                                                                                                        type);
 	default:
 		throw InternalException("Unimplemented type for min/max aggregate");
 	}
 }
 
 struct MinMaxBase {
+	template <class INPUT_TYPE, class STATE, class OP>
+	static bool OperationWithChange(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &unary_input) {
+		if (!state.is_set) {
+			OP::template Assign<INPUT_TYPE, STATE>(state, input, unary_input.input);
+			state.is_set = true;
+			return true;
+		}
+		return OP::template ExecuteWithChange<INPUT_TYPE, STATE, OP>(state, input, unary_input.input);
+	}
+
 	template <class INPUT_TYPE, class STATE, class OP>
 	static void ConstantOperation(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &unary_input,
 	                              idx_t count) {
@@ -91,6 +104,13 @@ struct MinMaxBase {
 
 template <class REDUCE_OP>
 struct NumericMinMaxBase : public MinMaxBase, public ClusteredStateCopy {
+	template <class INPUT_TYPE, class STATE, class OP>
+	static bool ExecuteWithChange(STATE &state, INPUT_TYPE input, AggregateInputData &) {
+		const auto previous = state.value;
+		state.value = REDUCE_OP::template Operation<INPUT_TYPE>(state.value, input);
+		return NotEquals::Operation(previous, state.value);
+	}
+
 	template <class INPUT_TYPE, class STATE>
 	static void Assign(STATE &state, INPUT_TYPE input, AggregateInputData &) {
 		state.value = input;
@@ -137,6 +157,18 @@ struct NumericMinMaxBase : public MinMaxBase, public ClusteredStateCopy {
 			using value_type = decltype(target.value);
 			target.value = REDUCE_OP::template Operation<value_type>(target.value, source.value);
 		}
+	}
+
+	template <class STATE, class OP>
+	static bool CombineWithChange(const STATE &source, STATE &target, AggregateInputData &input_data) {
+		if (!source.is_set) {
+			return false;
+		}
+		if (!target.is_set) {
+			target = source;
+			return true;
+		}
+		return OP::template ExecuteWithChange<typename STATE::value_type, STATE, OP>(target, source.value, input_data);
 	}
 
 	template <class STATE, class OP>
@@ -213,6 +245,19 @@ struct StringMinMaxBase : public MinMaxBase {
 	}
 
 	template <class STATE, class OP>
+	static bool CombineWithChange(const STATE &source, STATE &target, AggregateInputData &input_data) {
+		if (!source.is_set) {
+			return false;
+		}
+		if (!target.is_set) {
+			Assign(target, source.value, input_data);
+			target.is_set = true;
+			return true;
+		}
+		return OP::template ExecuteWithChange<string_t, STATE, OP>(target, source.value, input_data);
+	}
+
+	template <class STATE, class OP>
 	static void RepeatedCombine(const STATE &source, STATE &target, AggregateInputData &input, idx_t count) {
 		if (count == 0) {
 			return;
@@ -223,6 +268,15 @@ struct StringMinMaxBase : public MinMaxBase {
 
 template <class COMPARE>
 struct StringMinMaxOperation : public StringMinMaxBase {
+	template <class INPUT_TYPE, class STATE, class OP>
+	static bool ExecuteWithChange(STATE &state, INPUT_TYPE input, AggregateInputData &input_data) {
+		if (!COMPARE::template Operation<INPUT_TYPE>(input, state.value)) {
+			return false;
+		}
+		StringMinMaxBase::Assign(state, input, input_data);
+		return true;
+	}
+
 	template <class INPUT_TYPE, class STATE>
 	static void Execute(STATE &state, INPUT_TYPE input, AggregateInputData &input_data) {
 		if (COMPARE::template Operation<INPUT_TYPE>(input, state.value)) {
@@ -259,6 +313,20 @@ struct VectorMinMaxBase {
 		}
 	}
 
+	template <class INPUT_TYPE, class STATE, class OP>
+	static bool ExecuteWithChange(STATE &state, INPUT_TYPE input, AggregateInputData &input_data) {
+		if (!state.is_set) {
+			Assign(state, input, input_data);
+			state.is_set = true;
+			return true;
+		}
+		if (!LessThan::Operation<INPUT_TYPE>(input, state.value)) {
+			return false;
+		}
+		Assign(state, input, input_data);
+		return true;
+	}
+
 	template <class STATE, class OP>
 	static void Combine(const STATE &source, STATE &target, AggregateInputData &input_data) {
 		if (!source.is_set) {
@@ -266,6 +334,14 @@ struct VectorMinMaxBase {
 			return;
 		}
 		OP::template Execute<string_t, STATE, OP>(target, source.value, input_data);
+	}
+
+	template <class STATE, class OP>
+	static bool CombineWithChange(const STATE &source, STATE &target, AggregateInputData &input_data) {
+		if (!source.is_set) {
+			return false;
+		}
+		return OP::template ExecuteWithChange<string_t, STATE, OP>(target, source.value, input_data);
 	}
 
 	template <class STATE, class OP>
@@ -313,6 +389,9 @@ static AggregateFunction GetMinMaxFunction(const LogicalType &type) {
 	    AggregateFunction::StateCombine<STATE, OP>, AggregateFunction::StateVoidFinalize<STATE, OP>,
 	    FunctionNullHandling::DEFAULT_NULL_HANDLING, AggregateFunction::NoClusterUpdate(), OP::Bind, nullptr);
 	AggregateFunction::WireStructStateType<STATE>(result);
+	result.SetStateUpdateWithChangeCallback(
+	    AggregateSortKeyHelpers::UnaryUpdateWithChange<STATE, OP, OP::ORDER_TYPE, false>);
+	result.SetStateCombineWithChangeCallback(AggregateFunction::StateCombineWithChange<STATE, OP>);
 	return result;
 }
 
@@ -321,7 +400,8 @@ static AggregateFunction GetMinMaxOperator(const LogicalType &type) {
 	auto internal_type = type.InternalType();
 	switch (internal_type) {
 	case PhysicalType::VARCHAR:
-		return AggregateFunction::UnaryAggregate<MinMaxStringState, string_t, string_t, OP_STRING>(type, type);
+		return AggregateFunction::UnaryAggregateWithChange<MinMaxStringState, string_t, string_t, OP_STRING>(type,
+		                                                                                                     type);
 	case PhysicalType::LIST:
 	case PhysicalType::STRUCT:
 	case PhysicalType::ARRAY:
@@ -496,6 +576,50 @@ void MinMaxNUpdate(Vector inputs[], AggregateInputData &aggr_input, idx_t input_
 	}
 }
 
+template <class STATE>
+idx_t MinMaxNUpdateWithChange(Vector inputs[], AggregateInputData &aggr_input, idx_t input_count, Vector &state_vector,
+                              idx_t count, SelectionVector &changed) {
+	D_ASSERT(input_count == 2);
+	auto &value_vector = inputs[0];
+	auto &n_vector = inputs[1];
+	UnifiedVectorFormat value_format;
+	UnifiedVectorFormat n_format;
+	UnifiedVectorFormat state_format;
+	auto value_extra_state = STATE::VAL_TYPE::CreateExtraState();
+	STATE::VAL_TYPE::PrepareData(value_vector, value_extra_state, value_format, true);
+	n_vector.ToUnifiedFormat(n_format);
+	state_vector.ToUnifiedFormat(state_format);
+	auto states = UnifiedVectorFormat::GetData<STATE *>(state_format);
+	idx_t changed_count = 0;
+	for (idx_t i = 0; i < count; i++) {
+		const auto value_idx = value_format.sel->get_index(i);
+		if (!value_format.validity.RowIsValid(value_idx)) {
+			continue;
+		}
+		auto &state = *states[state_format.sel->get_index(i)];
+		if (!state.is_initialized) {
+			static constexpr int64_t MAX_N = 1000000;
+			const auto n_idx = n_format.sel->get_index(i);
+			if (!n_format.validity.RowIsValid(n_idx)) {
+				throw InvalidInputException("Invalid input for MIN/MAX: n value cannot be NULL");
+			}
+			const auto n_value = UnifiedVectorFormat::GetData<int64_t>(n_format)[n_idx];
+			if (n_value <= 0) {
+				throw InvalidInputException("Invalid input for MIN/MAX: n value must be > 0");
+			}
+			if (n_value >= MAX_N) {
+				throw InvalidInputException("Invalid input for MIN/MAX: n value must be < %d", MAX_N);
+			}
+			state.Initialize(aggr_input.allocator, UnsafeNumericCast<idx_t>(n_value));
+		}
+		const auto value = STATE::VAL_TYPE::Create(value_format, value_idx);
+		if (state.heap.Insert(aggr_input.allocator, value)) {
+			changed.set_index(changed_count++, i);
+		}
+	}
+	return changed_count;
+}
+
 template <class VAL_TYPE, class COMPARATOR>
 void SpecializeMinMaxNFunction(BoundAggregateFunction &function) {
 	using STATE = MinMaxNState<VAL_TYPE, COMPARATOR>;
@@ -505,10 +629,12 @@ void SpecializeMinMaxNFunction(BoundAggregateFunction &function) {
 	function.GetCallbacks().SetStateInitCallback(
 	    AggregateFunction::StateInitialize<STATE, OP, AggregateDestructorType::LEGACY>);
 	function.GetCallbacks().SetStateCombineCallback(AggregateFunction::StateCombine<STATE, OP>);
+	function.GetCallbacks().SetStateCombineWithChangeCallback(AggregateFunction::StateCombineWithChange<STATE, OP>);
 	function.GetCallbacks().SetStateDestructorCallback(AggregateFunction::StateDestroy<STATE, OP>);
 
 	function.GetCallbacks().SetStateFinalizeCallback(MinMaxNOperation::Finalize<STATE>);
 	function.GetCallbacks().SetStateUpdateCallback(MinMaxNUpdate<STATE>);
+	function.GetCallbacks().SetStateUpdateWithChangeCallback(MinMaxNUpdateWithChange<STATE>);
 }
 
 template <class COMPARATOR>

@@ -76,6 +76,15 @@ struct HistogramBinState {
 };
 
 struct HistogramBinFunction {
+	template <class STATE, class OP>
+	static bool CombineWithChange(const STATE &source, STATE &target, AggregateInputData &input_data) {
+		if (!source.bin_boundaries) {
+			return false;
+		}
+		Combine<STATE, OP>(source, target, input_data);
+		return true;
+	}
+
 	template <class STATE>
 	static void Destroy(STATE &state, AggregateInputData &aggr_input_data) {
 		state.Destroy();
@@ -163,6 +172,21 @@ void HistogramBinUpdateFunction(Vector inputs[], AggregateInputData &aggr_input,
 		auto bin_entry = HIST::template GetBin<T>(data[idx], *state.bin_boundaries);
 		++(*state.counts)[bin_entry];
 	}
+}
+
+template <class OP, class T, class HIST>
+idx_t HistogramBinUpdateWithChangeFunction(Vector inputs[], AggregateInputData &aggr_input, idx_t input_count,
+                                           Vector &state_vector, idx_t count, SelectionVector &changed) {
+	HistogramBinUpdateFunction<OP, T, HIST>(inputs, aggr_input, input_count, state_vector, count);
+	UnifiedVectorFormat input_data;
+	inputs[0].ToUnifiedFormat(input_data);
+	idx_t changed_count = 0;
+	for (idx_t i = 0; i < count; i++) {
+		if (input_data.validity.RowIsValid(input_data.sel->get_index(i))) {
+			changed.set_index(changed_count++, i);
+		}
+	}
+	return changed_count;
 }
 
 bool SupportsOtherBucket(const LogicalType &type) {
@@ -336,11 +360,15 @@ AggregateFunction GetHistogramBinFunction(const LogicalType &type) {
 	const char *function_name = HIST::EXACT ? "histogram_exact" : "histogram";
 
 	auto struct_type = LogicalType::MAP(type, LogicalType::UBIGINT);
-	return AggregateFunction(
+	auto function = AggregateFunction(
 	    function_name, {type, LogicalType::LIST(type)}, struct_type, AggregateFunction::StateSize<STATE_TYPE>,
 	    AggregateFunction::StateInitialize<STATE_TYPE, HistogramBinFunction>, HistogramBinUpdateFunction<OP, T, HIST>,
 	    AggregateFunction::StateCombine<STATE_TYPE, HistogramBinFunction>, HistogramBinFinalizeFunction<OP, T>, nullptr,
 	    nullptr, AggregateFunction::StateDestroy<STATE_TYPE, HistogramBinFunction>);
+	function.SetStateUpdateWithChangeCallback(HistogramBinUpdateWithChangeFunction<OP, T, HIST>);
+	function.SetStateCombineWithChangeCallback(
+	    AggregateFunction::StateCombineWithChange<STATE_TYPE, HistogramBinFunction>);
+	return function;
 }
 
 template <class HIST>

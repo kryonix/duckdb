@@ -17,6 +17,15 @@ namespace duckdb {
 
 struct RegrCountFunction {
 	template <class STATE, class OP>
+	static bool CombineWithChange(const STATE &source, STATE &target, AggregateInputData &) {
+		if (source == 0) {
+			return false;
+		}
+		target += source;
+		return true;
+	}
+
+	template <class STATE, class OP>
 	static void Combine(const STATE &source, STATE &target, AggregateInputData &) {
 		target += source;
 	}
@@ -31,6 +40,12 @@ struct RegrCountFunction {
 	template <class A_TYPE, class B_TYPE, class STATE, class OP>
 	static void Operation(STATE &state, const A_TYPE &, const B_TYPE &, AggregateBinaryInput &) {
 		state += 1;
+	}
+
+	template <class A_TYPE, class B_TYPE, class STATE, class OP>
+	static bool OperationWithChange(STATE &state, const A_TYPE &, const B_TYPE &, AggregateBinaryInput &) {
+		state += 1;
+		return true;
 	}
 };
 

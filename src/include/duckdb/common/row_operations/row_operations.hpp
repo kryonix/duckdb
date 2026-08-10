@@ -59,6 +59,9 @@ struct RowOperations {
 	                                  bool skip_addresses);
 	//! combine - unaligned addresses, updated
 	static void CombineStates(RowOperationsState &state, TupleDataLayout &layout, Vector &sources, Vector &targets);
+	//! change-aware combine - unaligned addresses, updated
+	static idx_t CombineStatesWithChange(RowOperationsState &state, TupleDataLayout &layout, Vector &sources,
+	                                     Vector &targets, SelectionVector &changed);
 	//! finalize - unaligned addresses, updated
 	static void FinalizeStates(RowOperationsState &state, TupleDataLayout &layout, Vector &addresses, DataChunk &result,
 	                           idx_t aggr_idx);

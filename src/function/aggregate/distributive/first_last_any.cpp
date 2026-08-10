@@ -95,6 +95,16 @@ static inline void ScanClusterRange(idx_t pos, idx_t end, FUNC &&func) {
 template <bool LAST, bool SKIP_NULLS>
 struct FirstFunction : public FirstFunctionBase {
 	template <class INPUT_TYPE, class STATE, class OP>
+	static bool OperationWithChange(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &unary_input) {
+		D_ASSERT(!LAST);
+		if (state.is_set || (SKIP_NULLS && !unary_input.RowIsValid())) {
+			return false;
+		}
+		Operation<INPUT_TYPE, STATE, OP>(state, input, unary_input);
+		return state.value_is_valid;
+	}
+
+	template <class INPUT_TYPE, class STATE, class OP>
 	static void Operation(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &unary_input) {
 		if (LAST || !state.is_set) {
 			if (!unary_input.RowIsValid()) {
@@ -158,6 +168,16 @@ struct FirstFunction : public FirstFunctionBase {
 		}
 	}
 
+	template <class STATE, class OP>
+	static bool CombineWithChange(const STATE &source, STATE &target, AggregateInputData &) {
+		D_ASSERT(!LAST);
+		if (target.is_set || !source.is_set) {
+			return false;
+		}
+		target = source;
+		return target.value_is_valid;
+	}
+
 	template <class T, class STATE>
 	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (!state.is_set || !state.value_is_valid) {
@@ -190,10 +210,31 @@ struct FirstFunctionStringBase : public FirstFunctionBase {
 			SetValue<STATE>(target, input_data, source.value, !source.value_is_valid);
 		}
 	}
+
+	template <class STATE, class OP>
+	static bool CombineWithChange(const STATE &source, STATE &target, AggregateInputData &input_data) {
+		D_ASSERT(!LAST);
+		if (target.is_set || !source.is_set) {
+			return false;
+		}
+		SetValue<STATE>(target, input_data, source.value, !source.value_is_valid);
+		return target.value_is_valid;
+	}
 };
 
 template <bool LAST, bool SKIP_NULLS>
 struct FirstFunctionString : FirstFunctionStringBase<LAST, SKIP_NULLS> {
+	template <class INPUT_TYPE, class STATE, class OP>
+	static bool OperationWithChange(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &unary_input) {
+		D_ASSERT(!LAST);
+		if (state.is_set || (SKIP_NULLS && !unary_input.RowIsValid())) {
+			return false;
+		}
+		FirstFunctionStringBase<LAST, SKIP_NULLS>::template SetValue<STATE>(state, unary_input.input, input,
+		                                                                    !unary_input.RowIsValid());
+		return state.value_is_valid;
+	}
+
 	template <class INPUT_TYPE, class STATE, class OP>
 	static void Operation(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &unary_input) {
 		if (LAST || !state.is_set) {
@@ -304,6 +345,60 @@ struct FirstVectorFunction : FirstFunctionStringBase<LAST, SKIP_NULLS> {
 		}
 	}
 
+	static idx_t UpdateWithChange(Vector inputs[], AggregateInputData &input_data, idx_t input_count,
+	                              Vector &state_vector, idx_t count, SelectionVector &changed) {
+		D_ASSERT(!LAST && input_count == 1);
+		auto &input = inputs[0];
+		UnifiedVectorFormat input_data_format;
+		input.ToUnifiedFormat(input_data_format);
+		UnifiedVectorFormat state_data;
+		state_vector.ToUnifiedFormat(state_data);
+
+		sel_t assign_sel[STANDARD_VECTOR_SIZE];
+		idx_t assign_count = 0;
+		auto states = UnifiedVectorFormat::GetData<STATE *>(state_data);
+		for (idx_t i = 0; i < count; i++) {
+			const auto input_idx = input_data_format.sel->get_index(i);
+			const auto is_null = !input_data_format.validity.RowIsValid(input_idx);
+			if (SKIP_NULLS && is_null) {
+				continue;
+			}
+			if (!states[state_data.sel->get_index(i)]->is_set) {
+				assign_sel[assign_count++] = NumericCast<sel_t>(i);
+			}
+		}
+		if (assign_count == 0) {
+			return 0;
+		}
+
+		Vector sort_key(LogicalType::BLOB);
+		OrderModifiers modifiers(OrderType::ASCENDING, OrderByNullType::NULLS_LAST);
+		if (assign_count == count) {
+			CreateSortKeyHelpers::CreateSortKey(input, modifiers, sort_key);
+		} else {
+			SelectionVector selection(assign_sel, STANDARD_VECTOR_SIZE);
+			Vector sliced_input(input, selection, assign_count);
+			CreateSortKeyHelpers::CreateSortKey(sliced_input, modifiers, sort_key);
+		}
+		auto sort_key_data = FlatVector::GetData<string_t>(sort_key);
+		idx_t changed_count = 0;
+		for (idx_t i = 0; i < assign_count; i++) {
+			const auto candidate_idx = assign_sel[i];
+			auto &state = *states[state_data.sel->get_index(candidate_idx)];
+			if (state.is_set) {
+				continue;
+			}
+			const auto input_idx = input_data_format.sel->get_index(candidate_idx);
+			const auto is_null = !input_data_format.validity.RowIsValid(input_idx);
+			FirstFunctionStringBase<LAST, SKIP_NULLS>::template SetValue<STATE>(state, input_data, sort_key_data[i],
+			                                                                    is_null);
+			if (state.value_is_valid) {
+				changed.set_index(changed_count++, candidate_idx);
+			}
+		}
+		return changed_count;
+	}
+
 	template <class STATE>
 	static void Finalize(STATE &state, AggregateFinalizeData &finalize_data) {
 		if (!state.is_set || !state.value_is_valid) {
@@ -351,6 +446,12 @@ AggregateFunction GetFirstAggregateTemplated(const LogicalType &type) {
 	                      AggregateFunction::StateFinalize<FirstState<T>, T, FirstFunction<LAST, SKIP_NULLS>>,
 	                      FunctionNullHandling::DEFAULT_NULL_HANDLING, FirstFunctionClusterUpdate<T, LAST, SKIP_NULLS>);
 	AggregateFunction::WireStructStateType<FirstState<T>>(result);
+	if constexpr (!LAST) {
+		result.SetStateUpdateWithChangeCallback(
+		    AggregateFunction::UnaryScatterUpdateWithChange<FirstState<T>, T, FirstFunction<LAST, SKIP_NULLS>>);
+		result.SetStateCombineWithChangeCallback(
+		    AggregateFunction::StateCombineWithChange<FirstState<T>, FirstFunction<LAST, SKIP_NULLS>>);
+	}
 	return result;
 }
 
@@ -409,8 +510,12 @@ AggregateFunction GetFirstFunction(const LogicalType &type) {
 	case PhysicalType::INTERVAL:
 		return GetFirstAggregateTemplated<interval_t, LAST, SKIP_NULLS>(type);
 	case PhysicalType::VARCHAR:
-		return AggregateFunction::UnaryAggregate<FirstStringState, string_t, string_t,
-		                                         FirstFunctionString<LAST, SKIP_NULLS>>(type, type);
+		if constexpr (LAST) {
+			return AggregateFunction::UnaryAggregate<FirstStringState, string_t, string_t,
+			                                         FirstFunctionString<LAST, SKIP_NULLS>>(type, type);
+		}
+		return AggregateFunction::UnaryAggregateWithChange<FirstStringState, string_t, string_t,
+		                                                   FirstFunctionString<LAST, SKIP_NULLS>>(type, type);
 	default: {
 		using OP = FirstVectorFunction<LAST, SKIP_NULLS>;
 		using STATE = FirstSortKeyState;
@@ -420,6 +525,10 @@ AggregateFunction GetFirstFunction(const LogicalType &type) {
 		    FunctionNullHandling::DEFAULT_NULL_HANDLING, AggregateFunction::NoClusterUpdate(), OP::Bind, nullptr,
 		    nullptr, nullptr);
 		AggregateFunction::WireStructStateType<STATE>(fun);
+		if constexpr (!LAST) {
+			fun.SetStateUpdateWithChangeCallback(OP::UpdateWithChange);
+			fun.SetStateCombineWithChangeCallback(AggregateFunction::StateCombineWithChange<STATE, OP>);
+		}
 		return fun;
 	}
 	}

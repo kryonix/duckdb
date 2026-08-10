@@ -433,6 +433,29 @@ idx_t GroupedAggregateHashTable::AddChunkAndGetNewGroups(DataChunk &groups, Data
 	return new_group_count;
 }
 
+idx_t GroupedAggregateHashTable::AddChunkWithChanges(DataChunk &groups, DataChunk &payload, AggregateType filter,
+                                                     const after_change_callback_t &after_change) {
+	unsafe_vector<idx_t> aggregate_filter;
+	auto &aggregates = layout_ptr->GetAggregates();
+	for (idx_t aggregate_idx = 0; aggregate_idx < aggregates.size(); aggregate_idx++) {
+		if (aggregates[aggregate_idx].aggr_type == filter) {
+			aggregate_filter.push_back(aggregate_idx);
+		}
+	}
+	if (groups.size() == 0) {
+		return 0;
+	}
+
+	sink_count += groups.size();
+	groups.Hash(state.hashes);
+	const auto new_group_count = FindOrCreateGroups(groups, state.hashes, state.addresses, state.new_groups);
+	SelectionVector changed_groups(STANDARD_VECTOR_SIZE);
+	const auto changed_group_count =
+	    UpdateAggregatesWithChanges(payload, aggregate_filter, groups.size(), changed_groups);
+	after_change(groups, state.addresses, state.new_groups, new_group_count, changed_groups, changed_group_count);
+	return new_group_count;
+}
+
 GroupedAggregateHashTable::AggregateDictionaryState::AggregateDictionaryState()
     : hashes(LogicalType::HASH), new_dictionary_pointers(LogicalType::POINTER), unique_entries(STANDARD_VECTOR_SIZE) {
 }
@@ -719,6 +742,66 @@ void GroupedAggregateHashTable::UpdateAggregates(DataChunk &payload, const unsaf
 	}
 
 	Verify();
+}
+
+idx_t GroupedAggregateHashTable::UpdateAggregatesWithChanges(DataChunk &payload, const unsafe_vector<idx_t> &filter,
+                                                             idx_t count, SelectionVector &changed_groups) {
+	ValidityMask changed_mask(count);
+	changed_mask.SetAllInvalid(count);
+	SelectionVector aggregate_changes(STANDARD_VECTOR_SIZE);
+	auto &aggregates = layout_ptr->GetAggregates();
+	idx_t filter_idx = 0;
+	idx_t payload_idx = 0;
+	idx_t offset = layout_ptr->GetAggrOffset();
+	VectorOperations::AddInPlace(state.addresses, NumericCast<int64_t>(offset));
+	for (idx_t aggregate_idx = 0; aggregate_idx < aggregates.size(); aggregate_idx++) {
+		auto &aggregate = aggregates[aggregate_idx];
+		if (filter_idx >= filter.size() || aggregate_idx < filter[filter_idx]) {
+			payload_idx += aggregate.child_count;
+			VectorOperations::AddInPlace(state.addresses, NumericCast<int64_t>(aggregate.payload_size));
+			offset += aggregate.payload_size;
+			continue;
+		}
+		D_ASSERT(aggregate_idx == filter[filter_idx]);
+		D_ASSERT(aggregate.function.HasStateUpdateWithChangeCallback());
+
+		AggregateInputData aggregate_input_data(aggregate, state.row_state.allocator);
+		idx_t aggregate_changed_count;
+		if (aggregate.aggr_type != AggregateType::DISTINCT && aggregate.filter) {
+			auto &filter_data = filter_set.GetFilterData(aggregate_idx);
+			const auto filtered_count = filter_data.ApplyFilter(payload);
+			Vector filtered_addresses(state.addresses, filter_data.true_sel, filtered_count);
+			auto inputs = aggregate.child_count ? filter_data.filtered_payload.data.data() + payload_idx : nullptr;
+			aggregate_changed_count = aggregate.function.GetStateUpdateWithChangeCallback()(
+			    inputs, aggregate_input_data, aggregate.child_count, filtered_addresses, filtered_count,
+			    aggregate_changes);
+			for (idx_t changed_idx = 0; changed_idx < aggregate_changed_count; changed_idx++) {
+				const auto filtered_idx = aggregate_changes.get_index_unsafe(changed_idx);
+				changed_mask.SetValidUnsafe(filter_data.true_sel.get_index_unsafe(filtered_idx));
+			}
+		} else {
+			auto inputs = aggregate.child_count ? payload.data.data() + payload_idx : nullptr;
+			aggregate_changed_count = aggregate.function.GetStateUpdateWithChangeCallback()(
+			    inputs, aggregate_input_data, aggregate.child_count, state.addresses, count, aggregate_changes);
+			for (idx_t changed_idx = 0; changed_idx < aggregate_changed_count; changed_idx++) {
+				changed_mask.SetValidUnsafe(aggregate_changes.get_index_unsafe(changed_idx));
+			}
+		}
+		payload_idx += aggregate.child_count;
+		VectorOperations::AddInPlace(state.addresses, NumericCast<int64_t>(aggregate.payload_size));
+		offset += aggregate.payload_size;
+		filter_idx++;
+	}
+	VectorOperations::AddInPlace(state.addresses, -NumericCast<int64_t>(offset));
+
+	idx_t changed_count = 0;
+	for (idx_t row_idx = 0; row_idx < count; row_idx++) {
+		if (changed_mask.RowIsValidUnsafe(row_idx)) {
+			changed_groups.set_index(changed_count++, row_idx);
+		}
+	}
+	Verify();
+	return changed_count;
 }
 
 idx_t GroupedAggregateHashTable::AddChunk(DataChunk &groups, Vector &group_hashes, DataChunk &payload,
@@ -1159,6 +1242,35 @@ void GroupedAggregateHashTable::Combine(GroupedAggregateHashTable &other) {
 	Combine(*other_data);
 
 	// Inherit ownership to all stored aggregate allocators
+	stored_allocators.emplace_back(other.aggregate_allocator);
+	for (const auto &stored_allocator : other.stored_allocators) {
+		stored_allocators.emplace_back(stored_allocator);
+	}
+}
+
+void GroupedAggregateHashTable::CombineWithChanges(GroupedAggregateHashTable &other,
+                                                   const after_change_callback_t &after_change) {
+	auto other_partitioned_data = other.AcquirePartitionedData();
+	auto other_data = other_partitioned_data->GetUnpartitioned();
+	if (other_data->Count() > 0) {
+		FlushMoveState move_state(*other_data);
+		while (move_state.Scan()) {
+			context.InterruptCheck();
+			const auto new_group_count = FindOrCreateGroups(move_state.groups, move_state.hashes,
+			                                                move_state.group_addresses, move_state.new_groups_sel);
+			SelectionVector changed_groups(STANDARD_VECTOR_SIZE);
+			const auto changed_group_count = RowOperations::CombineStatesWithChange(
+			    state.row_state, *layout_ptr, move_state.scan_state.chunk_state.row_locations,
+			    move_state.group_addresses, changed_groups);
+			if (layout_ptr->HasDestructor()) {
+				RowOperations::DestroyStates(state.row_state, *layout_ptr,
+				                             move_state.scan_state.chunk_state.row_locations);
+			}
+			after_change(move_state.groups, move_state.group_addresses, move_state.new_groups_sel, new_group_count,
+			             changed_groups, changed_group_count);
+		}
+	}
+
 	stored_allocators.emplace_back(other.aggregate_allocator);
 	for (const auto &stored_allocator : other.stored_allocators) {
 		stored_allocators.emplace_back(stored_allocator);

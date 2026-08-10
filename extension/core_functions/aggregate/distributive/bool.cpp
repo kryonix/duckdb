@@ -16,6 +16,15 @@ struct BoolAggregate {
 	// No Initialize: StateInitialize falls back to memset(state, 0) = nullopt
 
 	template <class INPUT_TYPE, class STATE, class OP>
+	static bool OperationWithChange(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &) {
+		const auto was_set = state.is_set;
+		const auto previous = state.value;
+		state.value = REDUCE_OP::template Operation<bool>(state.is_set ? state.value : INIT_VALUE, bool(input));
+		state.is_set = true;
+		return !was_set || state.value != previous;
+	}
+
+	template <class INPUT_TYPE, class STATE, class OP>
 	static void Operation(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &) {
 		state.value = REDUCE_OP::template Operation<bool>(state.is_set ? state.value : INIT_VALUE, bool(input));
 		state.is_set = true;
@@ -38,6 +47,18 @@ struct BoolAggregate {
 		target.is_set = true;
 	}
 
+	template <class STATE, class OP>
+	static bool CombineWithChange(const STATE &source, STATE &target, AggregateInputData &) {
+		if (!source.is_set) {
+			return false;
+		}
+		const auto was_set = target.is_set;
+		const auto previous = target.value;
+		target.value = REDUCE_OP::template Operation<bool>(target.is_set ? target.value : INIT_VALUE, source.value);
+		target.is_set = true;
+		return !was_set || target.value != previous;
+	}
+
 	template <class T, class STATE>
 	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (!state.is_set) {
@@ -58,7 +79,7 @@ using BoolOrFunFunction = BoolAggregate<LogicalOr, false>;
 } // namespace
 
 AggregateFunction BoolOrFun::GetFunction() {
-	auto fun = AggregateFunction::UnaryAggregate<BoolState, bool, bool, BoolOrFunFunction>(
+	auto fun = AggregateFunction::UnaryAggregateWithChange<BoolState, bool, bool, BoolOrFunFunction>(
 	    LogicalType(LogicalTypeId::BOOLEAN), LogicalType::BOOLEAN);
 	fun.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
 	fun.SetDistinctDependent(AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT);
@@ -66,7 +87,7 @@ AggregateFunction BoolOrFun::GetFunction() {
 }
 
 AggregateFunction BoolAndFun::GetFunction() {
-	auto fun = AggregateFunction::UnaryAggregate<BoolState, bool, bool, BoolAndFunFunction>(
+	auto fun = AggregateFunction::UnaryAggregateWithChange<BoolState, bool, bool, BoolAndFunFunction>(
 	    LogicalType(LogicalTypeId::BOOLEAN), LogicalType::BOOLEAN);
 	fun.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
 	fun.SetDistinctDependent(AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT);

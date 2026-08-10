@@ -14,6 +14,15 @@ namespace duckdb {
 namespace {
 template <class MAP_TYPE>
 struct HistogramFunction {
+	template <class STATE, class OP>
+	static bool CombineWithChange(const STATE &source, STATE &target, AggregateInputData &input_data) {
+		if (!source.hist) {
+			return false;
+		}
+		Combine<STATE, OP>(source, target, input_data);
+		return true;
+	}
+
 	template <class STATE>
 	static void Destroy(STATE &state, AggregateInputData &) {
 		if (state.hist) {
@@ -85,6 +94,21 @@ void HistogramUpdateFunction(Vector inputs[], AggregateInputData &aggr_input, id
 }
 
 template <class OP, class T, class MAP_TYPE>
+idx_t HistogramUpdateWithChangeFunction(Vector inputs[], AggregateInputData &aggr_input, idx_t input_count,
+                                        Vector &state_vector, idx_t count, SelectionVector &changed) {
+	HistogramUpdateFunction<OP, T, MAP_TYPE>(inputs, aggr_input, input_count, state_vector, count);
+	UnifiedVectorFormat input_data;
+	inputs[0].ToUnifiedFormat(input_data);
+	idx_t changed_count = 0;
+	for (idx_t i = 0; i < count; i++) {
+		if (input_data.validity.RowIsValid(input_data.sel->get_index(i))) {
+			changed.set_index(changed_count++, i);
+		}
+	}
+	return changed_count;
+}
+
+template <class OP, class T, class MAP_TYPE>
 void HistogramFinalizeFunction(Vector &state_vector, AggregateFinalizeInputData &, Vector &result, idx_t count,
                                idx_t offset) {
 	using HIST_STATE = HistogramAggState<T, typename MAP_TYPE::MAP_TYPE>;
@@ -138,11 +162,14 @@ AggregateFunction GetHistogramFunction(const LogicalType &type) {
 	using HIST_FUNC = HistogramFunction<MAP_TYPE>;
 
 	auto struct_type = LogicalType::MAP(type, LogicalType::UBIGINT);
-	return AggregateFunction(
+	auto function = AggregateFunction(
 	    "histogram", {type}, struct_type, AggregateFunction::StateSize<STATE_TYPE>,
 	    AggregateFunction::StateInitialize<STATE_TYPE, HIST_FUNC>, HistogramUpdateFunction<OP, T, MAP_TYPE>,
 	    AggregateFunction::StateCombine<STATE_TYPE, HIST_FUNC>, HistogramFinalizeFunction<OP, T, MAP_TYPE>, nullptr,
 	    nullptr, AggregateFunction::StateDestroy<STATE_TYPE, HIST_FUNC>);
+	function.SetStateUpdateWithChangeCallback(HistogramUpdateWithChangeFunction<OP, T, MAP_TYPE>);
+	function.SetStateCombineWithChangeCallback(AggregateFunction::StateCombineWithChange<STATE_TYPE, HIST_FUNC>);
+	return function;
 }
 
 template <class OP, class T, class MAP_TYPE>

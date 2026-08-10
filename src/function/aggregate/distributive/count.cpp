@@ -16,6 +16,15 @@ struct BaseCountFunction {
 	}
 
 	template <class STATE, class OP>
+	static bool CombineWithChange(const STATE &source, STATE &target, AggregateInputData &) {
+		if (source == 0) {
+			return false;
+		}
+		target += source;
+		return true;
+	}
+
+	template <class STATE, class OP>
 	static void RepeatedCombine(const STATE &source, STATE &target, AggregateInputData &, idx_t count) {
 		STATE repeated_count;
 		if (!TryMultiplyOperator::Operation(source, static_cast<STATE>(count), repeated_count)) {
@@ -33,6 +42,12 @@ struct BaseCountFunction {
 };
 
 struct CountStarFunction : public BaseCountFunction {
+	template <class STATE, class OP>
+	static bool OperationWithChange(STATE &state, AggregateInputData &, idx_t) {
+		state += 1;
+		return true;
+	}
+
 	template <class STATE, class OP>
 	static void Operation(STATE &state, AggregateInputData &, idx_t idx) {
 		state += 1;
@@ -242,6 +257,25 @@ struct CountFunction : public BaseCountFunction {
 		}
 	}
 
+	static idx_t CountScatterWithChange(Vector inputs[], AggregateInputData &, idx_t input_count, Vector &states,
+	                                    idx_t count, SelectionVector &changed) {
+		D_ASSERT(input_count == 1);
+		UnifiedVectorFormat input_data;
+		UnifiedVectorFormat state_data;
+		inputs[0].ToUnifiedFormat(input_data);
+		states.ToUnifiedFormat(state_data);
+		auto state_values = UnifiedVectorFormat::GetData<STATE *>(state_data);
+		idx_t changed_count = 0;
+		for (idx_t i = 0; i < count; i++) {
+			if (!input_data.validity.RowIsValid(input_data.sel->get_index(i))) {
+				continue;
+			}
+			CountFunction::Operation(*state_values[state_data.sel->get_index(i)]);
+			changed.set_index(changed_count++, i);
+		}
+		return changed_count;
+	}
+
 	static inline void CountFlatUpdateLoop(STATE &result, const ValidityMask &mask, idx_t count) {
 		idx_t base_idx = 0;
 		auto entry_count = ValidityMask::EntryCount(count);
@@ -295,6 +329,8 @@ AggregateFunction CountFunctionBase::GetFunction() {
 	                      AggregateFunction::StateFinalize<int64_t, int64_t, CountFunction>,
 	                      FunctionNullHandling::SPECIAL_HANDLING, CountFunction::CountClusterUpdate);
 	fun.SetName("count");
+	fun.SetStateUpdateWithChangeCallback(CountFunction::CountScatterWithChange);
+	fun.SetStateCombineWithChangeCallback(AggregateFunction::StateCombineWithChange<int64_t, CountFunction>);
 	fun.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
 	fun.SetStructStateExport(GetCountStateType);
 	fun.SetStatisticsCallback(CountPropagateStats);
@@ -302,7 +338,7 @@ AggregateFunction CountFunctionBase::GetFunction() {
 }
 
 AggregateFunction CountStarFun::GetFunction() {
-	auto fun = AggregateFunction::NullaryAggregate<int64_t, int64_t, CountStarFunction>(LogicalType::BIGINT);
+	auto fun = AggregateFunction::NullaryAggregateWithChange<int64_t, int64_t, CountStarFunction>(LogicalType::BIGINT);
 	fun.SetName("count_star");
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	fun.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);

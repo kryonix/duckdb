@@ -79,8 +79,16 @@ typedef void (*aggregate_initialize_t)(AggregateStateInput &input, data_ptr_t *s
 //! The type used for updating hashed aggregate functions
 typedef void (*aggregate_update_t)(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
                                    Vector &state, idx_t count);
+//! Optional update variant that returns input indexes whose finalized value changed. Reported changes must remain
+//! observable after subsequent updates in the same accumulation.
+typedef idx_t (*aggregate_update_with_change_t)(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
+                                                Vector &state, idx_t count, SelectionVector &changed);
 //! The type used for combining hashed aggregate states
 typedef void (*aggregate_combine_t)(Vector &state, Vector &combined, AggregateInputData &aggr_input_data, idx_t count);
+//! Optional combine variant that returns pair indexes whose target's finalized value changed. Reported changes must
+//! remain observable after subsequent combines in the same accumulation.
+typedef idx_t (*aggregate_combine_with_change_t)(Vector &state, Vector &combined, AggregateInputData &aggr_input_data,
+                                                 idx_t count, SelectionVector &changed);
 //! The type used for finalizing hashed aggregate function payloads
 typedef void (*aggregate_finalize_t)(Vector &state, AggregateFinalizeInputData &finalize_input_data, Vector &result,
                                      idx_t count, idx_t offset);
@@ -189,6 +197,9 @@ public:
 	bool HasStateUpdateCallback() const { return update != nullptr; }
 	aggregate_update_t GetStateUpdateCallback() const { return update; }
 	void SetStateUpdateCallback(aggregate_update_t callback) { update = callback; }
+	bool HasStateUpdateWithChangeCallback() const { return update_with_change != nullptr; }
+	aggregate_update_with_change_t GetStateUpdateWithChangeCallback() const { return update_with_change; }
+	void SetStateUpdateWithChangeCallback(aggregate_update_with_change_t callback) { update_with_change = callback; }
 
 	bool HasStateClusterUpdateCallback() const { return cluster_update != nullptr; }
 	aggregate_cluster_update_t GetStateClusterUpdateCallback() const { return cluster_update; }
@@ -197,6 +208,9 @@ public:
 	void SetStateCombineCallback(aggregate_combine_t callback) { combine = callback; }
 	aggregate_combine_t GetStateCombineCallback() const { return combine; }
 	bool HasStateCombineCallback() const { return combine != nullptr; }
+	bool HasStateCombineWithChangeCallback() const { return combine_with_change != nullptr; }
+	aggregate_combine_with_change_t GetStateCombineWithChangeCallback() const { return combine_with_change; }
+	void SetStateCombineWithChangeCallback(aggregate_combine_with_change_t callback) { combine_with_change = callback; }
 
 	void SetStateFinalizeCallback(aggregate_finalize_t callback) { finalize = callback; }
 	aggregate_finalize_t GetStateFinalizeCallback() const { return finalize; }
@@ -237,8 +251,12 @@ public:
 	aggregate_initialize_t initialize = nullptr;
 	//! The hashed aggregate update state function (may be null, if window is set)
 	aggregate_update_t update = nullptr;
+	//! Optional update callback used by change-aware incremental consumers.
+	aggregate_update_with_change_t update_with_change = nullptr;
 	//! The hashed aggregate combine states function (may be null, if window is set)
 	aggregate_combine_t combine = nullptr;
+	//! Optional combine callback used by change-aware incremental consumers.
+	aggregate_combine_with_change_t combine_with_change = nullptr;
 	//! The hashed aggregate finalization function (may be null, if window is set)
 	aggregate_finalize_t finalize = nullptr;
 	//! Initializes the local state used by the finalize (may be null)
@@ -358,6 +376,9 @@ public: // Callbacks
 	auto HasStateUpdateCallback() const -> bool { return callbacks.update != nullptr; }
 	auto GetStateUpdateCallback() const -> aggregate_update_t { return callbacks.update; }
 	auto SetStateUpdateCallback(aggregate_update_t callback) -> void { callbacks.update = callback; }
+	auto HasStateUpdateWithChangeCallback() const -> bool { return callbacks.update_with_change != nullptr; }
+	auto GetStateUpdateWithChangeCallback() const -> aggregate_update_with_change_t { return callbacks.update_with_change; }
+	auto SetStateUpdateWithChangeCallback(aggregate_update_with_change_t callback) -> void { callbacks.update_with_change = callback; }
 
 	auto HasStateClusterUpdateCallback() const -> bool { return callbacks.cluster_update != nullptr; }
 	auto GetStateClusterUpdateCallback() const -> aggregate_cluster_update_t { return callbacks.cluster_update; }
@@ -366,6 +387,9 @@ public: // Callbacks
 	auto HasStateCombineCallback() const -> bool { return callbacks.combine != nullptr; }
 	auto GetStateCombineCallback() const -> aggregate_combine_t { return callbacks.combine; }
 	auto SetStateCombineCallback(aggregate_combine_t callback) -> void { callbacks.combine = callback; }
+	auto HasStateCombineWithChangeCallback() const -> bool { return callbacks.combine_with_change != nullptr; }
+	auto GetStateCombineWithChangeCallback() const -> aggregate_combine_with_change_t { return callbacks.combine_with_change; }
+	auto SetStateCombineWithChangeCallback(aggregate_combine_with_change_t callback) -> void { callbacks.combine_with_change = callback; }
 
 	auto HasStateFinalizeCallback() const -> bool { return callbacks.finalize != nullptr; }
 	auto GetStateFinalizeCallback() const -> aggregate_finalize_t { return callbacks.finalize; }
@@ -585,6 +609,14 @@ public:
 		return result;
 	}
 
+	template <class STATE, class RESULT_TYPE, class OP>
+	static AggregateFunction NullaryAggregateWithChange(LogicalType return_type) {
+		auto result = NullaryAggregate<STATE, RESULT_TYPE, OP>(return_type);
+		result.SetStateUpdateWithChangeCallback(NullaryScatterUpdateWithChange<STATE, OP>);
+		result.SetStateCombineWithChangeCallback(StateCombineWithChange<STATE, OP>);
+		return result;
+	}
+
 	template <class STATE, class INPUT_TYPE, class RESULT_TYPE, class OP,
 	          AggregateDestructorType destructor_type = AggregateDestructorType::STANDARD>
 	static AggregateFunction
@@ -601,6 +633,18 @@ public:
 			result.callbacks.destructor = AggregateFunction::StateDestroy<STATE, OP>;
 		}
 		WireStructStateType<STATE>(result);
+		return result;
+	}
+
+	template <class STATE, class INPUT_TYPE, class RESULT_TYPE, class OP,
+	          AggregateDestructorType destructor_type = AggregateDestructorType::STANDARD>
+	static AggregateFunction
+	UnaryAggregateWithChange(const LogicalType &input_type, LogicalType return_type,
+	                         FunctionNullHandling null_handling = FunctionNullHandling::DEFAULT_NULL_HANDLING) {
+		auto result =
+		    UnaryAggregate<STATE, INPUT_TYPE, RESULT_TYPE, OP, destructor_type>(input_type, return_type, null_handling);
+		result.SetStateUpdateWithChangeCallback(UnaryScatterUpdateWithChange<STATE, INPUT_TYPE, OP>);
+		result.SetStateCombineWithChangeCallback(StateCombineWithChange<STATE, OP>);
 		return result;
 	}
 
@@ -625,6 +669,17 @@ public:
 		                         AggregateFunction::StateCombine<STATE, OP>,
 		                         AggregateFunction::StateFinalize<STATE, RESULT_TYPE, OP>, nullptr);
 		WireStructStateType<STATE>(result);
+		return result;
+	}
+
+	template <class STATE, class A_TYPE, class B_TYPE, class RESULT_TYPE, class OP,
+	          AggregateDestructorType destructor_type = AggregateDestructorType::STANDARD>
+	static AggregateFunction BinaryAggregateWithChange(const LogicalType &a_type, const LogicalType &b_type,
+	                                                   LogicalType return_type) {
+		auto result =
+		    BinaryAggregate<STATE, A_TYPE, B_TYPE, RESULT_TYPE, OP, destructor_type>(a_type, b_type, return_type);
+		result.SetStateUpdateWithChangeCallback(BinaryScatterUpdateWithChange<STATE, A_TYPE, B_TYPE, OP>);
+		result.SetStateCombineWithChangeCallback(StateCombineWithChange<STATE, OP>);
 		return result;
 	}
 
@@ -689,6 +744,13 @@ public:
 	}
 
 	template <class STATE, class OP>
+	static idx_t NullaryScatterUpdateWithChange(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
+	                                            Vector &states, idx_t count, SelectionVector &changed) {
+		D_ASSERT(input_count == 0);
+		return AggregateExecutor::NullaryScatterWithChange<STATE, OP>(states, aggr_input_data, count, changed);
+	}
+
+	template <class STATE, class OP>
 	static void NullaryUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count, data_ptr_t state,
 	                          idx_t count) {
 		D_ASSERT(input_count == 0);
@@ -707,6 +769,14 @@ public:
 	                               Vector &states, idx_t count) {
 		D_ASSERT(input_count == 1);
 		AggregateExecutor::UnaryScatter<STATE, T, OP>(inputs[0], states, aggr_input_data, count);
+	}
+
+	template <class STATE, class T, class OP>
+	static idx_t UnaryScatterUpdateWithChange(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
+	                                          Vector &states, idx_t count, SelectionVector &changed) {
+		D_ASSERT(input_count == 1);
+		return AggregateExecutor::UnaryScatterWithChange<STATE, T, OP>(inputs[0], states, aggr_input_data, count,
+		                                                               changed);
 	}
 
 	template <class STATE, class INPUT_TYPE, class OP>
@@ -732,6 +802,14 @@ public:
 	}
 
 	template <class STATE, class A_TYPE, class B_TYPE, class OP>
+	static idx_t BinaryScatterUpdateWithChange(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
+	                                           Vector &states, idx_t count, SelectionVector &changed) {
+		D_ASSERT(input_count == 2);
+		return AggregateExecutor::BinaryScatterWithChange<STATE, A_TYPE, B_TYPE, OP>(aggr_input_data, inputs[0],
+		                                                                             inputs[1], states, count, changed);
+	}
+
+	template <class STATE, class A_TYPE, class B_TYPE, class OP>
 	static void BinaryUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count, data_ptr_t state,
 	                         idx_t count) {
 		D_ASSERT(input_count == 2);
@@ -741,6 +819,12 @@ public:
 	template <class STATE, class OP>
 	static void StateCombine(Vector &source, Vector &target, AggregateInputData &aggr_input_data, idx_t count) {
 		AggregateExecutor::Combine<STATE, OP>(source, target, aggr_input_data, count);
+	}
+
+	template <class STATE, class OP>
+	static idx_t StateCombineWithChange(Vector &source, Vector &target, AggregateInputData &aggr_input_data,
+	                                    idx_t count, SelectionVector &changed) {
+		return AggregateExecutor::CombineWithChange<STATE, OP>(source, target, aggr_input_data, count, changed);
 	}
 
 	template <class STATE, class RESULT_TYPE, class OP>

@@ -31,6 +31,8 @@ AggregateFunction ListFun::GetFunction() {
 	                              ListCombineFunction<ListFunction>, ListFinalize, ListClusterUpdate<>, nullptr,
 	                              nullptr, nullptr);
 	AggregateFunction::WireStructStateType<ListAggState>(func);
+	func.SetStateUpdateWithChangeCallback(ListUpdateWithChangeFunction<>);
+	func.SetStateCombineWithChangeCallback(ListCombineWithChangeFunction<ListFunction>);
 
 	return func;
 }

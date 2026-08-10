@@ -192,6 +192,25 @@ struct IntegerSumOperation
 	}
 };
 
+struct CountIfChangeOperation : public IntegerSumOperation {
+	template <class INPUT_TYPE, class STATE, class OP>
+	static bool OperationWithChange(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &unary_input) {
+		const auto was_set = state.is_set;
+		IntegerSumOperation::template Operation<INPUT_TYPE, STATE, IntegerSumOperation>(state, input, unary_input);
+		return !was_set || bool(input);
+	}
+
+	template <class STATE, class OP>
+	static bool CombineWithChange(const STATE &source, STATE &target, AggregateInputData &input_data) {
+		if (!source.is_set) {
+			return false;
+		}
+		const auto changed = !target.is_set || source.value != 0;
+		IntegerSumOperation::template Combine<STATE, IntegerSumOperation>(source, target, input_data);
+		return changed;
+	}
+};
+
 struct SumToHugeintOperation
     : public ClusteredSumOperation<BaseSumOperation<SumSetOperation, AddToHugeint>, ClusteredAddOp<AddToHugeint>> {
 	template <class STATE, class OP>
@@ -439,7 +458,12 @@ AggregateFunctionSet SumFun::GetFunctions() {
 }
 
 AggregateFunction CountIfFun::GetFunction() {
-	return GetSumAggregate(PhysicalType::BOOL);
+	auto function = GetSumAggregate(PhysicalType::BOOL);
+	function.SetStateUpdateWithChangeCallback(
+	    AggregateFunction::UnaryScatterUpdateWithChange<SumState<int64_t>, bool, CountIfChangeOperation>);
+	function.SetStateCombineWithChangeCallback(
+	    AggregateFunction::StateCombineWithChange<SumState<int64_t>, CountIfChangeOperation>);
+	return function;
 }
 
 AggregateFunctionSet SumNoOverflowFun::GetFunctions() {

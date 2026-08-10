@@ -60,7 +60,8 @@ bool AggregateFunctionProperties::operator!=(const AggregateFunctionProperties &
 
 bool AggregateFunctionCallbacks::operator==(const AggregateFunctionCallbacks &rhs) const {
 	return state_size == rhs.state_size && initialize == rhs.initialize && update == rhs.update &&
-	       combine == rhs.combine && finalize == rhs.finalize &&
+	       update_with_change == rhs.update_with_change && combine == rhs.combine &&
+	       combine_with_change == rhs.combine_with_change && finalize == rhs.finalize &&
 	       init_local_state_finalize == rhs.init_local_state_finalize && cluster_update == rhs.cluster_update &&
 	       window == rhs.window && window_init == rhs.window_init && window_batch == rhs.window_batch &&
 	       bind == rhs.bind && destructor == rhs.destructor && statistics == rhs.statistics &&

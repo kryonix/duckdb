@@ -117,6 +117,7 @@ public:
 		memset(ptr, 0, capacity * sizeof(HeapEntry<T>));
 		heap = reinterpret_cast<HeapEntry<T> *>(ptr);
 		size = 0;
+		sorted = false;
 	}
 
 	bool IsEmpty() const {
@@ -129,13 +130,15 @@ public:
 		return capacity;
 	}
 
-	void Insert(ArenaAllocator &allocator, const T &value) {
+	bool Insert(ArenaAllocator &allocator, const T &value) {
 		D_ASSERT(capacity != 0); // must be initialized
+		RestoreHeap();
 
 		// If the heap is not full, insert the value into a new slot
 		if (size < capacity) {
 			heap[size++].Assign(allocator, value);
 			std::push_heap(heap, heap + size, Compare);
+			return true;
 		}
 		// If the heap is full, check if the value is greater than the smallest value in the heap
 		// If it is, assign the new value to the slot and re-heapify
@@ -143,18 +146,25 @@ public:
 			std::pop_heap(heap, heap + size, Compare);
 			heap[size - 1].Assign(allocator, value);
 			std::push_heap(heap, heap + size, Compare);
+			return true;
 		}
 		D_ASSERT(std::is_heap(heap, heap + size, Compare));
+		return false;
 	}
 
-	void Insert(ArenaAllocator &allocator, const UnaryAggregateHeap &other) {
+	bool Insert(ArenaAllocator &allocator, const UnaryAggregateHeap &other) {
+		bool changed = false;
 		for (idx_t slot = 0; slot < other.Size(); slot++) {
-			Insert(allocator, other.heap[slot].value);
+			changed = Insert(allocator, other.heap[slot].value) || changed;
 		}
+		return changed;
 	}
 
 	HeapEntry<T> *SortAndGetHeap() {
-		std::sort_heap(heap, heap + size, Compare);
+		if (!sorted) {
+			std::sort_heap(heap, heap + size, Compare);
+			sorted = true;
+		}
 		return heap;
 	}
 
@@ -163,6 +173,14 @@ public:
 	}
 
 private:
+	void RestoreHeap() {
+		if (!sorted) {
+			return;
+		}
+		std::make_heap(heap, heap + size, Compare);
+		sorted = false;
+	}
+
 	static bool Compare(const HeapEntry<T> &left, const HeapEntry<T> &right) {
 		return T_COMPARATOR::Operation(left.value, right.value);
 	}
@@ -170,6 +188,7 @@ private:
 	idx_t capacity;
 	HeapEntry<T> *heap;
 	idx_t size;
+	bool sorted;
 };
 
 struct List {
@@ -194,6 +213,7 @@ public:
 		allocated_capacity = 0;
 		heap = nullptr;
 		size = 0;
+		sorted = false;
 	}
 
 	bool IsEmpty() const {
@@ -208,6 +228,7 @@ public:
 
 	void Insert(ArenaAllocator &allocator, const K &key, const V &value) {
 		D_ASSERT(capacity != 0); // must be initialized
+		RestoreHeap();
 
 		// If the heap is not full, insert the value into a new slot
 		if (size < capacity) {
@@ -237,7 +258,10 @@ public:
 	}
 
 	STORAGE_TYPE *SortAndGetHeap() {
-		std::sort_heap(heap, heap + size, Compare);
+		if (!sorted) {
+			std::sort_heap(heap, heap + size, Compare);
+			sorted = true;
+		}
 		return heap;
 	}
 
@@ -246,6 +270,14 @@ public:
 	}
 
 private:
+	void RestoreHeap() {
+		if (!sorted) {
+			return;
+		}
+		std::make_heap(heap, heap + size, Compare);
+		sorted = false;
+	}
+
 	void Grow(ArenaAllocator &allocator) {
 		D_ASSERT(allocated_capacity < capacity);
 		const auto old_allocated_capacity = allocated_capacity;
@@ -273,6 +305,7 @@ private:
 	idx_t allocated_capacity = 0;
 	STORAGE_TYPE *heap = nullptr;
 	idx_t size = 0;
+	bool sorted = false;
 };
 
 enum class ArgMinMaxNullHandling { IGNORE_ANY_NULL, HANDLE_ARG_NULL, HANDLE_ANY_NULL };
@@ -425,6 +458,19 @@ struct MinMaxFixedValueOrNull {
 // MinMaxN Operation (common for both ArgMinMaxN and MinMaxN)
 //------------------------------------------------------------------------------
 struct MinMaxNOperation {
+	template <class STATE, class OP>
+	static bool CombineWithChange(const STATE &source, STATE &target, AggregateInputData &aggr_input) {
+		if (!source.is_initialized) {
+			return false;
+		}
+		if (!target.is_initialized) {
+			target.Initialize(aggr_input.allocator, source.heap.Capacity());
+		} else if (source.heap.Capacity() != target.heap.Capacity()) {
+			throw InvalidInputException("Mismatched n values in min/max/arg_min/arg_max");
+		}
+		return target.heap.Insert(aggr_input.allocator, source.heap);
+	}
+
 	template <class STATE, class OP>
 	static void Combine(const STATE &source, STATE &target, AggregateInputData &aggr_input) {
 		if (!source.is_initialized) {

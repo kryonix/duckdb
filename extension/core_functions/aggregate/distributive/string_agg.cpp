@@ -36,6 +36,14 @@ struct StringAggBindData : public FunctionData {
 };
 
 struct StringAggFunction {
+	template <class INPUT_TYPE, class STATE, class OP>
+	static bool OperationWithChange(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &unary_input) {
+		auto &bind_data = unary_input.input.bind_data->template Cast<StringAggBindData>();
+		const auto changed = !state.is_set || input.GetSize() != 0 || !bind_data.sep.empty();
+		PerformOperation(state, unary_input.input.allocator, input, unary_input.input.bind_data);
+		return changed;
+	}
+
 	template <class T, class STATE>
 	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (!state.is_set) {
@@ -115,6 +123,17 @@ struct StringAggFunction {
 		}
 		PerformOperation(target, aggr_input_data.allocator, source.value, aggr_input_data.bind_data);
 	}
+
+	template <class STATE, class OP>
+	static bool CombineWithChange(const STATE &source, STATE &target, AggregateInputData &aggr_input_data) {
+		if (!source.is_set) {
+			return false;
+		}
+		auto &bind_data = aggr_input_data.bind_data->template Cast<StringAggBindData>();
+		const auto changed = !target.is_set || source.value.GetSize() != 0 || !bind_data.sep.empty();
+		PerformOperation(target, aggr_input_data.allocator, source.value, aggr_input_data.bind_data);
+		return changed;
+	}
 };
 
 unique_ptr<FunctionData> StringAggBind(BindAggregateFunctionInput &input) {
@@ -181,6 +200,10 @@ AggregateFunctionSet StringAggFun::GetFunctions() {
 	    FunctionNullHandling::DEFAULT_NULL_HANDLING, AggregateFunction::NoClusterUpdate(), StringAggBind);
 
 	string_agg_param.GetSignature().GetParameter(0).SetName("input");
+	string_agg_param.SetStateUpdateWithChangeCallback(
+	    AggregateFunction::UnaryScatterUpdateWithChange<StringAggState, string_t, StringAggFunction>);
+	string_agg_param.SetStateCombineWithChangeCallback(
+	    AggregateFunction::StateCombineWithChange<StringAggState, StringAggFunction>);
 	string_agg_param.SetSerializeCallback(StringAggSerialize);
 	string_agg_param.SetDeserializeCallback(StringAggDeserialize);
 	string_agg_param.SetStructStateExport(StringAggStateType);

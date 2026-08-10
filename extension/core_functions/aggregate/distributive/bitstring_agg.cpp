@@ -68,6 +68,16 @@ struct BitStringAggOperation {
 	static constexpr const idx_t MAX_BIT_RANGE = 1000000000; // for now capped at 1 billion bits
 
 	template <class INPUT_TYPE, class STATE, class OP>
+	static bool OperationWithChange(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &unary_input) {
+		bool changed = !state.is_set;
+		if (state.is_set && input >= state.min && input <= state.max) {
+			changed = Bit::GetBit(state.value, GetBitIndex(input, state.min)) == 0;
+		}
+		Operation<INPUT_TYPE, STATE, OP>(state, input, unary_input);
+		return changed;
+	}
+
+	template <class INPUT_TYPE, class STATE, class OP>
 	static void Operation(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &unary_input) {
 		auto &bind_agg_data = unary_input.input.bind_data->template Cast<BitstringAggBindData>();
 		if (!state.is_set) {
@@ -128,6 +138,27 @@ struct BitStringAggOperation {
 		return val + 1;
 	}
 
+	template <class INPUT_TYPE>
+	static idx_t GetBitIndex(INPUT_TYPE input, INPUT_TYPE min) {
+		return UnsafeNumericCast<idx_t>(input - min);
+	}
+
+	static idx_t GetBitIndex(hugeint_t input, hugeint_t min) {
+		idx_t result;
+		if (!Hugeint::TryCast(input - min, result)) {
+			throw OutOfRangeException("Range too large for bitstring aggregation");
+		}
+		return result;
+	}
+
+	static idx_t GetBitIndex(uhugeint_t input, uhugeint_t min) {
+		idx_t result;
+		if (!Uhugeint::TryCast(input - min, result)) {
+			throw OutOfRangeException("Range too large for bitstring aggregation");
+		}
+		return result;
+	}
+
 	template <class INPUT_TYPE, class STATE>
 	static void Execute(STATE &state, INPUT_TYPE input, INPUT_TYPE min) {
 		Bit::SetBit(state.value, UnsafeNumericCast<idx_t>(input - min), 1);
@@ -146,6 +177,32 @@ struct BitStringAggOperation {
 		} else {
 			Bit::BitwiseOr(source.value, target.value, target.value);
 		}
+	}
+
+	template <class STATE, class OP>
+	static bool CombineWithChange(const STATE &source, STATE &target, AggregateInputData &) {
+		if (!source.is_set) {
+			return false;
+		}
+		if (!target.is_set) {
+			Assign(target, source.value);
+			target.is_set = true;
+			target.min = source.min;
+			target.max = source.max;
+			return true;
+		}
+		if (source.value.GetSize() != target.value.GetSize()) {
+			Bit::BitwiseOr(source.value, target.value, target.value);
+			return true;
+		}
+		const auto source_data = reinterpret_cast<const uint8_t *>(source.value.GetData());
+		const auto target_data = reinterpret_cast<const uint8_t *>(target.value.GetData());
+		bool changed = false;
+		for (idx_t byte_idx = 0; byte_idx < target.value.GetSize(); byte_idx++) {
+			changed = changed || (source_data[byte_idx] | target_data[byte_idx]) != target_data[byte_idx];
+		}
+		Bit::BitwiseOr(source.value, target.value, target.value);
+		return changed;
 	}
 
 	template <class INPUT_TYPE, class STATE>
@@ -253,8 +310,9 @@ unique_ptr<FunctionData> BindBitstringAgg(BindAggregateFunctionInput &input) {
 
 template <class TYPE>
 void BindBitString(AggregateFunctionSet &bitstring_agg, const LogicalTypeId &type) {
-	auto function = AggregateFunction::UnaryAggregate<BitAggState<TYPE>, TYPE, string_t, BitStringAggOperation>(
-	    type, LogicalType::BIT);
+	auto function =
+	    AggregateFunction::UnaryAggregateWithChange<BitAggState<TYPE>, TYPE, string_t, BitStringAggOperation>(
+	        type, LogicalType::BIT);
 	function.SetBindCallback(BindBitstringAgg); // create new a 'BitstringAggBindData'
 	function.SetSerializeCallback(BitstringAggBindData::Serialize);
 	function.SetDeserializeCallback(BitstringAggBindData::Deserialize);

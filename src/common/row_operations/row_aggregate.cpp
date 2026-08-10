@@ -149,6 +149,43 @@ void RowOperations::CombineStates(RowOperationsState &state, TupleDataLayout &la
 	VectorOperations::AddInPlace(targets, -UnsafeNumericCast<int64_t>(offset));
 }
 
+idx_t RowOperations::CombineStatesWithChange(RowOperationsState &state, TupleDataLayout &layout, Vector &sources,
+                                             Vector &targets, SelectionVector &changed) {
+	const auto count = sources.size();
+	if (count == 0) {
+		return 0;
+	}
+	ValidityMask changed_mask(count);
+	changed_mask.SetAllInvalid(count);
+	SelectionVector aggregate_changes(STANDARD_VECTOR_SIZE);
+
+	VectorOperations::AddInPlace(sources, UnsafeNumericCast<int64_t>(layout.GetAggrOffset()));
+	VectorOperations::AddInPlace(targets, UnsafeNumericCast<int64_t>(layout.GetAggrOffset()));
+	idx_t offset = layout.GetAggrOffset();
+	for (auto &aggr : layout.GetAggregates()) {
+		D_ASSERT(aggr.function.HasStateCombineWithChangeCallback());
+		AggregateInputData aggr_input_data(aggr, state.allocator, AggregateCombineType::ALLOW_DESTRUCTIVE);
+		const auto aggregate_changed_count = aggr.function.GetStateCombineWithChangeCallback()(
+		    sources, targets, aggr_input_data, count, aggregate_changes);
+		for (idx_t changed_idx = 0; changed_idx < aggregate_changed_count; changed_idx++) {
+			changed_mask.SetValidUnsafe(aggregate_changes.get_index_unsafe(changed_idx));
+		}
+		VectorOperations::AddInPlace(sources, UnsafeNumericCast<int64_t>(aggr.payload_size));
+		VectorOperations::AddInPlace(targets, UnsafeNumericCast<int64_t>(aggr.payload_size));
+		offset += aggr.payload_size;
+	}
+	VectorOperations::AddInPlace(sources, -UnsafeNumericCast<int64_t>(offset));
+	VectorOperations::AddInPlace(targets, -UnsafeNumericCast<int64_t>(offset));
+
+	idx_t changed_count = 0;
+	for (idx_t row_idx = 0; row_idx < count; row_idx++) {
+		if (changed_mask.RowIsValidUnsafe(row_idx)) {
+			changed.set_index(changed_count++, row_idx);
+		}
+	}
+	return changed_count;
+}
+
 void RowOperations::FinalizeStates(RowOperationsState &state, TupleDataLayout &layout, Vector &addresses,
                                    DataChunk &result, idx_t aggr_idx) {
 	// Copy the addresses

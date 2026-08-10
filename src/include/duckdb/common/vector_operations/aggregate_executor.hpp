@@ -308,6 +308,81 @@ private:
 
 public:
 	template <class STATE_TYPE, class OP>
+	static idx_t NullaryScatterWithChange(Vector &states, AggregateInputData &aggr_input_data, idx_t count,
+	                                      SelectionVector &changed) {
+		D_ASSERT(!aggr_input_data.clustered);
+		UnifiedVectorFormat sdata;
+		states.ToUnifiedFormat(sdata);
+		auto state_data = UnifiedVectorFormat::GetData<STATE_TYPE *>(sdata);
+		idx_t changed_count = 0;
+		for (idx_t i = 0; i < count; i++) {
+			auto &state = *state_data[sdata.sel->get_index(i)];
+			if (OP::template OperationWithChange<STATE_TYPE, OP>(state, aggr_input_data, i)) {
+				changed.set_index(changed_count++, i);
+			}
+		}
+		return changed_count;
+	}
+
+	template <class STATE_TYPE, class INPUT_TYPE, class OP>
+	static idx_t UnaryScatterWithChange(Vector &input, Vector &states, AggregateInputData &aggr_input_data, idx_t count,
+	                                    SelectionVector &changed) {
+		D_ASSERT(!aggr_input_data.clustered);
+		UnifiedVectorFormat idata;
+		UnifiedVectorFormat sdata;
+		input.ToUnifiedFormat(idata);
+		states.ToUnifiedFormat(sdata);
+		auto input_data = UnifiedVectorFormat::GetData<INPUT_TYPE>(idata);
+		auto state_data = UnifiedVectorFormat::GetData<STATE_TYPE *>(sdata);
+		AggregateUnaryInput unary_input(aggr_input_data, idata.validity);
+		idx_t changed_count = 0;
+		for (idx_t i = 0; i < count; i++) {
+			const auto input_idx = idata.sel->get_index(i);
+			if (OP::IgnoreNull() && !idata.validity.RowIsValid(input_idx)) {
+				continue;
+			}
+			unary_input.input_idx = input_idx;
+			auto &state = *state_data[sdata.sel->get_index(i)];
+			if (OP::template OperationWithChange<INPUT_TYPE, STATE_TYPE, OP>(state, input_data[input_idx],
+			                                                                 unary_input)) {
+				changed.set_index(changed_count++, i);
+			}
+		}
+		return changed_count;
+	}
+
+	template <class STATE_TYPE, class A_TYPE, class B_TYPE, class OP>
+	static idx_t BinaryScatterWithChange(AggregateInputData &aggr_input_data, Vector &a, Vector &b, Vector &states,
+	                                     idx_t count, SelectionVector &changed) {
+		D_ASSERT(!aggr_input_data.clustered);
+		UnifiedVectorFormat adata;
+		UnifiedVectorFormat bdata;
+		UnifiedVectorFormat sdata;
+		a.ToUnifiedFormat(adata);
+		b.ToUnifiedFormat(bdata);
+		states.ToUnifiedFormat(sdata);
+		auto a_values = UnifiedVectorFormat::GetData<A_TYPE>(adata);
+		auto b_values = UnifiedVectorFormat::GetData<B_TYPE>(bdata);
+		auto state_data = UnifiedVectorFormat::GetData<STATE_TYPE *>(sdata);
+		AggregateBinaryInput binary_input(aggr_input_data, adata.validity, bdata.validity);
+		idx_t changed_count = 0;
+		for (idx_t i = 0; i < count; i++) {
+			binary_input.lidx = adata.sel->get_index(i);
+			binary_input.ridx = bdata.sel->get_index(i);
+			if (OP::IgnoreNull() &&
+			    (!adata.validity.RowIsValid(binary_input.lidx) || !bdata.validity.RowIsValid(binary_input.ridx))) {
+				continue;
+			}
+			auto &state = *state_data[sdata.sel->get_index(i)];
+			if (OP::template OperationWithChange<A_TYPE, B_TYPE, STATE_TYPE, OP>(
+			        state, a_values[binary_input.lidx], b_values[binary_input.ridx], binary_input)) {
+				changed.set_index(changed_count++, i);
+			}
+		}
+		return changed_count;
+	}
+
+	template <class STATE_TYPE, class OP>
 	static void NullaryScatter(Vector &states, AggregateInputData &aggr_input_data, idx_t count) {
 		// COUNT(*) can add run lengths directly.
 		if (aggr_input_data.clustered) {
@@ -945,6 +1020,22 @@ public:
 		} else {
 			CombineWithoutMultiplicities<STATE_TYPE, OP>(source, target, aggr_input_data, count);
 		}
+	}
+
+	template <class STATE_TYPE, class OP>
+	static idx_t CombineWithChange(Vector &source, Vector &target, AggregateInputData &aggr_input_data, idx_t count,
+	                               SelectionVector &changed) {
+		D_ASSERT(!aggr_input_data.combine_multiplicities);
+		auto source_data = source.Values<const STATE_TYPE *>();
+		auto target_data = target.Values<STATE_TYPE *>();
+		idx_t changed_count = 0;
+		for (idx_t i = 0; i < count; i++) {
+			if (OP::template CombineWithChange<STATE_TYPE, OP>(*source_data[i].GetValueUnsafe(),
+			                                                   *target_data[i].GetValueUnsafe(), aggr_input_data)) {
+				changed.set_index(changed_count++, i);
+			}
+		}
+		return changed_count;
 	}
 
 	template <class STATE_TYPE, class RESULT_TYPE, class OP>

@@ -18,35 +18,53 @@ struct BitState {
 	bool is_set;
 };
 
-template <class OP>
+template <class STATE, class INPUT, class RESULT, class OP, bool CHANGE_AWARE>
+AggregateFunction GetBitfieldTypedAggregate(const LogicalType &type) {
+	if constexpr (CHANGE_AWARE) {
+		return AggregateFunction::UnaryAggregateWithChange<STATE, INPUT, RESULT, OP>(type, type);
+	}
+	return AggregateFunction::UnaryAggregate<STATE, INPUT, RESULT, OP>(type, type);
+}
+
+template <class OP, bool CHANGE_AWARE = false>
 AggregateFunction GetBitfieldUnaryAggregate(LogicalType type) {
 	switch (type.id()) {
 	case LogicalTypeId::TINYINT:
-		return AggregateFunction::UnaryAggregate<BitState<uint8_t>, int8_t, int8_t, OP>(type, type);
+		return GetBitfieldTypedAggregate<BitState<uint8_t>, int8_t, int8_t, OP, CHANGE_AWARE>(type);
 	case LogicalTypeId::SMALLINT:
-		return AggregateFunction::UnaryAggregate<BitState<uint16_t>, int16_t, int16_t, OP>(type, type);
+		return GetBitfieldTypedAggregate<BitState<uint16_t>, int16_t, int16_t, OP, CHANGE_AWARE>(type);
 	case LogicalTypeId::INTEGER:
-		return AggregateFunction::UnaryAggregate<BitState<uint32_t>, int32_t, int32_t, OP>(type, type);
+		return GetBitfieldTypedAggregate<BitState<uint32_t>, int32_t, int32_t, OP, CHANGE_AWARE>(type);
 	case LogicalTypeId::BIGINT:
-		return AggregateFunction::UnaryAggregate<BitState<uint64_t>, int64_t, int64_t, OP>(type, type);
+		return GetBitfieldTypedAggregate<BitState<uint64_t>, int64_t, int64_t, OP, CHANGE_AWARE>(type);
 	case LogicalTypeId::HUGEINT:
-		return AggregateFunction::UnaryAggregate<BitState<hugeint_t>, hugeint_t, hugeint_t, OP>(type, type);
+		return GetBitfieldTypedAggregate<BitState<hugeint_t>, hugeint_t, hugeint_t, OP, CHANGE_AWARE>(type);
 	case LogicalTypeId::UTINYINT:
-		return AggregateFunction::UnaryAggregate<BitState<uint8_t>, uint8_t, uint8_t, OP>(type, type);
+		return GetBitfieldTypedAggregate<BitState<uint8_t>, uint8_t, uint8_t, OP, CHANGE_AWARE>(type);
 	case LogicalTypeId::USMALLINT:
-		return AggregateFunction::UnaryAggregate<BitState<uint16_t>, uint16_t, uint16_t, OP>(type, type);
+		return GetBitfieldTypedAggregate<BitState<uint16_t>, uint16_t, uint16_t, OP, CHANGE_AWARE>(type);
 	case LogicalTypeId::UINTEGER:
-		return AggregateFunction::UnaryAggregate<BitState<uint32_t>, uint32_t, uint32_t, OP>(type, type);
+		return GetBitfieldTypedAggregate<BitState<uint32_t>, uint32_t, uint32_t, OP, CHANGE_AWARE>(type);
 	case LogicalTypeId::UBIGINT:
-		return AggregateFunction::UnaryAggregate<BitState<uint64_t>, uint64_t, uint64_t, OP>(type, type);
+		return GetBitfieldTypedAggregate<BitState<uint64_t>, uint64_t, uint64_t, OP, CHANGE_AWARE>(type);
 	case LogicalTypeId::UHUGEINT:
-		return AggregateFunction::UnaryAggregate<BitState<uhugeint_t>, uhugeint_t, uhugeint_t, OP>(type, type);
+		return GetBitfieldTypedAggregate<BitState<uhugeint_t>, uhugeint_t, uhugeint_t, OP, CHANGE_AWARE>(type);
 	default:
 		throw InternalException("Unimplemented bitfield type for unary aggregate");
 	}
 }
 
 struct BitwiseOperation {
+	template <class INPUT_TYPE, class STATE, class OP>
+	static bool OperationWithChange(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &) {
+		if (!state.is_set) {
+			OP::template Assign<INPUT_TYPE>(state, input);
+			state.is_set = true;
+			return true;
+		}
+		return OP::template ExecuteWithChange<INPUT_TYPE>(state, input);
+	}
+
 	template <class INPUT_TYPE, class STATE, class OP>
 	static void Operation(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &) {
 		if (!state.is_set) {
@@ -76,6 +94,19 @@ struct BitwiseOperation {
 		} else {
 			OP::template Execute<typename STATE::value_type>(target, source.value);
 		}
+	}
+
+	template <class STATE, class OP>
+	static bool CombineWithChange(const STATE &source, STATE &target, AggregateInputData &) {
+		if (!source.is_set) {
+			return false;
+		}
+		if (!target.is_set) {
+			OP::template Assign<typename STATE::value_type>(target, source.value);
+			target.is_set = true;
+			return true;
+		}
+		return OP::template ExecuteWithChange<typename STATE::value_type>(target, source.value);
 	}
 
 	template <class INPUT_TYPE, class STATE>
@@ -119,6 +150,13 @@ struct NumericBitwiseOperation : public BitwiseOperation, public ClusteredStateC
 
 template <class OP>
 struct SimpleBitwiseOperation : public NumericBitwiseOperation<SimpleBitwiseOperation<OP>> {
+	template <class INPUT_TYPE, class STATE>
+	static bool ExecuteWithChange(STATE &state, INPUT_TYPE input) {
+		const auto previous = state.value;
+		Execute(state, input);
+		return previous != state.value;
+	}
+
 	template <class INPUT_TYPE, class STATE>
 	static void Execute(STATE &state, INPUT_TYPE input) {
 		state.value =
@@ -193,12 +231,44 @@ struct BitStringBitwiseOperation : public BitwiseOperation {
 
 struct BitStringAndOperation : public BitStringBitwiseOperation {
 	template <class INPUT_TYPE, class STATE>
+	static bool ExecuteWithChange(STATE &state, INPUT_TYPE input) {
+		if (Bit::BitLength(input) != Bit::BitLength(state.value)) {
+			Bit::BitwiseAnd(input, state.value, state.value);
+			return true;
+		}
+		const auto state_data = reinterpret_cast<const uint8_t *>(state.value.GetData());
+		const auto input_data = reinterpret_cast<const uint8_t *>(input.GetData());
+		bool changed = false;
+		for (idx_t i = 1; i < state.value.GetSize(); i++) {
+			changed = changed || (state_data[i] & input_data[i]) != state_data[i];
+		}
+		Bit::BitwiseAnd(input, state.value, state.value);
+		return changed;
+	}
+
+	template <class INPUT_TYPE, class STATE>
 	static void Execute(STATE &state, INPUT_TYPE input) {
 		Bit::BitwiseAnd(input, state.value, state.value);
 	}
 };
 
 struct BitStringOrOperation : public BitStringBitwiseOperation {
+	template <class INPUT_TYPE, class STATE>
+	static bool ExecuteWithChange(STATE &state, INPUT_TYPE input) {
+		if (Bit::BitLength(input) != Bit::BitLength(state.value)) {
+			Bit::BitwiseOr(input, state.value, state.value);
+			return true;
+		}
+		const auto state_data = reinterpret_cast<const uint8_t *>(state.value.GetData());
+		const auto input_data = reinterpret_cast<const uint8_t *>(input.GetData());
+		bool changed = false;
+		for (idx_t i = 1; i < state.value.GetSize(); i++) {
+			changed = changed || (state_data[i] | input_data[i]) != state_data[i];
+		}
+		Bit::BitwiseOr(input, state.value, state.value);
+		return changed;
+	}
+
 	template <class INPUT_TYPE, class STATE>
 	static void Execute(STATE &state, INPUT_TYPE input) {
 		Bit::BitwiseOr(input, state.value, state.value);
@@ -225,20 +295,22 @@ struct BitStringXorOperation : public BitStringBitwiseOperation {
 AggregateFunctionSet BitAndFun::GetFunctions() {
 	AggregateFunctionSet bit_and;
 	for (auto &type : LogicalType::Integral()) {
-		bit_and.AddFunction(GetBitfieldUnaryAggregate<BitAndOperation>(type));
+		bit_and.AddFunction(GetBitfieldUnaryAggregate<BitAndOperation, true>(type));
 	}
-	bit_and.AddFunction(AggregateFunction::UnaryAggregate<BitStringState, string_t, string_t, BitStringAndOperation>(
-	    LogicalType::BIT, LogicalType::BIT));
+	bit_and.AddFunction(
+	    AggregateFunction::UnaryAggregateWithChange<BitStringState, string_t, string_t, BitStringAndOperation>(
+	        LogicalType::BIT, LogicalType::BIT));
 	return bit_and;
 }
 
 AggregateFunctionSet BitOrFun::GetFunctions() {
 	AggregateFunctionSet bit_or;
 	for (auto &type : LogicalType::Integral()) {
-		bit_or.AddFunction(GetBitfieldUnaryAggregate<BitOrOperation>(type));
+		bit_or.AddFunction(GetBitfieldUnaryAggregate<BitOrOperation, true>(type));
 	}
-	bit_or.AddFunction(AggregateFunction::UnaryAggregate<BitStringState, string_t, string_t, BitStringOrOperation>(
-	    LogicalType::BIT, LogicalType::BIT));
+	bit_or.AddFunction(
+	    AggregateFunction::UnaryAggregateWithChange<BitStringState, string_t, string_t, BitStringOrOperation>(
+	        LogicalType::BIT, LogicalType::BIT));
 	return bit_or;
 }
 
