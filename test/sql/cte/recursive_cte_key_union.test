@@ -717,7 +717,7 @@ SELECT count(*), min(lower(label)), min(v) FROM t;
 ----
 1	a	0
 
-# Preaggregation and partial-key probes share stable recurring group addresses.
+# Preaggregation keeps partial-key hashes aligned with reordered recurring group addresses.
 query III
 WITH RECURSIVE t(k1, k2, v) USING KEY (k1, k2, min(v)) AS (
 	SELECT i, i % 4, 2

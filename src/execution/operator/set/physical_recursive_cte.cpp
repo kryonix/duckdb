@@ -904,7 +904,7 @@ void RecursiveCTEState::CommitUsingKeyUpdatesInternal() {
 					    const auto index_start = COLLECT_METRICS ? std::chrono::steady_clock::now()
 					                                             : std::chrono::steady_clock::time_point();
 					    for (auto &index : partial_key_indexes) {
-						    index->AddGroups(keys, new_groups, group_addresses, new_group_count);
+						    index->AddGroups(keys, new_groups, group_addresses, new_groups, new_group_count);
 					    }
 					    if constexpr (COLLECT_METRICS) {
 						    const auto index_end = std::chrono::steady_clock::now();
@@ -958,7 +958,8 @@ void RecursiveCTEState::CommitUsingKeyUpdatesInternal() {
 			const auto index_start =
 			    COLLECT_METRICS ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 			for (auto &index : partial_key_indexes) {
-				index->AddGroups(distinct_rows, new_groups, new_group_addresses, new_group_count);
+				index->AddGroups(distinct_rows, new_groups, new_group_addresses,
+				                 *FlatVector::IncrementalSelectionVector(), new_group_count);
 			}
 			if constexpr (COLLECT_METRICS) {
 				const auto index_end = std::chrono::steady_clock::now();
@@ -992,7 +993,8 @@ void RecursiveCTEState::CommitUsingKeyUpdatesInternal() {
 		const auto index_start =
 		    COLLECT_METRICS ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 		for (auto &index : partial_key_indexes) {
-			index->AddGroups(distinct_rows, new_groups, new_group_addresses, new_group_count);
+			index->AddGroups(distinct_rows, new_groups, new_group_addresses, *FlatVector::IncrementalSelectionVector(),
+			                 new_group_count);
 		}
 		if constexpr (COLLECT_METRICS) {
 			const auto index_end = std::chrono::steady_clock::now();
@@ -1093,7 +1095,7 @@ void RecursiveCTEState::CommitMixedUsingKeyUpdatesInternal(unique_ptr<GroupedAgg
 				    const auto index_start =
 				        COLLECT_METRICS ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 				    for (auto &index : partial_key_indexes) {
-					    index->AddGroups(keys, new_groups, group_addresses, new_group_count);
+					    index->AddGroups(keys, new_groups, group_addresses, new_groups, new_group_count);
 				    }
 				    if constexpr (COLLECT_METRICS) {
 					    const auto index_end = std::chrono::steady_clock::now();
@@ -1156,7 +1158,7 @@ void RecursiveCTEState::CommitMixedUsingKeyUpdatesInternal(unique_ptr<GroupedAgg
 			const auto index_start =
 			    COLLECT_METRICS ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 			for (auto &index : partial_key_indexes) {
-				index->AddGroups(keys, new_groups, group_addresses, new_group_count);
+				index->AddGroups(keys, new_groups, group_addresses, new_groups, new_group_count);
 			}
 			if constexpr (COLLECT_METRICS) {
 				const auto index_end = std::chrono::steady_clock::now();
@@ -1280,7 +1282,7 @@ void RecursiveCTEState::CommitPreaggregatedUsingKeyUpdatesInternal() {
 			const auto index_start =
 			    COLLECT_METRICS ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 			for (auto &index : partial_key_indexes) {
-				index->AddGroups(keys, new_groups, group_addresses, new_group_count);
+				index->AddGroups(keys, new_groups, group_addresses, new_groups, new_group_count);
 			}
 			if constexpr (COLLECT_METRICS) {
 				const auto index_end = std::chrono::steady_clock::now();
