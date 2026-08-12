@@ -8,6 +8,7 @@
 #pragma once
 
 #include "duckdb/common/enums/expression_type.hpp"
+#include "duckdb/common/enums/join_type.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 
 namespace duckdb {
