@@ -1,0 +1,9 @@
+# name: benchmark/recursive_cte/adaptive_probe_shallow_left.benchmark
+# group: [recursive_cte]
+
+name Recursive CTE shallow LEFT planning protection
+group Recursive CTE
+
+run benchmark/recursive_cte/queries/performance/adaptive_probe_shallow_left.sql
+
+result benchmark/recursive_cte/answers/performance/adaptive_probe_shallow_left.csv

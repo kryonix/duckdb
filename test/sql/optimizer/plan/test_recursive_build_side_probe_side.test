@@ -16,3 +16,22 @@ explain with recursive t(x) as (
 select * from t
 ----
 logical_opt	<REGEX>:.*LEFT.*
+
+# A shallow keyed recursion keeps its cheap default orientation instead of forcing the recurring state to build.
+statement ok
+pragma explain_output='physical_only'
+
+query II
+explain with recursive state(key, value) using key (key) as (
+	select key, case when key < 1000 then 0 else 100 end
+	from range(1000000) keys(key)
+	union all
+	select frontier.key, recurring_state.value + 1
+	from state frontier
+	left join recurring.state recurring_state using (key)
+	where frontier.value < 1
+)
+select count(*) as keys, sum(value)::bigint as value_sum
+from state;
+----
+physical_plan	<REGEX>:.*Hash Join.*Join Type: RIGHT.*

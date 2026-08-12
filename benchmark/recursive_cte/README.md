@@ -32,7 +32,10 @@ sparse and dense complete-key `LEFT`, `SEMI`, and `ANTI` probes plus an
 independent candidate source. The `LEFT` variants keep the recurring state on
 the hash-build side explicitly because they are operator-level benchmarks;
 ordinary join costing may choose the opposite orientation for shallow
-recursions. The tiny-frontier `UNION ALL`
+recursions. The separate shallow `LEFT` workload protects that default plan
+choice because forcing the recurring state onto the build side regresses a
+recursion that terminates before the hash build can be amortized. The
+tiny-frontier `UNION ALL`
 workload guards fixed per-epoch runtime overhead across many one-row iterations.
 The keyed fan-in pair uses identical duplicated binary-tree edges to compare raw
 candidate frontiers under `UNION ALL` with finalized changed-key frontiers under
