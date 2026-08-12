@@ -1,6 +1,8 @@
 #include "duckdb/execution/operator/set/physical_recursive_cte_state.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte_delta.hpp"
 
+#include "duckdb/common/types/uhugeint.hpp"
+#include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -87,6 +89,10 @@ RecursiveCTEState::RecursiveCTEState(ClientContext &context, const PhysicalRecur
 
 	if (op.using_key) {
 		ht = CreateUsingKeyHashTable();
+		adaptive_key_probes.reserve(op.adaptive_key_probes.size());
+		for (idx_t probe_idx = 0; probe_idx < op.adaptive_key_probes.size(); probe_idx++) {
+			adaptive_key_probes.push_back(make_uniq<RecursiveCTEAdaptiveKeyProbeState>());
+		}
 		for (auto &spec : op.partial_key_index_specs) {
 			partial_key_indexes.push_back(
 			    make_uniq<RecursiveCTEPartialKeyIndex>(Allocator::Get(context), op.hash_key_types, spec.Indices()));
@@ -197,6 +203,87 @@ const RecursiveCTEPartialKeyIndex &RecursiveCTEState::GetPartialKeyIndex(const v
 
 void RecursiveCTEState::RecordSinkMetrics(idx_t wait_ns, idx_t work_ns, idx_t rows) {
 	metrics.RecordSink(wait_ns, work_ns, rows);
+}
+
+static bool AdaptiveProbeDensityFits(idx_t probe_rows, idx_t state_rows, idx_t numerator, idx_t denominator) {
+	const auto probe_work = uhugeint_t(probe_rows) * uhugeint_t(denominator);
+	const auto state_work = uhugeint_t(state_rows) * uhugeint_t(numerator);
+	return probe_work <= state_work;
+}
+
+static bool PredictedAdaptiveProbeDensityFits(idx_t probe_rows, idx_t previous_frontier_rows,
+                                              idx_t current_frontier_rows, idx_t state_rows, idx_t numerator,
+                                              idx_t denominator) {
+	if (current_frontier_rows <= previous_frontier_rows || previous_frontier_rows == 0) {
+		return AdaptiveProbeDensityFits(probe_rows, state_rows, numerator, denominator);
+	}
+	const auto probe_work = uhugeint_t(probe_rows) * uhugeint_t(current_frontier_rows) * uhugeint_t(denominator);
+	const auto state_work = uhugeint_t(state_rows) * uhugeint_t(previous_frontier_rows) * uhugeint_t(numerator);
+	return probe_work <= state_work;
+}
+
+void RecursiveCTEState::BeginAdaptiveKeyProbeEpoch() {
+	D_ASSERT(adaptive_key_probes.size() == op.adaptive_key_probes.size());
+	const auto state_rows = GetHashTable().Count();
+	const auto frontier_rows = CurrentInputCount();
+	const auto force_external = Settings::Get<DebugForceExternalSetting>(context);
+	for (idx_t probe_idx = 0; probe_idx < adaptive_key_probes.size(); probe_idx++) {
+		auto &probe_state = *adaptive_key_probes[probe_idx];
+		const auto probe_rows = probe_state.probe_rows.exchange(0);
+		if (!probe_state.initialized) {
+			probe_state.initialized = true;
+			probe_state.direct = false;
+			probe_state.previous_state_rows = state_rows;
+			probe_state.previous_frontier_rows = frontier_rows;
+			if (metrics.Enabled()) {
+				metrics.RecordAdaptiveKeyProbeEpoch(false, false);
+			}
+			continue;
+		}
+
+		auto &join = op.adaptive_key_probes[probe_idx].get();
+		const auto cutoff = join.GetRecursiveKeyProbeDensityCutoff();
+		const auto previous_epoch_fits =
+		    probe_state.previous_state_rows > 0 &&
+		    AdaptiveProbeDensityFits(probe_rows, probe_state.previous_state_rows, cutoff.first, cutoff.second);
+		if (previous_epoch_fits) {
+			probe_state.low_density_epochs++;
+		} else {
+			probe_state.low_density_epochs = 0;
+		}
+		const auto prediction_fits =
+		    state_rows > 0 && PredictedAdaptiveProbeDensityFits(probe_rows, probe_state.previous_frontier_rows,
+		                                                        frontier_rows, state_rows, cutoff.first, cutoff.second);
+		const auto previous_direct = probe_state.direct;
+		probe_state.direct = !force_external && probe_state.low_density_epochs >= 2 && prediction_fits;
+		if (metrics.Enabled()) {
+			metrics.RecordAdaptiveKeyProbeEpoch(probe_state.direct, previous_direct != probe_state.direct);
+		}
+		probe_state.previous_state_rows = state_rows;
+		probe_state.previous_frontier_rows = frontier_rows;
+	}
+}
+
+bool RecursiveCTEState::UsesDirectAdaptiveKeyProbe(idx_t index) const {
+	if (index >= adaptive_key_probes.size()) {
+		throw InternalException("Invalid adaptive recursive key probe index");
+	}
+	return adaptive_key_probes[index]->direct;
+}
+
+void RecursiveCTEState::RecordAdaptiveKeyProbeRows(idx_t index, idx_t rows) {
+	if (index >= adaptive_key_probes.size()) {
+		throw InternalException("Invalid adaptive recursive key probe index");
+	}
+	adaptive_key_probes[index]->probe_rows.fetch_add(rows);
+}
+
+idx_t RecursiveCTEState::ActiveAdaptiveKeyProbeCount() const {
+	idx_t result = 0;
+	for (auto &probe_state : adaptive_key_probes) {
+		result += probe_state->direct;
+	}
+	return result;
 }
 
 void RecursiveCTEState::AppendOutput(DataChunk &chunk) {
@@ -1400,6 +1487,10 @@ SourceResultType PhysicalRecursiveCTEStateScan::GetDataInternal(ExecutionContext
 		throw InternalException("USING KEY state scan has no recursive state");
 	}
 	auto &recursive_state = recursive_cte->sink_state->Cast<RecursiveCTEState>();
+	if (adaptive_key_probe_index.IsValid() &&
+	    recursive_state.UsesDirectAdaptiveKeyProbe(adaptive_key_probe_index.GetIndex())) {
+		return SourceResultType::FINISHED;
+	}
 	if (!recursive_state.GetMetrics().Enabled()) {
 		return GetDataFromState(chunk, input, recursive_state);
 	}

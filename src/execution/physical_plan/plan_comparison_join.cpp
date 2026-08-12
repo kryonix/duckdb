@@ -7,6 +7,7 @@
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/execution/operator/join/physical_piecewise_merge_join.hpp"
 #include "duckdb/execution/operator/join/physical_recursive_cte_key_join.hpp"
+#include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -24,20 +25,57 @@ static void RewriteJoinCondition(unique_ptr<Expression> &root_expr, idx_t offset
 	    root_expr, [&](BoundReferenceExpression &ref, unique_ptr<Expression> &expr) { ref.IndexMutable() += offset; });
 }
 
-static optional_ptr<PhysicalRecursiveCTEStateScan>
+struct DirectRecursiveStateScan {
+	optional_ptr<PhysicalRecursiveCTEStateScan> scan;
+	vector<idx_t> output_to_state;
+	bool projected = false;
+
+	explicit operator bool() const {
+		return scan != nullptr;
+	}
+};
+
+static DirectRecursiveStateScan
 FindDirectRecursiveStateScan(PhysicalOperator &op,
                              const unordered_map<TableIndex, RecursiveCTEPlanningInfo> &recursive_cte_planning) {
+	if (op.type == PhysicalOperatorType::PROJECTION && op.children.size() == 1) {
+		auto child = FindDirectRecursiveStateScan(op.children[0].get(), recursive_cte_planning);
+		if (!child) {
+			return {};
+		}
+		auto &projection = op.Cast<PhysicalProjection>();
+		vector<idx_t> output_to_state;
+		output_to_state.reserve(projection.select_list.size());
+		for (auto &expression : projection.select_list) {
+			if (expression->GetExpressionClass() != ExpressionClass::BOUND_REF) {
+				return {};
+			}
+			const auto child_idx = expression->Cast<BoundReferenceExpression>().Index();
+			if (child_idx >= child.output_to_state.size()) {
+				return {};
+			}
+			output_to_state.push_back(child.output_to_state[child_idx]);
+		}
+		child.output_to_state = std::move(output_to_state);
+		child.projected = true;
+		return child;
+	}
 	if (op.type != PhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN) {
-		return nullptr;
+		return {};
 	}
 	for (auto &entry : recursive_cte_planning) {
 		for (auto &scan_ref : entry.second.state_scans) {
 			if (&scan_ref.get() == &op) {
-				return scan_ref.get();
+				DirectRecursiveStateScan result;
+				result.scan = scan_ref.get();
+				for (idx_t column_idx = 0; column_idx < op.GetTypes().size(); column_idx++) {
+					result.output_to_state.push_back(column_idx);
+				}
+				return result;
 			}
 		}
 	}
-	return nullptr;
+	return {};
 }
 
 static unique_ptr<Expression> CreateRecursiveKeyNormalizer(ClientContext &context, const LogicalType &type,
@@ -51,16 +89,22 @@ static unique_ptr<Expression> CreateRecursiveKeyNormalizer(ClientContext &contex
 	return result;
 }
 
-static optional_idx MatchRecursiveStateKey(ClientContext &context, const PhysicalRecursiveCTEStateScan &state_scan,
+static optional_idx MatchRecursiveStateKey(ClientContext &context, const DirectRecursiveStateScan &state,
                                            const Expression &expression) {
+	auto &state_scan = *state.scan;
 	for (idx_t key_idx = 0; key_idx < state_scan.distinct_idx.size(); key_idx++) {
 		const auto state_idx = state_scan.distinct_idx[key_idx];
 		if (state_idx >= state_scan.GetTypes().size()) {
 			return optional_idx();
 		}
-		auto expected = CreateRecursiveKeyNormalizer(context, state_scan.GetTypes()[state_idx], state_idx);
-		if (Expression::Equals(expression, *expected)) {
-			return key_idx;
+		for (idx_t output_idx = 0; output_idx < state.output_to_state.size(); output_idx++) {
+			if (state.output_to_state[output_idx] != state_idx) {
+				continue;
+			}
+			auto expected = CreateRecursiveKeyNormalizer(context, state_scan.GetTypes()[state_idx], output_idx);
+			if (Expression::Equals(expression, *expected)) {
+				return key_idx;
+			}
 		}
 	}
 	return optional_idx();
@@ -87,20 +131,36 @@ struct RecursiveKeyProbe {
 };
 
 static bool TryGetRecursiveKeyProbe(ClientContext &context, LogicalComparisonJoin &op, PhysicalOperator &left,
-                                    PhysicalOperator &right, optional_ptr<PhysicalRecursiveCTEStateScan> left_state,
-                                    optional_ptr<PhysicalRecursiveCTEStateScan> right_state,
-                                    vector<idx_t> &state_key_indices, vector<idx_t> &probe_key_indices,
-                                    vector<ExpressionType> &key_comparisons, bool &state_on_left) {
-	if (op.join_type != JoinType::INNER || (left_state && right_state)) {
+                                    PhysicalOperator &right, const DirectRecursiveStateScan &left_state,
+                                    const DirectRecursiveStateScan &right_state, vector<idx_t> &state_key_indices,
+                                    vector<idx_t> &probe_key_indices, vector<ExpressionType> &key_comparisons,
+                                    bool &state_on_left) {
+	const auto direct_inner = op.join_type == JoinType::INNER;
+	const auto adaptive_non_inner = op.join_type == JoinType::LEFT || op.join_type == JoinType::SEMI ||
+	                                op.join_type == JoinType::ANTI || op.join_type == JoinType::RIGHT_SEMI ||
+	                                op.join_type == JoinType::RIGHT_ANTI;
+	if ((!direct_inner && !adaptive_non_inner) || (left_state && right_state)) {
 		return false;
 	}
-	auto state_scan = left_state ? left_state : right_state;
+	const auto flipped_non_inner = op.join_type == JoinType::RIGHT_SEMI || op.join_type == JoinType::RIGHT_ANTI;
+	if (adaptive_non_inner &&
+	    (op.filter_pushdown || (flipped_non_inner ? (!left_state || right_state) : (!right_state || left_state)))) {
+		return false;
+	}
+	auto &state = left_state ? left_state : right_state;
+	auto state_scan = state.scan;
 	if (!state_scan) {
 		return false;
 	}
-	state_on_left = left_state != nullptr;
+	state_on_left = static_cast<bool>(left_state);
+	if (state.projected && (direct_inner || op.join_type == JoinType::LEFT)) {
+		return false;
+	}
 	auto &probe = state_on_left ? right : left;
 	if (op.conditions.empty() || op.conditions.size() > state_scan->distinct_idx.size()) {
+		return false;
+	}
+	if (adaptive_non_inner && op.conditions.size() != state_scan->distinct_idx.size()) {
 		return false;
 	}
 
@@ -115,7 +175,7 @@ static bool TryGetRecursiveKeyProbe(ClientContext &context, LogicalComparisonJoi
 		}
 		auto &state_expr = state_on_left ? condition.GetLHS() : condition.GetRHS();
 		auto &probe_expr = state_on_left ? condition.GetRHS() : condition.GetLHS();
-		auto state_key_idx = MatchRecursiveStateKey(context, *state_scan, state_expr);
+		auto state_key_idx = MatchRecursiveStateKey(context, state, state_expr);
 		if (!state_key_idx.IsValid()) {
 			return false;
 		}
@@ -191,10 +251,15 @@ PhysicalOperator &PhysicalPlanGenerator::PlanComparisonJoin(LogicalComparisonJoi
 	bool state_on_left;
 	if (TryGetRecursiveKeyProbe(context, op, left, right, left_state, right_state, state_key_indices, probe_key_indices,
 	                            key_comparisons, state_on_left)) {
-		auto &state_scan = state_on_left ? *left_state : *right_state;
+		auto &state_scan = state_on_left ? *left_state.scan : *right_state.scan;
 		auto &probe = state_on_left ? right : left;
-		auto left_projection_map = PhysicalJoin::FillProjectionMap(left, op.left_projection_map);
-		auto right_projection_map = PhysicalJoin::FillProjectionMap(right, op.right_projection_map);
+		const auto flipped_non_inner = op.join_type == JoinType::RIGHT_SEMI || op.join_type == JoinType::RIGHT_ANTI;
+		auto left_projection_map = PhysicalJoin::FillProjectionMap(
+		    flipped_non_inner ? probe : left, flipped_non_inner ? op.right_projection_map : op.left_projection_map);
+		auto right_projection_map =
+		    op.join_type == JoinType::SEMI || op.join_type == JoinType::ANTI || flipped_non_inner
+		        ? vector<idx_t>()
+		        : PhysicalJoin::FillProjectionMap(right, op.right_projection_map);
 		auto probe_key_normalizers = CreateRecursiveKeyProbeNormalizers(context, state_scan, state_key_indices);
 		if (state_key_indices.size() < state_scan.distinct_idx.size()) {
 			RecursiveCTEPartialKeySpec new_spec(state_key_indices, state_scan.distinct_idx.size());
@@ -206,10 +271,32 @@ PhysicalOperator &PhysicalPlanGenerator::PlanComparisonJoin(LogicalComparisonJoi
 				state_scan.partial_key_index_specs.push_back(std::move(new_spec));
 			}
 		}
-		return Make<PhysicalRecursiveCTEKeyJoin>(op, probe, state_scan, state_on_left, std::move(state_key_indices),
-		                                         std::move(probe_key_indices), std::move(key_comparisons),
-		                                         std::move(probe_key_normalizers), std::move(left_projection_map),
-		                                         std::move(right_projection_map), op.estimated_cardinality);
+		if (op.join_type == JoinType::INNER) {
+			return Make<PhysicalRecursiveCTEKeyJoin>(op, probe, state_scan, state_on_left, std::move(state_key_indices),
+			                                         std::move(probe_key_indices), std::move(key_comparisons),
+			                                         std::move(probe_key_normalizers), std::move(left_projection_map),
+			                                         std::move(right_projection_map), op.estimated_cardinality);
+		}
+		optional_ptr<PhysicalOperator> join;
+		JoinType physical_join_type = op.join_type;
+		if (flipped_non_inner) {
+			physical_join_type = op.join_type == JoinType::RIGHT_SEMI ? JoinType::SEMI : JoinType::ANTI;
+			for (auto &condition : op.conditions) {
+				condition.Swap();
+			}
+			join = Make<PhysicalHashJoin>(op, right, left, std::move(op.conditions), physical_join_type,
+			                              op.right_projection_map, vector<ProjectionIndex>(), std::move(op.mark_types),
+			                              op.estimated_cardinality, std::move(op.filter_pushdown));
+		} else {
+			join = Make<PhysicalHashJoin>(op, left, right, std::move(op.conditions), physical_join_type,
+			                              op.left_projection_map, op.right_projection_map, std::move(op.mark_types),
+			                              op.estimated_cardinality, std::move(op.filter_pushdown));
+		}
+		join->Cast<PhysicalHashJoin>().SetRecursiveKeyProbe(make_uniq<RecursiveCTEKeyJoinLayout>(
+		    state_scan, probe, false, std::move(state_key_indices), std::move(probe_key_indices),
+		    std::move(key_comparisons), std::move(probe_key_normalizers), std::move(left_projection_map),
+		    std::move(right_projection_map)));
+		return *join;
 	}
 
 	if (op.conditions.empty()) {

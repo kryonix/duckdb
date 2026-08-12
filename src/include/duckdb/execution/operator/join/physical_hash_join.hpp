@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/execution/operator/join/physical_comparison_join.hpp"
+#include "duckdb/execution/operator/join/physical_recursive_cte_key_join.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 
 namespace duckdb {
@@ -70,6 +71,9 @@ public:
 	JoinProjectionColumns lhs_probe_columns;
 	//! Mapping from lhs_output_columns positions to lhs_probe_columns positions
 	vector<idx_t> lhs_output_in_probe;
+	//! Optional complete-key recurring-state probe used by eligible non-inner joins.
+	unique_ptr<RecursiveCTEKeyJoinLayout> recursive_key_probe;
+	optional_idx recursive_key_probe_index;
 
 public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
@@ -110,6 +114,14 @@ public:
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
+	void SetRecursiveKeyProbe(unique_ptr<RecursiveCTEKeyJoinLayout> probe);
+	void SetRecursiveKeyProbeIndex(idx_t index);
+	bool HasRecursiveKeyProbe() const {
+		return recursive_key_probe != nullptr;
+	}
+	bool UsesDirectRecursiveKeyProbe() const;
+	void RecordRecursiveKeyProbeRows(idx_t rows) const;
+	pair<idx_t, idx_t> GetRecursiveKeyProbeDensityCutoff() const;
 	void SetPreserveBuildForRecursiveReuse(bool preserve) const;
 	bool CanPreserveBuildForRecursiveReuse() const;
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
@@ -126,6 +138,9 @@ public:
 	}
 
 private:
+	template <bool ADAPTIVE_RECURSIVE_PROBE>
+	OperatorResultType ExecuteHashJoinInternal(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
+	                                           GlobalOperatorState &gstate, OperatorState &state) const;
 	static void ExtractResidualPredicateColumns(unique_ptr<Expression> &predicate, idx_t probe_column_count,
 	                                            vector<idx_t> &probe_column_ids, vector<idx_t> &build_column_ids);
 

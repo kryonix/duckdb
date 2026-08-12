@@ -68,15 +68,18 @@ struct RecursiveCTEParallelism {
 static idx_t GetRecursiveWorkUnits(const RecursiveCTEState &state, idx_t direct_probe_work_units) {
 	auto &op = state.GetOperator();
 	auto &references = op.recursive_references;
+	const auto active_adaptive_probes = state.ActiveAdaptiveKeyProbeCount();
+	D_ASSERT(active_adaptive_probes <= references.recurring_scans);
+	const auto recurring_scans = references.recurring_scans - active_adaptive_probes;
 	idx_t work_units = 0;
 	if (op.working_table && references.frontier_scans > 0) {
 		work_units += state.CurrentInputTable().ChunkCount() * references.frontier_scans;
 	}
-	if (op.recurring_table && references.recurring_scans > 0) {
+	if (op.recurring_table && recurring_scans > 0) {
 		const auto recurring_chunks =
 		    op.using_key ? (state.GetHashTable().Count() + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE
 		                 : op.recurring_table->ChunkCount();
-		work_units += recurring_chunks * references.recurring_scans;
+		work_units += recurring_chunks * recurring_scans;
 	}
 	// Direct probes consume their visible input without scanning the frozen recurring state. Recursive probe inputs
 	// are counted above, while independent probe inputs contribute their estimated chunks.
@@ -87,13 +90,16 @@ static idx_t GetRecursiveWorkUnits(const RecursiveCTEState &state, idx_t direct_
 static idx_t GetRecursiveInputRows(const RecursiveCTEState &state) {
 	auto &op = state.GetOperator();
 	auto &references = op.recursive_references;
+	const auto active_adaptive_probes = state.ActiveAdaptiveKeyProbeCount();
+	D_ASSERT(active_adaptive_probes <= references.recurring_scans);
+	const auto recurring_scans = references.recurring_scans - active_adaptive_probes;
 	idx_t recursive_rows = 0;
 	if (op.working_table && references.frontier_scans > 0) {
 		recursive_rows += state.CurrentInputTable().Count() * references.frontier_scans;
 	}
-	if (op.recurring_table && references.recurring_scans > 0) {
+	if (op.recurring_table && recurring_scans > 0) {
 		const auto recurring_rows = op.using_key ? state.GetHashTable().Count() : op.recurring_table->Count();
-		recursive_rows += recurring_rows * references.recurring_scans;
+		recursive_rows += recurring_rows * recurring_scans;
 	}
 	return recursive_rows;
 }
@@ -351,6 +357,30 @@ static bool IsDirectRecursiveKeyProbe(const PhysicalOperator &op, TableIndex cte
 	}
 	auto &key_join = op.Cast<PhysicalRecursiveCTEKeyJoin>();
 	return key_join.StateScan().cte_index == cte_index;
+}
+
+static void GatherAdaptiveRecursiveKeyProbesInternal(PhysicalOperator &op, TableIndex cte_index,
+                                                     vector<reference<PhysicalHashJoin>> &result,
+                                                     reference_set_t<const PhysicalOperator> &visited) {
+	if (!visited.insert(op).second) {
+		return;
+	}
+	if (op.type == PhysicalOperatorType::HASH_JOIN) {
+		auto &hash_join = op.Cast<PhysicalHashJoin>();
+		if (hash_join.HasRecursiveKeyProbe() && hash_join.recursive_key_probe->StateScan().cte_index == cte_index) {
+			hash_join.SetRecursiveKeyProbeIndex(result.size());
+			result.push_back(hash_join);
+		}
+	}
+	for (auto &child : op.children) {
+		GatherAdaptiveRecursiveKeyProbesInternal(child.get(), cte_index, result, visited);
+	}
+}
+
+static void GatherAdaptiveRecursiveKeyProbes(PhysicalOperator &op, TableIndex cte_index,
+                                             vector<reference<PhysicalHashJoin>> &result) {
+	reference_set_t<const PhysicalOperator> visited;
+	GatherAdaptiveRecursiveKeyProbesInternal(op, cte_index, result, visited);
 }
 
 static unique_ptr<RecursiveCTEPipelineSchedulePlan>
@@ -901,6 +931,9 @@ void PhysicalRecursiveCTE::ExecuteRecursivePipelines(ExecutionContext &context) 
 
 	// Reset sink state from the main thread so recursive iterations can reuse or recreate
 	// pipeline-local global sinks without tearing down the rest of the runtime state graph.
+	if (!adaptive_key_probes.empty()) {
+		gstate.BeginAdaptiveKeyProbeEpoch();
+	}
 	for (auto &meta_pipeline : active_meta_pipelines) {
 		vector<shared_ptr<Pipeline>> pipelines;
 		meta_pipeline->GetPipelines(pipelines, false);
@@ -1096,6 +1129,7 @@ void PhysicalRecursiveCTE::BuildPipelines(Pipeline &current, MetaPipeline &meta_
 		shared_executor_pool->executors.clear();
 	}
 	recursive_references = RecursiveCTEReferenceInfo();
+	adaptive_key_probes.clear();
 	recursive_scans.clear();
 	invariant_meta_pipelines.clear();
 
@@ -1113,6 +1147,7 @@ void PhysicalRecursiveCTE::BuildPipelines(Pipeline &current, MetaPipeline &meta_
 	recursive_meta_pipeline = make_shared_ptr<MetaPipeline>(executor, state, this);
 	recursive_meta_pipeline->SetRecursiveCTE();
 	recursive_meta_pipeline->Build(children[1]);
+	GatherAdaptiveRecursiveKeyProbes(children[1], table_index, adaptive_key_probes);
 	recursive_references = CountRecursiveReferences(children[1], table_index);
 	GatherRecursiveScans(children[1], table_index, recursive_scans);
 

@@ -19,6 +19,7 @@ namespace duckdb {
 
 class RecursiveCTEState;
 class RecursiveCTEMetrics;
+class PhysicalHashJoin;
 struct RecursiveExecutorPool;
 struct RecursiveCTEPipelineSchedulePlan;
 class PhysicalColumnDataScan;
@@ -94,6 +95,8 @@ public:
 	vector<RecursiveCTEPartialKeySpec> partial_key_index_specs;
 	//! Physical recursive inputs inside the recursive member
 	RecursiveCTEReferenceInfo recursive_references;
+	//! Eligible non-inner joins that choose between state scans and direct complete-key probes per epoch.
+	vector<reference<PhysicalHashJoin>> adaptive_key_probes;
 	//! Recursive table scans rebound to the current iteration input buffer
 	vector<reference<PhysicalColumnDataScan>> recursive_scans;
 	//! Recursive meta-pipelines that are independent of the active recursive scan graph and can be materialized once
@@ -161,6 +164,7 @@ public:
 	vector<LogicalType> aggregate_types;
 	vector<bool> key_requires_normalization;
 	vector<RecursiveCTEPartialKeySpec> partial_key_index_specs;
+	optional_idx adaptive_key_probe_index;
 
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context,

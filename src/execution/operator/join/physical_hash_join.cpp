@@ -13,6 +13,8 @@
 #include "duckdb/execution/join_hashtable.hpp"
 #include "duckdb/execution/operator/aggregate/ungrouped_aggregate_state.hpp"
 #include "duckdb/execution/operator/join/perfect_hash_join_executor.hpp"
+#include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
+#include "duckdb/execution/operator/set/physical_recursive_cte_state.hpp"
 #include "duckdb/function/aggregate/distributive_function_utils.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/function/function_binder.hpp"
@@ -96,6 +98,50 @@ PhysicalHashJoin::PhysicalHashJoin(PhysicalPlan &physical_plan, LogicalOperator 
 
 	// handle build side (RHS)
 	InitializeBuildSide(lhs_input_types, rhs_input_types, right_projection_map, build_cols);
+}
+
+void PhysicalHashJoin::SetRecursiveKeyProbe(unique_ptr<RecursiveCTEKeyJoinLayout> probe) {
+	if (recursive_key_probe || probe->StateOnLeft() || probe->IsPartial() ||
+	    (join_type != JoinType::LEFT && join_type != JoinType::SEMI && join_type != JoinType::ANTI)) {
+		throw InternalException("Invalid adaptive recursive key probe");
+	}
+	recursive_key_probe = std::move(probe);
+}
+
+void PhysicalHashJoin::SetRecursiveKeyProbeIndex(idx_t index) {
+	if (!recursive_key_probe || recursive_key_probe_index.IsValid() ||
+	    recursive_key_probe->StateScan().adaptive_key_probe_index.IsValid()) {
+		throw InternalException("Invalid adaptive recursive key probe registration");
+	}
+	recursive_key_probe_index = index;
+	recursive_key_probe->StateScan().adaptive_key_probe_index = index;
+}
+
+bool PhysicalHashJoin::UsesDirectRecursiveKeyProbe() const {
+	if (!recursive_key_probe_index.IsValid()) {
+		return false;
+	}
+	auto &state_scan = recursive_key_probe->StateScan();
+	if (!state_scan.recursive_cte || !state_scan.recursive_cte->sink_state) {
+		throw InternalException("Adaptive recursive key probe has no recursive state");
+	}
+	auto &recursive_state = state_scan.recursive_cte->sink_state->Cast<RecursiveCTEState>();
+	return recursive_state.UsesDirectAdaptiveKeyProbe(recursive_key_probe_index.GetIndex());
+}
+
+void PhysicalHashJoin::RecordRecursiveKeyProbeRows(idx_t rows) const {
+	D_ASSERT(recursive_key_probe_index.IsValid());
+	auto &state_scan = recursive_key_probe->StateScan();
+	if (!state_scan.recursive_cte || !state_scan.recursive_cte->sink_state) {
+		throw InternalException("Adaptive recursive key probe has no recursive state");
+	}
+	auto &recursive_state = state_scan.recursive_cte->sink_state->Cast<RecursiveCTEState>();
+	recursive_state.RecordAdaptiveKeyProbeRows(recursive_key_probe_index.GetIndex(), rows);
+}
+
+pair<idx_t, idx_t> PhysicalHashJoin::GetRecursiveKeyProbeDensityCutoff() const {
+	D_ASSERT(recursive_key_probe);
+	return make_pair<idx_t, idx_t>(1, 1);
 }
 
 PhysicalHashJoin::PhysicalHashJoin(PhysicalPlan &physical_plan, LogicalOperator &op, PhysicalOperator &left,
@@ -2014,7 +2060,7 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 		sink.ScheduleFinalize(pipeline, event);
 	}
 	sink.finalized = true;
-	if (ht.Count() == 0 && EmptyResultIfRHSIsEmpty()) {
+	if (ht.Count() == 0 && EmptyResultIfRHSIsEmpty() && !UsesDirectRecursiveKeyProbe()) {
 		return SinkFinalizeType::NO_OUTPUT_POSSIBLE;
 	}
 	return SinkFinalizeType::READY;
@@ -2054,6 +2100,9 @@ class HashJoinOperatorState : public CachingOperatorState {
 public:
 	HashJoinOperatorState(ClientContext &context, const PhysicalHashJoin &op_p, HashJoinGlobalSinkState &sink)
 	    : op(op_p), probe_executor(context), scan_structure(*sink.hash_table, join_key_state) {
+		if (op.recursive_key_probe) {
+			recursive_key_probe_state = make_uniq<RecursiveCTEKeyProbeState>(context, *op.recursive_key_probe);
+		}
 	}
 
 	const PhysicalHashJoin &op;
@@ -2065,6 +2114,9 @@ public:
 	ExpressionExecutor probe_executor;
 	JoinHashTable::ScanStructure scan_structure;
 	unique_ptr<OperatorState> perfect_hash_join_state;
+	unique_ptr<RecursiveCTEKeyProbeState> recursive_key_probe_state;
+	idx_t recursive_key_probe_rows = 0;
+	bool recursive_key_probe_input_active = false;
 
 	JoinHashTable::ProbeSpillLocalAppendState spill_state;
 	JoinHashTable::ProbeState probe_state;
@@ -2074,6 +2126,25 @@ public:
 public:
 	void Finalize(const PhysicalOperator &op, ExecutionContext &context) override {
 		context.thread.profiler.Flush(op);
+		if (this->op.HasRecursiveKeyProbe() && recursive_key_probe_rows > 0) {
+			this->op.RecordRecursiveKeyProbeRows(recursive_key_probe_rows);
+			recursive_key_probe_rows = 0;
+		}
+	}
+
+	void BeginRecursiveKeyProbeInput(idx_t count) {
+		if (!recursive_key_probe_state || recursive_key_probe_input_active) {
+			return;
+		}
+		recursive_key_probe_rows += count;
+		recursive_key_probe_input_active = true;
+	}
+
+	OperatorResultType FinishRecursiveKeyProbeInput(OperatorResultType result) {
+		if (result != OperatorResultType::HAVE_MORE_OUTPUT) {
+			recursive_key_probe_input_active = false;
+		}
+		return result;
 	}
 
 	bool SupportsReuse() const override {
@@ -2087,6 +2158,11 @@ public:
 		lhs_output_data.Reset();
 		scan_structure.Reset();
 		perfect_hash_join_state.reset();
+		if (recursive_key_probe_state) {
+			recursive_key_probe_state->Reset();
+		}
+		recursive_key_probe_rows = 0;
+		recursive_key_probe_input_active = false;
 		spill_state = JoinHashTable::ProbeSpillLocalAppendState();
 		TupleDataCollection::InitializeChunkState(join_key_state, op.condition_types);
 		if (spill_chunk.ColumnCount() != 0) {
@@ -2138,10 +2214,36 @@ unique_ptr<OperatorState> PhysicalHashJoin::GetOperatorState(ExecutionContext &c
 
 OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
                                                      GlobalOperatorState &gstate, OperatorState &state_p) const {
+	if (recursive_key_probe) {
+		return ExecuteHashJoinInternal<true>(context, input, chunk, gstate, state_p);
+	}
+	return ExecuteHashJoinInternal<false>(context, input, chunk, gstate, state_p);
+}
+
+template <bool ADAPTIVE_RECURSIVE_PROBE>
+OperatorResultType PhysicalHashJoin::ExecuteHashJoinInternal(ExecutionContext &context, DataChunk &input,
+                                                             DataChunk &chunk, GlobalOperatorState &gstate,
+                                                             OperatorState &state_p) const {
 	auto &state = state_p.Cast<HashJoinOperatorState>();
 	auto &sink = sink_state->Cast<HashJoinGlobalSinkState>();
 	D_ASSERT(sink.finalized);
 	D_ASSERT(!sink.scanned_data);
+	auto finish = [&](OperatorResultType result) {
+		if constexpr (ADAPTIVE_RECURSIVE_PROBE) {
+			return state.FinishRecursiveKeyProbeInput(result);
+		}
+		return result;
+	};
+	if constexpr (ADAPTIVE_RECURSIVE_PROBE) {
+		state.BeginRecursiveKeyProbeInput(input.size());
+		if (UsesDirectRecursiveKeyProbe()) {
+			D_ASSERT(state.recursive_key_probe_state);
+			auto &state_scan = recursive_key_probe->StateScan();
+			auto &recursive_state = state_scan.recursive_cte->sink_state->Cast<RecursiveCTEState>();
+			return finish(state.recursive_key_probe_state->Execute(input, chunk, *recursive_key_probe, recursive_state,
+			                                                       join_type));
+		}
+	}
 
 	if (sink.hash_table->Count() == 0) {
 		if (sink.hash_table->HasUncorrelatedMarkJoin()) {
@@ -2149,15 +2251,15 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 			state.probe_executor.Execute(input, state.lhs_join_keys);
 			state.lhs_probe_data.ReferenceColumns(input, lhs_probe_columns.col_idxs);
 			sink.hash_table->ConstructMarkJoinResult(state.lhs_join_keys, state.lhs_probe_data, chunk);
-			return OperatorResultType::NEED_MORE_INPUT;
+			return finish(OperatorResultType::NEED_MORE_INPUT);
 		}
 		if (EmptyResultIfRHSIsEmpty()) {
-			return OperatorResultType::FINISHED;
+			return finish(OperatorResultType::FINISHED);
 		}
 		// for empty result, only need output columns (no predicate evaluation)
 		state.lhs_output_data.ReferenceColumns(input, lhs_output_columns.col_idxs);
 		ConstructEmptyJoinResult(sink.hash_table->join_type, sink.hash_table->has_null, state.lhs_output_data, chunk);
-		return OperatorResultType::NEED_MORE_INPUT;
+		return finish(OperatorResultType::NEED_MORE_INPUT);
 	}
 
 	if (sink.perfect_join_executor) {
@@ -2168,8 +2270,8 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 		}
 		// for perfect hash join, when predicate is NULL, only output columns are needed
 		state.lhs_output_data.ReferenceColumns(input, lhs_output_columns.col_idxs);
-		return sink.perfect_join_executor->ProbePerfectHashTable(context, input, state.lhs_output_data, chunk,
-		                                                         *state.perfect_hash_join_state);
+		return finish(sink.perfect_join_executor->ProbePerfectHashTable(context, input, state.lhs_output_data, chunk,
+		                                                                *state.perfect_hash_join_state));
 	}
 
 	if (sink.external && !state.initialized) {
@@ -2202,9 +2304,9 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 
 	if (state.scan_structure.PointersExhausted() && chunk.size() == 0) {
 		state.scan_structure.is_null = true;
-		return OperatorResultType::NEED_MORE_INPUT;
+		return finish(OperatorResultType::NEED_MORE_INPUT);
 	}
-	return OperatorResultType::HAVE_MORE_OUTPUT;
+	return finish(OperatorResultType::HAVE_MORE_OUTPUT);
 }
 
 //===--------------------------------------------------------------------===//
@@ -2783,6 +2885,10 @@ InsertionOrderPreservingMap<string> PhysicalHashJoin::ParamsToString() const {
 	}
 
 	result["Conditions"] = condition_info;
+	if (recursive_key_probe) {
+		result["Recursive Key Probe"] = "ADAPTIVE";
+		result["Key Mode"] = "COMPLETE";
+	}
 
 	SetEstimatedCardinality(result, estimated_cardinality);
 	return result;

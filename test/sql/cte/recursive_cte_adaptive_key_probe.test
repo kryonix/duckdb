@@ -1,0 +1,352 @@
+# name: test/sql/cte/recursive_cte_adaptive_key_probe.test
+# description: Adaptive complete-key non-inner probes over frozen USING KEY state
+# group: [cte]
+
+statement ok
+SET threads=1;
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+# A visited-set anti join remains a hash join with an adaptive complete-key probe capability.
+query II
+EXPLAIN WITH RECURSIVE reach(node, depth) USING KEY (node) AS (
+	VALUES (0, 0)
+	UNION ALL
+	SELECT candidate, next_depth
+	FROM (SELECT node + 1 AS candidate, depth + 1 AS next_depth FROM reach WHERE depth < 6) next
+	ANTI JOIN recurring.reach seen ON seen.node = candidate
+)
+SELECT * FROM reach;
+----
+physical_plan	<REGEX>:.*HASH_JOIN.*Recursive Key Probe.*ADAPTIVE.*
+
+# LEFT probes preserve matched recurring payloads after switching away from the hash-table build.
+query IIII
+WITH RECURSIVE t(k, v) USING KEY (k) AS (
+	VALUES (0, 0)
+	UNION ALL
+	SELECT n.k + 1, s.v + 1
+	FROM t n
+	LEFT JOIN recurring.t s ON s.k = n.k
+	WHERE n.k < 6
+)
+SELECT count(*), min(v), max(v), sum(v) FROM t;
+----
+7	0	6	21
+
+# Missing LEFT probes retain the probe row and produce a NULL state payload.
+query III
+WITH RECURSIVE t(k, v) USING KEY (k) AS (
+	VALUES (0, 0)
+	UNION ALL
+	SELECT n.k + 1, coalesce(s.v, n.v) + 1
+	FROM t n
+	LEFT JOIN recurring.t s ON s.k = n.k + 100
+	WHERE n.k < 6
+)
+SELECT count(*), max(k), max(v) FROM t;
+----
+7	6	6
+
+# SEMI probes retain duplicate probe rows; keyed UNION aggregation observes both rows.
+query II
+WITH RECURSIVE t(k, v) USING KEY (k, sum(v) AS v) AS (
+	VALUES (1, 0)
+	UNION
+	SELECT n.k, 1
+	FROM t n
+	CROSS JOIN range(2) duplicate
+	SEMI JOIN recurring.t s ON s.k = n.k
+	WHERE n.v < 8
+)
+SELECT k, v FROM t;
+----
+1	8
+
+# Ordinary NULL equality misses while null-safe equality finds the keyed state row.
+query TI rowsort
+WITH RECURSIVE ordinary(k, v) USING KEY (k) AS (
+	VALUES (NULL::INTEGER, 0)
+	UNION ALL
+	SELECT n.k, CASE WHEN s.v IS NULL THEN n.v + 1 ELSE s.v + 10 END
+	FROM ordinary n
+	LEFT JOIN recurring.ordinary s ON s.k = n.k
+	WHERE n.v < 3
+), null_safe(k, v) USING KEY (k) AS (
+	VALUES (NULL::INTEGER, 0)
+	UNION ALL
+	SELECT n.k, CASE WHEN s.v IS NULL THEN n.v + 1 ELSE s.v + 10 END
+	FROM null_safe n
+	LEFT JOIN recurring.null_safe s ON s.k IS NOT DISTINCT FROM n.k
+	WHERE n.v < 30
+)
+SELECT 'ordinary', v FROM ordinary
+UNION ALL
+SELECT 'null_safe', v FROM null_safe;
+----
+null_safe	30
+ordinary	3
+
+# Collated probe keys use the same normalized identity as the recurring table.
+query TI
+WITH RECURSIVE t(k, v) USING KEY (k) AS (
+	SELECT 'a' COLLATE nocase, 0
+	UNION ALL
+	SELECT n.k, s.v + 1
+	FROM (SELECT upper(k) AS k, v FROM t) n
+	LEFT JOIN recurring.t s ON s.k IS NOT DISTINCT FROM n.k
+	WHERE n.v < 4
+)
+SELECT k, v FROM t;
+----
+a	4
+
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# A sparse chain learns from two hash epochs, then skips later recurring-state scans.
+query III
+WITH RECURSIVE reach(node, depth) USING KEY (node) AS (
+	VALUES (0, 0)
+	UNION ALL
+	SELECT candidate, next_depth
+	FROM (SELECT node + 1 AS candidate, depth + 1 AS next_depth FROM reach WHERE depth < 8) next
+	ANTI JOIN recurring.reach seen ON seen.node = candidate
+)
+SELECT count(*), max(node), max(depth) FROM reach;
+----
+9	8	8
+
+statement ok
+CALL disable_logging();
+
+query IIIII
+SELECT info.direct_probe_rows::UBIGINT > 0,
+       info.recurring_scan_rows::UBIGINT > 0,
+       info.adaptive_direct_probe_epochs::UBIGINT > 0,
+       info.adaptive_hash_probe_epochs::UBIGINT >= 2,
+       info.adaptive_probe_switches::UBIGINT >= 1
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
+----
+1	1	1	1	1
+
+# The adaptive history belongs to the recursive invocation, not cached operator state.
+statement ok
+SET enable_caching_operators=false;
+
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query III
+WITH RECURSIVE reach(node, depth) USING KEY (node) AS (
+	VALUES (0, 0)
+	UNION ALL
+	SELECT candidate, next_depth
+	FROM (SELECT node + 1 AS candidate, depth + 1 AS next_depth FROM reach WHERE depth < 8) next
+	ANTI JOIN recurring.reach seen ON seen.node = candidate
+)
+SELECT count(*), max(node), max(depth) FROM reach;
+----
+9	8	8
+
+statement ok
+CALL disable_logging();
+
+query I
+SELECT info.adaptive_direct_probe_epochs::UBIGINT > 0
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
+----
+1
+
+statement ok
+RESET enable_caching_operators;
+
+# Repeated nested invocations must not inherit the prior invocation's decision or hash-table binding.
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II rowsort
+WITH RECURSIVE outer_cte(a, b) AS (
+	SELECT 1, 1
+	UNION
+	(
+		WITH RECURSIVE inner_cte(k, v) USING KEY (k) AS (
+			SELECT a, 0 FROM outer_cte WHERE b < 4
+			UNION ALL
+			SELECT candidate, next_v
+			FROM (SELECT k + 1 AS candidate, v + 1 AS next_v FROM inner_cte WHERE v < 6) next
+			ANTI JOIN recurring.inner_cte seen ON seen.k = candidate
+		)
+		SELECT k - 6, b + 1
+		FROM inner_cte, outer_cte
+		WHERE v = 6 AND b < 4
+	)
+)
+SELECT * FROM outer_cte;
+----
+1	1
+1	2
+1	3
+1	4
+
+statement ok
+CALL disable_logging();
+
+query II
+SELECT count(*) >= 3,
+       count(*) FILTER (WHERE info.adaptive_direct_probe_epochs::UBIGINT > 0) >= 3
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics'
+  AND info.adaptive_hash_probe_epochs::UBIGINT > 0;
+----
+1	1
+
+# Reordered composite keys mix ordinary and null-safe equality in the direct LEFT path.
+query III
+WITH RECURSIVE t(k1, k2, v) USING KEY (k1, k2) AS (
+	SELECT CASE WHEN i = 0 THEN NULL ELSE i::INTEGER END, i::INTEGER, 0
+	FROM range(64) input(i)
+	UNION ALL
+	SELECT n.k1, n.k2, s.v + 1
+	FROM t n
+	LEFT JOIN recurring.t s
+	  ON s.k2 = n.k2 AND s.k1 IS NOT DISTINCT FROM n.k1
+	WHERE n.k1 IS NULL AND n.v < 4
+)
+SELECT count(*), max(v), sum(v) FROM t;
+----
+64	4	4
+
+# Several input vectors may probe the frozen state concurrently.
+statement ok
+SET threads=4;
+
+query III
+WITH RECURSIVE t(k, v) USING KEY (k) AS (
+	SELECT i::INTEGER, 0 FROM range(2048) input(i)
+	UNION ALL
+	SELECT n.k, s.v + 1
+	FROM t n
+	LEFT JOIN recurring.t s ON s.k = n.k
+	WHERE n.k < 32 AND n.v < 4
+)
+SELECT count(*), max(v), sum(v) FROM t;
+----
+2048	4	128
+
+statement ok
+SET threads=1;
+
+# Serializer verification remains independent of the physical-only adaptive metadata.
+statement ok
+SET debug_verify_serializer=true;
+
+query III
+WITH RECURSIVE t(k, v) USING KEY (k) AS (
+	VALUES (0, 0)
+	UNION ALL
+	SELECT n.k + 1, coalesce(s.v, n.v) + 1
+	FROM t n
+	LEFT JOIN recurring.t s ON s.k = n.k + 100
+	WHERE n.k < 4
+)
+SELECT count(*), max(k), max(v) FROM t;
+----
+5	4	4
+
+statement ok
+SET debug_verify_serializer=false;
+
+# Partial keys and filtered state inputs retain the generic hash-join path.
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+WITH RECURSIVE partial(k1, k2, v) USING KEY (k1, k2) AS (
+	VALUES (1, 1, 0)
+	UNION ALL
+	SELECT n.k1, n.k2 + 1, n.v + 1
+	FROM partial n
+	ANTI JOIN recurring.partial s ON s.k1 = n.k1
+)
+SELECT count(*) FROM partial;
+----
+1
+
+query I
+WITH RECURSIVE filtered(k, v) USING KEY (k) AS (
+	VALUES (0, 0)
+	UNION ALL
+	SELECT n.k + 1, n.v + 1
+	FROM filtered n
+	ANTI JOIN (SELECT k FROM recurring.filtered WHERE v >= 0) s ON s.k = n.k + 1
+	WHERE n.k < 2
+)
+SELECT count(*) FROM filtered;
+----
+3
+
+statement ok
+CALL disable_logging();
+
+query III
+SELECT count(*),
+       sum(info.adaptive_direct_probe_epochs::UBIGINT + info.adaptive_hash_probe_epochs::UBIGINT),
+       sum(info.recurring_scan_rows::UBIGINT) > 0
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
+----
+2	0	1
+
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Duplicate-heavy complete-key access never crosses the direct-probe density gate.
+query II
+WITH RECURSIVE t(k, v) USING KEY (k, sum(v) AS v) AS (
+	VALUES (1, 0)
+	UNION
+	SELECT n.k, 1
+	FROM t n
+	CROSS JOIN range(16) duplicate
+	SEMI JOIN recurring.t s ON s.k = n.k
+	WHERE n.v < 64
+)
+SELECT k, v FROM t;
+----
+1	64
+
+statement ok
+CALL disable_logging();
+
+query IIIII
+SELECT info.direct_probe_rows::UBIGINT = 0,
+       info.recurring_scan_rows::UBIGINT > 0,
+       info.adaptive_direct_probe_epochs::UBIGINT = 0,
+       info.adaptive_hash_probe_epochs::UBIGINT > 0,
+       info.adaptive_probe_switches::UBIGINT = 0
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
+----
+1	1	1	1	1

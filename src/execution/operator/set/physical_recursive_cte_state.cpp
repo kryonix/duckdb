@@ -278,6 +278,15 @@ void RecursiveCTEMetrics::RecordDirectProbeMatches(idx_t rows) {
 	direct_probe_matches.fetch_add(rows);
 }
 
+void RecursiveCTEMetrics::RecordAdaptiveKeyProbeEpoch(bool direct, bool switched) {
+	if (direct) {
+		adaptive_direct_probe_epochs++;
+	} else {
+		adaptive_hash_probe_epochs++;
+	}
+	adaptive_probe_switches += switched;
+}
+
 void RecursiveCTEMetrics::RecordPartialProbeChainVisits(idx_t count) {
 	partial_probe_chain_visits.fetch_add(count);
 }
@@ -344,6 +353,9 @@ void RecursiveCTEMetrics::Log(const vector<unique_ptr<RecursiveCTEPartialKeyInde
 	            {"recurring_scan_rows", to_string(recurring_scan_rows.load())},
 	            {"direct_probe_rows", to_string(direct_probe_rows.load())},
 	            {"direct_probe_matches", to_string(direct_probe_matches.load())},
+	            {"adaptive_direct_probe_epochs", to_string(adaptive_direct_probe_epochs)},
+	            {"adaptive_hash_probe_epochs", to_string(adaptive_hash_probe_epochs)},
+	            {"adaptive_probe_switches", to_string(adaptive_probe_switches)},
 	            {"partial_probe_chain_visits", to_string(partial_probe_chain_visits.load())},
 	            {"partial_index_build_us", to_string(partial_index_build_us)},
 	            {"partial_index_rows", to_string(partial_index_rows)},

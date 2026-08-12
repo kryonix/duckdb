@@ -31,6 +31,15 @@ enum class RecursiveCTESourcePhase : uint8_t {
 
 enum class RecursiveCTEPipelineMetricType : uint8_t { RECURSIVE, INVARIANT_BUILD, INVARIANT_CTE_MATERIALIZATION };
 
+struct RecursiveCTEAdaptiveKeyProbeState {
+	atomic<idx_t> probe_rows {0};
+	idx_t previous_state_rows = 0;
+	idx_t previous_frontier_rows = 0;
+	idx_t low_density_epochs = 0;
+	bool initialized = false;
+	bool direct = false;
+};
+
 //! Epoch-stable secondary index over a proper subset of USING KEY columns.
 class RecursiveCTEPartialKeyIndex {
 public:
@@ -193,6 +202,7 @@ public:
 	void RecordRecurringScanRows(idx_t rows);
 	void RecordDirectProbeRows(idx_t rows);
 	void RecordDirectProbeMatches(idx_t rows);
+	void RecordAdaptiveKeyProbeEpoch(bool direct, bool switched);
 	void RecordPartialProbeChainVisits(idx_t count);
 	void RecordPartialIndexBuild(idx_t elapsed_us);
 	void RecordFinalStateRows(idx_t rows);
@@ -222,6 +232,9 @@ private:
 	atomic<idx_t> recurring_scan_rows {0};
 	atomic<idx_t> direct_probe_rows {0};
 	atomic<idx_t> direct_probe_matches {0};
+	idx_t adaptive_direct_probe_epochs = 0;
+	idx_t adaptive_hash_probe_epochs = 0;
+	idx_t adaptive_probe_switches = 0;
 	atomic<idx_t> partial_probe_chain_visits {0};
 	idx_t partial_index_build_us = 0;
 	idx_t final_state_rows = 0;
@@ -328,6 +341,10 @@ public:
 	void MarkInvariantPipelinesMaterialized() {
 		invariant_meta_pipelines_materialized = true;
 	}
+	void BeginAdaptiveKeyProbeEpoch();
+	bool UsesDirectAdaptiveKeyProbe(idx_t index) const;
+	void RecordAdaptiveKeyProbeRows(idx_t index, idx_t rows);
+	idx_t ActiveAdaptiveKeyProbeCount() const;
 
 private:
 	template <bool COLLECT_METRICS>
@@ -358,6 +375,7 @@ private:
 	unique_ptr<GroupedAggregateHashTable> ht;
 	vector<unique_ptr<RecursiveCTEPartialKeyIndex>> partial_key_indexes;
 	vector<unique_ptr<RecursiveCTEDistinctPartition>> distinct_partitions;
+	vector<unique_ptr<RecursiveCTEAdaptiveKeyProbeState>> adaptive_key_probes;
 	const PhysicalRecursiveCTE &op;
 	ExpressionExecutor executor;
 	DataChunk payload_rows;

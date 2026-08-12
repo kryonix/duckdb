@@ -99,6 +99,8 @@ public:
 	void Reset();
 	OperatorResultType Execute(DataChunk &input, DataChunk &output, const RecursiveCTEKeyJoinLayout &layout,
 	                           RecursiveCTEState &recursive_state);
+	OperatorResultType Execute(DataChunk &input, DataChunk &output, const RecursiveCTEKeyJoinLayout &layout,
+	                           RecursiveCTEState &recursive_state, JoinType join_type);
 
 private:
 	class State;
