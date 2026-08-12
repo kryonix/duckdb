@@ -379,6 +379,25 @@ SELECT count(*) FROM filtered;
 3
 
 statement ok
+SET disabled_optimizers='build_side_probe_side';
+
+query III
+WITH RECURSIVE projected(k, value, carried) USING KEY (k) AS (
+	SELECT i, 0, i FROM range(4) input(i)
+	UNION ALL
+	SELECT n.k, s.value + 1, n.carried
+	FROM projected n
+	LEFT JOIN (SELECT abs(k) AS k, value FROM recurring.projected) s USING (k)
+	WHERE n.value < 2
+)
+SELECT count(*), sum(value), sum(carried) FROM projected;
+----
+4	8	6
+
+statement ok
+RESET disabled_optimizers;
+
+statement ok
 CALL disable_logging();
 
 query III
@@ -388,7 +407,7 @@ SELECT count(*),
 FROM duckdb_logs_parsed('PhysicalOperator')
 WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
 ----
-2	0	1
+3	0	1
 
 statement ok
 CALL enable_logging('PhysicalOperator');
