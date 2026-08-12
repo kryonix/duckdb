@@ -52,6 +52,20 @@ SELECT count(*), max(k), max(v) FROM t;
 ----
 7	6	6
 
+# Nested state payloads retain their values and produce typed NULLs for missing LEFT matches.
+query III
+WITH RECURSIVE t(k, payload, depth) USING KEY (k) AS (
+	VALUES (0, [1, 2], 0)
+	UNION ALL
+	SELECT n.k + 1, list_append(coalesce(s.payload, n.payload), n.depth + 3), n.depth + 1
+	FROM t n
+	LEFT JOIN recurring.t s ON s.k = n.k + 100
+	WHERE n.depth < 6
+)
+SELECT count(*), max(len(payload)), sum(len(payload)) FROM t;
+----
+7	8	35
+
 # SEMI probes retain duplicate probe rows; keyed UNION aggregation observes both rows.
 query II
 WITH RECURSIVE t(k, v) USING KEY (k, sum(v) AS v) AS (
@@ -137,6 +151,39 @@ FROM duckdb_logs_parsed('PhysicalOperator')
 WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
 ----
 1	1	1	1	1
+
+# Multiple eligible joins over the same recurring state make independent decisions and skip both scans.
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query III
+WITH RECURSIVE t(k, depth) USING KEY (k) AS (
+	SELECT i, CASE WHEN i = 0 THEN 0 ELSE 100 END
+	FROM range(64) input(i)
+	UNION ALL
+	SELECT candidate, current.depth + 1
+	FROM (SELECT k + 64 AS candidate, k AS source FROM t WHERE depth < 8) next
+	LEFT JOIN recurring.t current ON current.k = next.source
+	ANTI JOIN recurring.t seen ON seen.k = next.candidate
+)
+SELECT count(*), max(depth) FILTER (WHERE k >= 64), sum(depth) FROM t;
+----
+72	8	6336
+
+statement ok
+CALL disable_logging();
+
+query III
+SELECT info.adaptive_direct_probe_epochs::UBIGINT > 0,
+       info.adaptive_hash_probe_epochs::UBIGINT >= 4,
+       info.adaptive_probe_switches::UBIGINT >= 2
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
+----
+1	1	1
 
 # The adaptive history belongs to the recursive invocation, not cached operator state.
 statement ok
@@ -350,3 +397,39 @@ FROM duckdb_logs_parsed('PhysicalOperator')
 WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
 ----
 1	1	1	1	1
+
+# External hash joins retain their generic lifecycle instead of switching to the in-memory direct probe.
+statement ok
+SET debug_force_external=true;
+
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query III
+WITH RECURSIVE reach(node, depth) USING KEY (node) AS (
+	VALUES (0, 0)
+	UNION ALL
+	SELECT candidate, next_depth
+	FROM (SELECT node + 1 AS candidate, depth + 1 AS next_depth FROM reach WHERE depth < 8) next
+	ANTI JOIN recurring.reach seen ON seen.node = candidate
+)
+SELECT count(*), max(node), max(depth) FROM reach;
+----
+9	8	8
+
+statement ok
+CALL disable_logging();
+
+statement ok
+SET debug_force_external=false;
+
+query II
+SELECT info.adaptive_direct_probe_epochs::UBIGINT = 0,
+       info.adaptive_hash_probe_epochs::UBIGINT > 0
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
+----
+1	1
