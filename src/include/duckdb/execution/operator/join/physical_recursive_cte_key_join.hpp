@@ -13,6 +13,7 @@
 namespace duckdb {
 
 class LogicalComparisonJoin;
+class RecursiveCTEState;
 class PhysicalRecursiveCTEStateScan;
 
 //! Validated key and projection ordinals for a recursive state probe.
@@ -87,6 +88,21 @@ private:
 	vector<LogicalType> probe_key_types;
 	vector<LogicalType> raw_probe_key_types;
 	vector<LogicalType> payload_types;
+};
+
+//! Reusable execution state for a frozen USING KEY state probe.
+class RecursiveCTEKeyProbeState {
+public:
+	RecursiveCTEKeyProbeState(ClientContext &context, const RecursiveCTEKeyJoinLayout &layout);
+	~RecursiveCTEKeyProbeState();
+
+	void Reset();
+	OperatorResultType Execute(DataChunk &input, DataChunk &output, const RecursiveCTEKeyJoinLayout &layout,
+	                           RecursiveCTEState &recursive_state);
+
+private:
+	class State;
+	unique_ptr<State> state;
 };
 
 //! Probes a frozen USING KEY recursive state using a complete or indexed partial key.
