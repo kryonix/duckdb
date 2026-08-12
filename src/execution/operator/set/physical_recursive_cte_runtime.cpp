@@ -498,6 +498,16 @@ static bool ContainsVisibleRecursiveScan(const PhysicalOperator &op, TableIndex 
 	return ContainsVisibleRecursiveScanInternal(op, cte_index, visited);
 }
 
+static void CountIndependentRecursiveProbeWork(const PhysicalOperator &probe, TableIndex cte_index,
+                                               RecursiveCTEReferenceInfo &references) {
+	if (ContainsVisibleRecursiveScan(probe, cte_index)) {
+		return;
+	}
+	const auto probe_work_units =
+	    probe.estimated_cardinality / STANDARD_VECTOR_SIZE + (probe.estimated_cardinality % STANDARD_VECTOR_SIZE != 0);
+	references.direct_probe_work_units = MaxValue(references.direct_probe_work_units, probe_work_units);
+}
+
 static void CountDirectRecursiveReferences(const PhysicalOperator &op, TableIndex cte_index,
                                            RecursiveCTEReferenceInfo &references) {
 	if (IsDirectRecursiveKeyProbe(op, cte_index)) {
@@ -507,13 +517,14 @@ static void CountDirectRecursiveReferences(const PhysicalOperator &op, TableInde
 		} else {
 			references.exact_key_probes++;
 		}
-		auto &probe = key_join.children[0].get();
-		if (!ContainsVisibleRecursiveScan(probe, cte_index)) {
-			const auto probe_work_units = probe.estimated_cardinality / STANDARD_VECTOR_SIZE +
-			                              (probe.estimated_cardinality % STANDARD_VECTOR_SIZE != 0);
-			references.direct_probe_work_units = MaxValue(references.direct_probe_work_units, probe_work_units);
-		}
+		CountIndependentRecursiveProbeWork(key_join.children[0].get(), cte_index, references);
 		return;
+	}
+	if (op.type == PhysicalOperatorType::HASH_JOIN) {
+		auto &hash_join = op.Cast<PhysicalHashJoin>();
+		if (hash_join.HasRecursiveKeyProbe() && hash_join.recursive_key_probe->StateScan().cte_index == cte_index) {
+			CountIndependentRecursiveProbeWork(hash_join.children[0].get(), cte_index, references);
+		}
 	}
 	if (op.type != PhysicalOperatorType::RECURSIVE_CTE_SCAN &&
 	    op.type != PhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN) {

@@ -1,0 +1,13 @@
+# name: benchmark/recursive_cte/adaptive_probe_independent_left.benchmark
+# group: [recursive_cte]
+
+name Recursive CTE independent-source adaptive LEFT probe
+group Recursive CTE
+
+# Keep the recurring state on the build side so this operator-level benchmark exercises the adaptive probe.
+init
+SET disabled_optimizers = 'build_side_probe_side';
+
+run benchmark/recursive_cte/queries/performance/adaptive_probe_independent_left.sql
+
+result benchmark/recursive_cte/answers/performance/adaptive_probe_independent_left.csv

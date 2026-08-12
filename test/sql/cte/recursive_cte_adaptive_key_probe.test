@@ -323,6 +323,49 @@ SELECT count(*), max(v), sum(v) FROM t;
 ----
 2048	4	128
 
+# Independent candidate sources still contribute worker capacity after direct mode skips the recurring-state scan.
+statement ok
+SET disabled_optimizers='build_side_probe_side';
+
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query III
+WITH RECURSIVE t(k, v) USING KEY (k) AS (
+	SELECT i, 0
+	FROM range(current_setting('standard_vector_size')::INTEGER * 128) input(i)
+	UNION ALL
+	SELECT candidate.k, coalesce(state.v, 0) + 1
+	FROM range(current_setting('standard_vector_size')::INTEGER * 128) candidate(k)
+	LEFT JOIN recurring.t state USING (k)
+	WHERE coalesce(state.v, 0) < 8
+)
+SELECT count(*) = current_setting('standard_vector_size')::BIGINT * 128,
+       max(v) = 8,
+       sum(v)::BIGINT = current_setting('standard_vector_size')::BIGINT * 128 * 8
+FROM t;
+----
+1	1	1
+
+statement ok
+CALL disable_logging();
+
+query IIII
+SELECT info.adaptive_hash_probe_epochs::UBIGINT >= 2,
+       info.adaptive_direct_probe_epochs::UBIGINT > 0,
+       info.direct_probe_rows::UBIGINT > 0,
+       info.scheduled_workers::UBIGINT = info.epochs::UBIGINT * 4
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
+----
+1	1	1	1
+
+statement ok
+RESET disabled_optimizers;
+
 statement ok
 SET threads=1;
 
