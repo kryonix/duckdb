@@ -1,0 +1,8 @@
+# name: benchmark/recursive_cte/adaptive_probe_dense_anti.benchmark
+# group: [recursive_cte]
+
+template benchmark/recursive_cte/recursive_cte.benchmark.in
+TIER=performance
+QUERY=adaptive_probe_dense_anti
+BENCHMARK_NAME=Recursive CTE dense adaptive ANTI probe
+DESCRIPTION=Probe a duplicate-heavy visited-set frontier against recurring state

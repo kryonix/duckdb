@@ -1,0 +1,8 @@
+# name: benchmark/recursive_cte/adaptive_probe_sparse_semi.benchmark
+# group: [recursive_cte]
+
+template benchmark/recursive_cte/recursive_cte.benchmark.in
+TIER=performance
+QUERY=adaptive_probe_sparse_semi
+BENCHMARK_NAME=Recursive CTE sparse adaptive SEMI probe
+DESCRIPTION=Probe a large recurring state from a small SEMI-join frontier

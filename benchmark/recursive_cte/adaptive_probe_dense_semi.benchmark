@@ -1,0 +1,8 @@
+# name: benchmark/recursive_cte/adaptive_probe_dense_semi.benchmark
+# group: [recursive_cte]
+
+template benchmark/recursive_cte/recursive_cte.benchmark.in
+TIER=performance
+QUERY=adaptive_probe_dense_semi
+BENCHMARK_NAME=Recursive CTE dense adaptive SEMI probe
+DESCRIPTION=Probe every recurring-state row through a SEMI join

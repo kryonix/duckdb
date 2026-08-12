@@ -1,0 +1,8 @@
+# name: benchmark/recursive_cte/adaptive_probe_sparse_anti.benchmark
+# group: [recursive_cte]
+
+template benchmark/recursive_cte/recursive_cte.benchmark.in
+TIER=performance
+QUERY=adaptive_probe_sparse_anti
+BENCHMARK_NAME=Recursive CTE sparse adaptive ANTI probe
+DESCRIPTION=Grow a sparse visited-set frontier beside a large recurring state
