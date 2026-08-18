@@ -18,6 +18,7 @@
 namespace duckdb {
 
 class Optimizer;
+class CTEFilterPusher;
 
 class FilterPushdown {
 public:
@@ -46,12 +47,15 @@ public:
 	};
 
 private:
+	friend class CTEFilterPusher;
+
 	struct RewriteContext {
-		explicit RewriteContext(LogicalOperator &root) : data_flow(root), mutator(data_flow) {
+		RewriteContext(LogicalPlanDataFlow &data_flow_p, LogicalPlanDataFlowMutator &mutator_p)
+		    : data_flow(data_flow_p), mutator(mutator_p) {
 		}
 
-		LogicalPlanDataFlow data_flow;
-		LogicalPlanDataFlowMutator mutator;
+		LogicalPlanDataFlow &data_flow;
+		LogicalPlanDataFlowMutator &mutator;
 	};
 
 	enum class JoinDecisionPolicy {

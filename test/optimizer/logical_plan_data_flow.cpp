@@ -7,6 +7,7 @@
 #include "duckdb/planner/logical_plan_data_flow.hpp"
 #include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_cross_product.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_dependent_join.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
@@ -422,6 +423,57 @@ TEST_CASE("Logical plan data flow keeps materialized CTE components separate", "
 	filter_boundary.Add(LogicalPlanPathProperty::FILTER_PUSHDOWN_BOUNDARY);
 	REQUIRE(data_flow.FindFirstPathOperator(producer_ref, reader_ref, filter_boundary).status ==
 	        LogicalPlanDataFlowStatus::CTE_BOUNDARY);
+}
+
+TEST_CASE("Logical plan data flow orders materialized CTE lineage by ownership",
+          "[optimizer][logical_plan_data_flow]") {
+	auto inner_producer = CreateProjection(TableIndex(10), TableIndex(20));
+	auto inner_reader =
+	    make_uniq<LogicalCTERef>(TableIndex(40), TableIndex(30), vector<LogicalType> {LogicalType::INTEGER},
+	                             vector<Identifier> {Identifier("i")});
+	auto &inner_reader_ref = *inner_reader;
+	auto inner_cte =
+	    make_uniq<LogicalMaterializedCTE>(Identifier("inner"), TableIndex(30), 1, std::move(inner_producer),
+	                                      std::move(inner_reader), CTEMaterialize::CTE_MATERIALIZE_ALWAYS);
+
+	auto outer_left =
+	    make_uniq<LogicalCTERef>(TableIndex(60), TableIndex(50), vector<LogicalType> {LogicalType::INTEGER},
+	                             vector<Identifier> {Identifier("i")});
+	auto &outer_left_ref = *outer_left;
+	auto outer_right =
+	    make_uniq<LogicalCTERef>(TableIndex(70), TableIndex(50), vector<LogicalType> {LogicalType::INTEGER},
+	                             vector<Identifier> {Identifier("i")});
+	auto &outer_right_ref = *outer_right;
+	auto continuation = make_uniq<LogicalCrossProduct>(std::move(outer_left), std::move(outer_right));
+	auto plan = make_uniq<LogicalMaterializedCTE>(Identifier("outer"), TableIndex(50), 1, std::move(inner_cte),
+	                                              std::move(continuation), CTEMaterialize::CTE_MATERIALIZE_ALWAYS);
+
+	LogicalPlanDataFlow data_flow(*plan);
+	REQUIRE(data_flow.Verify());
+	auto materialized_ctes = data_flow.GetMaterializedCTEs();
+	REQUIRE(materialized_ctes.size() == 2);
+	REQUIRE(&materialized_ctes[0].get() == plan.get());
+	REQUIRE(&materialized_ctes[1].get() == plan->children[0].get());
+	auto outer_readers = data_flow.GetCTEReaders(TableIndex(50));
+	REQUIRE(outer_readers.status == LogicalPlanDataFlowStatus::SUCCESS);
+	REQUIRE(outer_readers.readers.size() == 2);
+	REQUIRE(&outer_readers.readers[0].get() == &outer_left_ref);
+	REQUIRE(&outer_readers.readers[1].get() == &outer_right_ref);
+	auto inner_readers = data_flow.GetCTEReaders(TableIndex(30));
+	REQUIRE(inner_readers.status == LogicalPlanDataFlowStatus::SUCCESS);
+	REQUIRE(inner_readers.readers.size() == 1);
+	REQUIRE(&inner_readers.readers[0].get() == &inner_reader_ref);
+}
+
+TEST_CASE("Logical plan data flow excludes recursive CTEs from materialized lineage",
+          "[optimizer][logical_plan_data_flow]") {
+	DuckDB db;
+	Connection connection(db);
+	auto plan = connection.ExtractPlan(
+	    "WITH RECURSIVE values(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM values WHERE i < 3) SELECT * FROM values");
+	LogicalPlanDataFlow data_flow(*plan);
+	REQUIRE(data_flow.Verify());
+	REQUIRE(data_flow.GetMaterializedCTEs().empty());
 }
 
 TEST_CASE("Logical plan data flow treats extension operators as opaque", "[optimizer][logical_plan_data_flow]") {
@@ -1044,8 +1096,14 @@ TEST_CASE("Indexed logical plan mutations maintain materialized CTE producers", 
 	                                             std::move(continuation), CTEMaterialize::CTE_MATERIALIZE_ALWAYS);
 	LogicalPlanDataFlow data_flow(*cte);
 	LogicalPlanDataFlowMutator mutator(data_flow);
+	auto materialized_ctes = data_flow.GetMaterializedCTEs();
+	REQUIRE(materialized_ctes.size() == 1);
+	REQUIRE(&materialized_ctes[0].get() == cte.get());
 
 	auto old_producer = mutator.ReplaceSubtree(cte->children[0], CreateProjection(TableIndex(11), TableIndex(21)));
+	materialized_ctes = data_flow.GetMaterializedCTEs();
+	REQUIRE(materialized_ctes.size() == 1);
+	REQUIRE(&materialized_ctes[0].get() == cte.get());
 	REQUIRE(data_flow.GetCTEProducer(TableIndex(30)).op.get() == cte->children[0].get());
 	REQUIRE(data_flow.GetOwnershipParent(*old_producer).status == LogicalPlanDataFlowStatus::OPERATOR_NOT_INDEXED);
 	REQUIRE(data_flow.ResolveSource(ColumnBinding(TableIndex(11), ProjectionIndex(0)), 0, *cte->children[0]).status ==

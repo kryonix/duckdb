@@ -610,11 +610,17 @@ public:
 	}
 
 	void BuildSourcesAndLineage() {
-		for (auto &entry_pair : entries) {
+		vector<reference<LogicalOperator>> pending {*root};
+		while (!pending.empty()) {
+			auto op = pending.back();
+			pending.pop_back();
+			auto entry = GetEntry(op);
 			LogicalPlanDataFlowMetadata metadata;
-			if (!GetMetadata(entry_pair.second->op, metadata) ||
-			    !AddContributions(*entry_pair.second, std::move(metadata))) {
+			if (!entry || !GetMetadata(op, metadata) || !AddContributions(*entry, std::move(metadata))) {
 				valid = false;
+			}
+			for (idx_t child_idx = op.get().children.size(); child_idx > 0; child_idx--) {
+				pending.push_back(*op.get().children[child_idx - 1]);
 			}
 		}
 	}
@@ -1482,6 +1488,23 @@ LogicalPlanDataFlowReadersResult LogicalPlanDataFlow::GetCTEReaders(TableIndex c
 		return {LogicalPlanDataFlowStatus::BINDING_NOT_FOUND, {}};
 	}
 	return {LogicalPlanDataFlowStatus::SUCCESS, lineage->second.readers};
+}
+
+vector<reference<LogicalOperator>> LogicalPlanDataFlow::GetMaterializedCTEs() const {
+	state->EnsureQueryable();
+	vector<reference<LogicalOperator>> result;
+	vector<reference<LogicalOperator>> pending {*state->root};
+	while (!pending.empty()) {
+		auto op = pending.back();
+		pending.pop_back();
+		if (op.get().type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+			result.push_back(op);
+		}
+		for (idx_t child_idx = op.get().children.size(); child_idx > 0; child_idx--) {
+			pending.push_back(*op.get().children[child_idx - 1]);
+		}
+	}
+	return result;
 }
 
 const vector<LogicalPlanBindingUse> &LogicalPlanDataFlow::GetBindingUses() const {

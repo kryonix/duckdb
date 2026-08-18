@@ -10,83 +10,101 @@
 
 namespace duckdb {
 
-CTEFilterPusher::MaterializedCTEInfo::MaterializedCTEInfo(LogicalOperator &materialized_cte_p)
-    : materialized_cte(materialized_cte_p), all_cte_refs_are_filtered(true) {
-}
-
 CTEFilterPusher::CTEFilterPusher(Optimizer &optimizer_p) : optimizer(optimizer_p) {
 }
 
 unique_ptr<LogicalOperator> CTEFilterPusher::Optimize(unique_ptr<LogicalOperator> op) {
-	FindCandidates(*op);
-	auto ctes = std::move(cte_info_map);
-
-	// Iterate once over all materialized CTEs
-	for (auto it = ctes.rbegin(); it != ctes.rend(); it++) {
-		if (!it->second->all_cte_refs_are_filtered) {
-			continue;
-		}
-
-		// The cte_info_map must be reconstructed each time.
-		// Changes to the plan otherwise break the non-unique_ptr references.
-		cte_info_map = InsertionOrderPreservingMap<unique_ptr<MaterializedCTEInfo>>();
-		FindCandidates(*op);
-
-		PushFilterIntoCTE(*cte_info_map[it->first]);
+	if (!HasMaterializedCTE(*op)) {
+		return op;
 	}
+
+	RewriteContext context(*op);
+	auto materialized_ctes = context.data_flow.GetMaterializedCTEs();
+	for (auto it = materialized_ctes.rbegin(); it != materialized_ctes.rend(); it++) {
+		auto indexed = GetIndexedCandidate(*it, context);
+		if (indexed.all_cte_refs_are_filtered) {
+			PushFilterIntoCTE(*it, indexed.filters, context);
+		}
+	}
+	D_ASSERT(context.data_flow.Verify());
 	return op;
 }
 
-void CTEFilterPusher::FindCandidates(LogicalOperator &op) {
-	if (op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
-		// We encountered a new CTE, add it to the map
-		auto key = to_string(op.Cast<LogicalMaterializedCTE>().table_index.index);
-		auto value = make_uniq<MaterializedCTEInfo>(op);
-
-		cte_info_map.insert(key, std::move(value));
-	} else if (op.type == LogicalOperatorType::LOGICAL_FILTER &&
-	           op.children[0]->type == LogicalOperatorType::LOGICAL_CTE_REF) {
-		// We encountered a filtered CTE ref, update the according CTE info
-		auto &cte_ref = op.children[0]->Cast<LogicalCTERef>();
-		auto it = cte_info_map.find(to_string(cte_ref.cte_index.index));
-		if (it != cte_info_map.end()) {
-			it->second->filters.push_back(op);
+bool CTEFilterPusher::HasMaterializedCTE(LogicalOperator &op) {
+	vector<reference<LogicalOperator>> pending {op};
+	while (!pending.empty()) {
+		auto current = pending.back();
+		pending.pop_back();
+		if (current.get().type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+			return true;
 		}
-		return;
-	} else if (op.type == LogicalOperatorType::LOGICAL_CTE_REF) {
-		// We encountered a CTE ref without a filter on top, so we can't do the optimization
-		auto &cte_ref = op.Cast<LogicalCTERef>();
-		auto it = cte_info_map.find(to_string(cte_ref.cte_index.index));
-		if (it != cte_info_map.end()) {
-			it->second->all_cte_refs_are_filtered = false;
+		for (auto &child : current.get().children) {
+			pending.push_back(*child);
 		}
-		return;
 	}
-	for (auto &child : op.children) {
-		FindCandidates(*child);
-	}
+	return false;
 }
 
-void CTEFilterPusher::PushFilterIntoCTE(MaterializedCTEInfo &info) {
-	D_ASSERT(info.materialized_cte.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE);
-	if (info.filters.empty()) {
+CTEFilterPusher::IndexedMaterializedCTEInfo CTEFilterPusher::GetIndexedCandidate(LogicalOperator &materialized_cte_op,
+                                                                                 RewriteContext &context) {
+	if (materialized_cte_op.type != LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ||
+	    materialized_cte_op.children.size() != 2) {
+		throw InternalException("Indexed materialized CTE candidate has an invalid wrapper");
+	}
+	auto &materialized_cte = materialized_cte_op.Cast<LogicalMaterializedCTE>();
+	auto cte_index = materialized_cte.table_index;
+	auto producer = context.data_flow.GetCTEProducer(cte_index);
+	if (producer.status != LogicalPlanDataFlowStatus::SUCCESS ||
+	    producer.op.get() != materialized_cte.children[0].get()) {
+		throw InternalException("Indexed materialized CTE candidate has inconsistent producer lineage");
+	}
+
+	IndexedMaterializedCTEInfo result;
+	auto readers = context.data_flow.GetCTEReaders(cte_index);
+	if (readers.status != LogicalPlanDataFlowStatus::SUCCESS) {
+		throw InternalException("Indexed materialized CTE candidate has inconsistent reader lineage");
+	}
+	for (auto &reader : readers.readers) {
+		if (reader.get().type != LogicalOperatorType::LOGICAL_CTE_REF) {
+			throw InternalException("Indexed materialized CTE lineage contains a non-reader operator");
+		}
+		auto &cte_ref = reader.get().Cast<LogicalCTERef>();
+		if (cte_ref.cte_index != cte_index || cte_ref.is_recurring) {
+			throw InternalException("Indexed materialized CTE lineage contains an invalid reader");
+		}
+		auto reader_parent = context.data_flow.GetOwnershipParent(reader.get());
+		if (reader_parent.status != LogicalPlanDataFlowStatus::SUCCESS) {
+			throw InternalException("Indexed materialized CTE reader has inconsistent ownership");
+		}
+		if (!reader_parent.parent || reader_parent.child_index != 0 ||
+		    reader_parent.parent->type != LogicalOperatorType::LOGICAL_FILTER ||
+		    reader_parent.parent->children[0].get() != &reader.get()) {
+			result.all_cte_refs_are_filtered = false;
+			continue;
+		}
+		result.filters.push_back(*reader_parent.parent);
+	}
+	return result;
+}
+
+void CTEFilterPusher::PushFilterIntoCTE(LogicalOperator &materialized_cte,
+                                        const vector<reference<LogicalOperator>> &filters, RewriteContext &context) {
+	D_ASSERT(materialized_cte.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE);
+	if (filters.empty()) {
 		return;
 	}
 
 	// Create an OR expression with all the filters on all references of the CTE
 	unique_ptr<Expression> outer_expr;
-	for (auto &filter : info.filters) {
+	for (auto &filter : filters) {
 		D_ASSERT(filter.get().type == LogicalOperatorType::LOGICAL_FILTER);
 
 		auto old_bindings = filter.get().children[0]->GetColumnBindings();
-		auto new_bindings = info.materialized_cte.children[0]->GetColumnBindings();
+		auto new_bindings = materialized_cte.children[0]->GetColumnBindings();
 		D_ASSERT(old_bindings.size() == new_bindings.size());
 
 		ColumnBindingReplacer replacer;
-		replacer.replacement_bindings.reserve(old_bindings.size());
-		for (idx_t i = 0; i < old_bindings.size(); i++) {
-			replacer.replacement_bindings.emplace_back(old_bindings[i], new_bindings[i]);
-		}
+		replacer.AddReplacements(old_bindings, new_bindings);
 
 		// We copy the filters and replace the CTE reference bindings with the bindings in the CTE definition
 		unique_ptr<Expression> inner_expr;
@@ -115,13 +133,13 @@ void CTEFilterPusher::PushFilterIntoCTE(MaterializedCTEInfo &info) {
 
 	// Rewrite the operator expressions before adding the child op (children should be rewritten already)
 	optimizer.rewriter.VisitOperator(*new_cte);
-	new_cte->children.push_back(std::move(info.materialized_cte.children[0]));
+	context.mutator.InsertUnary(materialized_cte.children[0], std::move(new_cte));
 
 	// Push down the filter
 	FilterPushdown pushdown(optimizer, true, FilterPushdown::ProjectionMode::PRESERVE_COMPUTED_EXPRESSIONS);
-	new_cte = pushdown.Rewrite(std::move(new_cte));
-
-	info.materialized_cte.children[0] = std::move(new_cte);
+	FilterPushdown::RewriteContext pushdown_context(context.data_flow, context.mutator);
+	pushdown.Rewrite(materialized_cte.children[0], pushdown_context);
+	D_ASSERT(context.data_flow.Verify());
 }
 
 } // namespace duckdb

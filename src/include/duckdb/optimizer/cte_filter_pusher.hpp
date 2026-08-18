@@ -8,7 +8,7 @@
 
 #pragma once
 
-#include "duckdb/common/insertion_order_preserving_map.hpp"
+#include "duckdb/planner/logical_plan_data_flow.hpp"
 
 namespace duckdb {
 
@@ -22,25 +22,31 @@ public:
 	unique_ptr<LogicalOperator> Optimize(unique_ptr<LogicalOperator> op);
 
 private:
-	//! CTE info needed for creating OR filters that can be pushed down
-	struct MaterializedCTEInfo {
-		explicit MaterializedCTEInfo(LogicalOperator &materialized_cte);
-		LogicalOperator &materialized_cte;
+	struct RewriteContext {
+		explicit RewriteContext(LogicalOperator &root) : data_flow(root), mutator(data_flow) {
+		}
+
+		LogicalPlanDataFlow data_flow;
+		LogicalPlanDataFlowMutator mutator;
+	};
+
+	struct IndexedMaterializedCTEInfo {
 		vector<reference<LogicalOperator>> filters;
-		bool all_cte_refs_are_filtered;
+		bool all_cte_refs_are_filtered = true;
 	};
 
 private:
-	//! Find all materialized CTEs and their refs
-	void FindCandidates(LogicalOperator &op);
+	//! Check whether the plan contains work for this optimizer
+	static bool HasMaterializedCTE(LogicalOperator &op);
+	//! Find a materialized CTE and its directly filtered refs through the data-flow index
+	static IndexedMaterializedCTEInfo GetIndexedCandidate(LogicalOperator &materialized_cte, RewriteContext &context);
 	//! Creates an OR filter and pushes it into a materialized CTE
-	void PushFilterIntoCTE(MaterializedCTEInfo &info);
+	void PushFilterIntoCTE(LogicalOperator &materialized_cte, const vector<reference<LogicalOperator>> &filters,
+	                       RewriteContext &context);
 
 private:
 	//! The optimizer
 	Optimizer &optimizer;
-	//! Mapping from CTE index to CTE info, order preserving so deepest CTEs are done first
-	InsertionOrderPreservingMap<unique_ptr<MaterializedCTEInfo>> cte_info_map;
 };
 
 } // namespace duckdb

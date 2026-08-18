@@ -25,6 +25,128 @@ ORDER BY x;
 statement ok
 PRAGMA explain_output='optimized_only'
 
+# Every reader is directly filtered, so the producer receives their disjunction
+query II
+EXPLAIN WITH cte AS MATERIALIZED (
+	SELECT i FROM range(10) t(i)
+)
+SELECT * FROM cte WHERE i < 2
+UNION ALL
+SELECT * FROM cte WHERE i > 7;
+----
+logical_opt	<REGEX>:(?s).*Expressions: \(i < 2\) OR \(i > 7\).*
+
+query I rowsort
+WITH cte AS MATERIALIZED (
+	SELECT i FROM range(10) t(i)
+)
+SELECT * FROM cte WHERE i < 2
+UNION ALL
+SELECT * FROM cte WHERE i > 7;
+----
+0
+1
+8
+9
+
+# One unfiltered reader prevents a partial producer filter
+query II
+EXPLAIN WITH cte AS MATERIALIZED (
+	SELECT i FROM range(10) t(i)
+)
+SELECT * FROM cte WHERE i < 2
+UNION ALL
+SELECT * FROM cte;
+----
+logical_opt	<!REGEX>:(?s).*Expressions: .* OR .*
+
+query I rowsort
+WITH cte AS MATERIALIZED (
+	SELECT i FROM range(10) t(i)
+)
+SELECT * FROM cte WHERE i < 2
+UNION ALL
+SELECT * FROM cte;
+----
+0
+0
+1
+1
+2
+3
+4
+5
+6
+7
+8
+9
+
+# A filter above a window is not a direct filter on the CTE reader
+query II
+EXPLAIN WITH cte AS MATERIALIZED (
+	SELECT i FROM range(10) t(i)
+)
+SELECT i
+FROM (
+	SELECT i, row_number() OVER () AS rn
+	FROM cte
+) windowed
+WHERE rn = 1;
+----
+logical_opt	<!REGEX>:(?s).*Expressions: rn = 1.*Expressions: rn = 1.*
+
+query I
+WITH cte AS MATERIALIZED (
+	SELECT i FROM range(10) t(i)
+)
+SELECT i
+FROM (
+	SELECT i, row_number() OVER () AS rn
+	FROM cte
+) windowed
+WHERE rn = 1;
+----
+0
+
+# Nested CTEs are handled deepest-first while keeping both producer filters valid
+query II
+EXPLAIN WITH outer_cte AS MATERIALIZED (
+	WITH inner_cte AS MATERIALIZED (
+		SELECT i FROM range(10) t(i)
+	)
+	SELECT * FROM inner_cte WHERE i < 8
+)
+SELECT * FROM outer_cte WHERE i % 3 = 1;
+----
+logical_opt	<REGEX>:(?s).*CTE Name: outer_cte.*CTE Name: inner_cte.*Expressions: i < 8.*Expressions: \(i % 3\) = 1.*
+
+query I
+WITH outer_cte AS MATERIALIZED (
+	WITH inner_cte AS MATERIALIZED (
+		SELECT i FROM range(10) t(i)
+	)
+	SELECT * FROM inner_cte WHERE i < 8
+)
+SELECT * FROM outer_cte WHERE i % 3 = 1
+ORDER BY i;
+----
+1
+4
+7
+
+# Recursive CTE readers are outside materialized CTE filter routing
+query I
+WITH RECURSIVE values(i) AS (
+	VALUES (1)
+	UNION ALL
+	SELECT i + 1 FROM values WHERE i < 5
+)
+SELECT i FROM values WHERE i % 2 = 0
+ORDER BY i;
+----
+2
+4
+
 # Computed materialized outputs must not be copied into the combined consumer filter
 query II
 EXPLAIN WITH cte AS MATERIALIZED (

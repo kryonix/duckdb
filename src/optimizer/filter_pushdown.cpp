@@ -87,7 +87,9 @@ FilterPushdown::FilterPushdown(Optimizer &optimizer, bool convert_mark_joins, Pr
 }
 
 unique_ptr<LogicalOperator> FilterPushdown::Rewrite(unique_ptr<LogicalOperator> op) {
-	RewriteContext context(*op);
+	LogicalPlanDataFlow data_flow(*op);
+	LogicalPlanDataFlowMutator mutator(data_flow);
+	RewriteContext context(data_flow, mutator);
 	Rewrite(op, context);
 	D_ASSERT(context.data_flow.Verify());
 	return op;

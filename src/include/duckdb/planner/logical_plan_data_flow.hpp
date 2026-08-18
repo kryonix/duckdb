@@ -118,6 +118,7 @@ public:
 
 	LogicalPlanDataFlowOperatorResult GetCTEProducer(TableIndex cte_index) const;
 	LogicalPlanDataFlowReadersResult GetCTEReaders(TableIndex cte_index) const;
+	vector<reference<LogicalOperator>> GetMaterializedCTEs() const;
 	const vector<LogicalPlanBindingUse> &GetBindingUses() const;
 	idx_t OperatorCount() const;
 
