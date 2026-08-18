@@ -16,6 +16,7 @@ namespace duckdb {
 
 class LogicalOperator;
 class LogicalPlanDataFlowState;
+class LogicalPlanDataFlowMutator;
 
 enum class LogicalPlanDataFlowStatus {
 	SUCCESS,
@@ -113,7 +114,63 @@ public:
 	bool Verify() const;
 
 private:
-	unique_ptr<LogicalPlanDataFlowState> state;
+	friend class LogicalPlanDataFlowMutator;
+	friend class LogicalPlanDataFlowDetachedSubtree;
+
+	shared_ptr<LogicalPlanDataFlowState> state;
+};
+
+//! Owns an indexed subtree while it is detached from the main logical plan.
+class LogicalPlanDataFlowDetachedSubtree {
+public:
+	~LogicalPlanDataFlowDetachedSubtree();
+
+	LogicalPlanDataFlowDetachedSubtree(LogicalPlanDataFlowDetachedSubtree &&other) noexcept;
+	LogicalPlanDataFlowDetachedSubtree &operator=(LogicalPlanDataFlowDetachedSubtree &&other) noexcept;
+
+	LogicalPlanDataFlowDetachedSubtree(const LogicalPlanDataFlowDetachedSubtree &) = delete;
+	LogicalPlanDataFlowDetachedSubtree &operator=(const LogicalPlanDataFlowDetachedSubtree &) = delete;
+
+public:
+	explicit operator bool() const;
+	LogicalOperator &Get();
+
+private:
+	friend class LogicalPlanDataFlowMutator;
+
+	LogicalPlanDataFlowDetachedSubtree(const shared_ptr<LogicalPlanDataFlowState> &state,
+	                                   unique_ptr<LogicalOperator> subtree);
+	void Reset();
+
+private:
+	weak_ptr<LogicalPlanDataFlowState> state;
+	unique_ptr<LogicalOperator> subtree;
+};
+
+//! Maintains a LogicalPlanDataFlow while its logical plan is rewritten.
+class LogicalPlanDataFlowMutator {
+public:
+	explicit LogicalPlanDataFlowMutator(LogicalPlanDataFlow &data_flow);
+
+public:
+	LogicalPlanDataFlowDetachedSubtree RegisterSubtree(unique_ptr<LogicalOperator> subtree);
+	unique_ptr<LogicalOperator> UnregisterSubtree(LogicalPlanDataFlowDetachedSubtree subtree);
+	LogicalPlanDataFlowDetachedSubtree DetachChild(LogicalOperator &parent, idx_t child_index);
+	void AttachChild(LogicalOperator &parent, idx_t child_index, LogicalPlanDataFlowDetachedSubtree subtree);
+	void AttachChild(LogicalOperator &parent, idx_t child_index, unique_ptr<LogicalOperator> subtree);
+	unique_ptr<LogicalOperator> EraseChild(LogicalOperator &parent, idx_t child_index);
+	unique_ptr<LogicalOperator> ReplaceSubtree(unique_ptr<LogicalOperator> &slot,
+	                                           unique_ptr<LogicalOperator> replacement);
+	unique_ptr<LogicalOperator> ReplaceOperator(unique_ptr<LogicalOperator> &slot,
+	                                            unique_ptr<LogicalOperator> replacement);
+	unique_ptr<LogicalOperator> PromoteChild(unique_ptr<LogicalOperator> &slot, idx_t child_index);
+	void InsertUnary(unique_ptr<LogicalOperator> &slot, unique_ptr<LogicalOperator> wrapper);
+	unique_ptr<LogicalOperator> RemoveUnary(unique_ptr<LogicalOperator> &slot);
+	void SwapChildren(LogicalOperator &parent, idx_t left_index, idx_t right_index);
+	void RefreshOperator(LogicalOperator &op);
+
+private:
+	LogicalPlanDataFlow &data_flow;
 };
 
 } // namespace duckdb

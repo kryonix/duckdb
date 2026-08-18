@@ -56,20 +56,62 @@ optional_ptr<vector<ProjectionIndex>> LogicalOperatorVisitor::GetProjectionMap(L
 	}
 }
 
+void LogicalOperatorVisitor::ValidateProjectionMaps(LogicalOperator &op) {
+	for (auto &child : op.children) {
+		ValidateProjectionMaps(*child);
+	}
+	if (!op.HasProjectionMap()) {
+		return;
+	}
+	for (idx_t child_index = 0; child_index < op.children.size(); child_index++) {
+		auto projection_map = GetProjectionMap(op, child_index);
+		if (!projection_map) {
+			// Extension operators can own projection maps that are opaque to the core visitor.
+			continue;
+		}
+		const auto child_column_count = op.children[child_index]->GetColumnBindings().size();
+		for (auto projection_index : *projection_map) {
+			if (projection_index.GetIndex() >= child_column_count) {
+				throw InternalException(
+				    "Operator %s projection map references column %llu in child %llu with %llu columns",
+				    EnumUtil::ToString(op.type), projection_index.GetIndex(), child_index, child_column_count);
+			}
+		}
+	}
+}
+
 void LogicalOperatorVisitor::RemapProjectionMap(vector<ProjectionIndex> &projection_map,
                                                 const vector<ColumnBinding> &child_bindings_before,
                                                 const vector<ColumnBinding> &child_bindings_after) {
-	if (projection_map.empty() || child_bindings_before == child_bindings_after) {
+	if (child_bindings_before == child_bindings_after) {
+		return;
+	}
+	vector<ColumnBinding> selected_bindings;
+	if (projection_map.empty()) {
+		selected_bindings = child_bindings_before;
+	} else {
+		selected_bindings.reserve(projection_map.size());
+		for (auto projection_index : projection_map) {
+			if (projection_index.GetIndex() >= child_bindings_before.size()) {
+				throw InternalException("Projection map references column %llu in a child with %llu columns",
+				                        projection_index.GetIndex(), child_bindings_before.size());
+			}
+			selected_bindings.push_back(child_bindings_before[projection_index.GetIndex()]);
+		}
+	}
+	if (selected_bindings == child_bindings_after) {
+		projection_map.clear();
 		return;
 	}
 	vector<ProjectionIndex> new_projection_map;
-	new_projection_map.reserve(projection_map.size());
-	for (auto projection_index : projection_map) {
-		auto &desired_binding = child_bindings_before[projection_index.GetIndex()];
+	new_projection_map.reserve(selected_bindings.size());
+	for (auto &desired_binding : selected_bindings) {
 		auto entry = std::find(child_bindings_after.begin(), child_bindings_after.end(), desired_binding);
 		if (entry == child_bindings_after.end()) {
-			projection_map.clear();
-			return;
+			throw InternalException("Projection map rewrite lost binding %s (selected %s, child output %s)",
+			                        desired_binding.ToString(),
+			                        LogicalOperator::ColumnBindingsToString(selected_bindings),
+			                        LogicalOperator::ColumnBindingsToString(child_bindings_after));
 		}
 		new_projection_map.emplace_back(NumericCast<idx_t>(entry - child_bindings_after.begin()));
 	}

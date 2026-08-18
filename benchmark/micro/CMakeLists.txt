@@ -6,6 +6,7 @@ add_library(
   bulkupdate.cpp
   cast.cpp
   in.cpp
+  optimizer.cpp
   storage.cpp
   string_serialize.cpp)
 

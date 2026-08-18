@@ -237,6 +237,14 @@ unique_ptr<LogicalOperator> LogicalComparisonJoin::CreateJoin(JoinType type, Joi
                                                               unique_ptr<LogicalOperator> left_child,
                                                               unique_ptr<LogicalOperator> right_child,
                                                               vector<JoinCondition> conditions) {
+	auto result = CreateJoin(type, ref_type, std::move(conditions));
+	result->children.push_back(std::move(left_child));
+	result->children.push_back(std::move(right_child));
+	return result;
+}
+
+unique_ptr<LogicalOperator> LogicalComparisonJoin::CreateJoin(JoinType type, JoinRefType ref_type,
+                                                              vector<JoinCondition> conditions) {
 	// separate comparison and non-comparison conditions for validation
 	vector<JoinCondition> comparison_conditions;
 	vector<JoinCondition> non_comparison_conditions;
@@ -309,8 +317,6 @@ unique_ptr<LogicalOperator> LogicalComparisonJoin::CreateJoin(JoinType type, Joi
 	if (is_asof) {
 		auto asof_join = make_uniq<LogicalComparisonJoin>(type, LogicalOperatorType::LOGICAL_ASOF_JOIN);
 		asof_join->conditions = std::move(all_conditions);
-		asof_join->children.push_back(std::move(left_child));
-		asof_join->children.push_back(std::move(right_child));
 		return std::move(asof_join);
 	}
 
@@ -321,8 +327,6 @@ unique_ptr<LogicalOperator> LogicalComparisonJoin::CreateJoin(JoinType type, Joi
 		}
 
 		auto any_join = make_uniq<LogicalAnyJoin>(type);
-		any_join->children.push_back(std::move(left_child));
-		any_join->children.push_back(std::move(right_child));
 		any_join->condition = JoinCondition::CreateExpression(std::move(all_conditions));
 		return std::move(any_join);
 	}
@@ -330,8 +334,6 @@ unique_ptr<LogicalOperator> LogicalComparisonJoin::CreateJoin(JoinType type, Joi
 	// Case 3: Has comparison conditions - Use comparison join
 	auto comp_join = make_uniq<LogicalComparisonJoin>(type, LogicalOperatorType::LOGICAL_COMPARISON_JOIN);
 	comp_join->conditions = std::move(all_conditions);
-	comp_join->children.push_back(std::move(left_child));
-	comp_join->children.push_back(std::move(right_child));
 
 	return std::move(comp_join);
 }

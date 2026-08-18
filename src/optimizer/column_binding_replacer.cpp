@@ -5,6 +5,8 @@
 #include "duckdb/planner/operator/logical_cte.hpp"
 #include "duckdb/planner/operator/logical_dependent_join.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
+#include "duckdb/planner/logical_plan_data_flow.hpp"
+#include "duckdb/planner/subquery/column_binding_layout.hpp"
 
 namespace duckdb {
 
@@ -137,7 +139,19 @@ void ColumnBindingReplacer::VisitOperator(LogicalOperator &op) {
 	if (stop_operator && stop_operator.get() == &op) {
 		return;
 	}
-	VisitOperatorChildren(op);
+	if (op.HasProjectionMap()) {
+		BindingReplacementGraph replacements;
+		for (auto &replacement : replacement_bindings) {
+			replacements.Add(replacement);
+		}
+		for (idx_t child_index = 0; child_index < op.children.size(); child_index++) {
+			auto old_child_bindings = op.children[child_index]->GetColumnBindings();
+			VisitOperator(*op.children[child_index]);
+			ColumnBindingRewrite::RemapProjectionMap(op, child_index, old_child_bindings, replacements);
+		}
+	} else {
+		VisitOperatorChildren(op);
+	}
 	VisitOperatorBindings(op);
 }
 
@@ -301,13 +315,92 @@ static ReplacementBinding ResolveBoundaryReplacement(ColumnBinding binding,
 	return ReplacementBinding(binding, binding);
 }
 
+void ColumnBindingRewrite::RemapProjectionMap(LogicalOperator &op, idx_t child_index,
+                                              const vector<ColumnBinding> &old_child_bindings,
+                                              const BindingReplacementGraph &replacements) {
+	if (child_index >= op.children.size()) {
+		throw InternalException("Binding rewrite child index %llu out of range", child_index);
+	}
+	auto projection_map = LogicalOperatorVisitor::GetProjectionMap(op, child_index);
+	if (!projection_map) {
+		throw InternalException("Operator %s has no projection map for child %llu", EnumUtil::ToString(op.type),
+		                        child_index);
+	}
+	auto new_child_bindings = op.children[child_index]->GetColumnBindings();
+	auto boundary_replacements = ScopeToOutput(new_child_bindings, replacements);
+	auto rewritten_child_bindings = old_child_bindings;
+	column_binding_set_t new_bindings(new_child_bindings.begin(), new_child_bindings.end());
+	for (auto &binding : rewritten_child_bindings) {
+		if (new_bindings.find(binding) != new_bindings.end()) {
+			continue;
+		}
+		binding = ResolveBoundaryReplacement(binding, boundary_replacements).new_binding;
+	}
+	RemapProjectionMapStrict(*projection_map, rewritten_child_bindings, new_child_bindings);
+}
+
+void ColumnBindingRewrite::RemapPrunedProjectionMap(LogicalOperator &op, idx_t child_index,
+                                                    const vector<ColumnBinding> &old_child_bindings,
+                                                    const BindingReplacementGraph &replacements) {
+	if (child_index >= op.children.size()) {
+		throw InternalException("Binding rewrite child index %llu out of range", child_index);
+	}
+	auto projection_map = LogicalOperatorVisitor::GetProjectionMap(op, child_index);
+	if (!projection_map) {
+		throw InternalException("Operator %s has no projection map for child %llu", EnumUtil::ToString(op.type),
+		                        child_index);
+	}
+	vector<ColumnBinding> selected_bindings;
+	if (projection_map->empty()) {
+		selected_bindings = old_child_bindings;
+	} else {
+		selected_bindings.reserve(projection_map->size());
+		for (auto projection_index : *projection_map) {
+			if (projection_index.GetIndex() >= old_child_bindings.size()) {
+				throw InternalException("Projection map references column %llu in a child with %llu columns",
+				                        projection_index.GetIndex(), old_child_bindings.size());
+			}
+			selected_bindings.push_back(old_child_bindings[projection_index.GetIndex()]);
+		}
+	}
+
+	auto new_child_bindings = op.children[child_index]->GetColumnBindings();
+	column_binding_set_t new_bindings(new_child_bindings.begin(), new_child_bindings.end());
+	vector<ColumnBinding> rewritten_bindings;
+	for (auto &binding : selected_bindings) {
+		ReplacementBinding resolved(binding, binding);
+		if (TryResolveToOutput(binding, new_bindings, replacements, resolved)) {
+			rewritten_bindings.push_back(resolved.new_binding);
+		}
+	}
+	if (rewritten_bindings.empty()) {
+		if (new_child_bindings.size() > 1) {
+			*projection_map = {ProjectionIndex(0)};
+		} else {
+			projection_map->clear();
+		}
+		return;
+	}
+	if (rewritten_bindings == new_child_bindings) {
+		projection_map->clear();
+		return;
+	}
+	*projection_map = ColumnBindingLayout(new_child_bindings).CreateProjectionMap(rewritten_bindings);
+}
+
 void ColumnBindingRewrite::ApplyToChild(unique_ptr<LogicalOperator> &op, idx_t child_index,
                                         vector<ColumnBinding> old_child_bindings,
                                         const BindingReplacementGraph &replacements) {
-	if (child_index >= op->children.size()) {
+	ApplyToChild(*op, child_index, std::move(old_child_bindings), replacements);
+}
+
+void ColumnBindingRewrite::ApplyToChild(LogicalOperator &op, idx_t child_index,
+                                        vector<ColumnBinding> old_child_bindings,
+                                        const BindingReplacementGraph &replacements) {
+	if (child_index >= op.children.size()) {
 		throw InternalException("Binding rewrite child index %llu out of range", child_index);
 	}
-	auto new_child_bindings = op->children[child_index]->GetColumnBindings();
+	auto new_child_bindings = op.children[child_index]->GetColumnBindings();
 	auto boundary_replacements = ScopeToOutput(new_child_bindings, replacements);
 	column_binding_set_t new_bindings(new_child_bindings.begin(), new_child_bindings.end());
 	for (auto &binding : old_child_bindings) {
@@ -321,21 +414,117 @@ void ColumnBindingRewrite::ApplyToChild(unique_ptr<LogicalOperator> &op, idx_t c
 		}
 		binding = ResolveBoundaryReplacement(binding, boundary_replacements).new_binding;
 	}
-	if (op->HasProjectionMap()) {
-		auto projection_map = LogicalOperatorVisitor::GetProjectionMap(*op, child_index);
-		D_ASSERT(projection_map);
-		RemapProjectionMapStrict(*projection_map, old_child_bindings, new_child_bindings);
+	if (op.HasProjectionMap()) {
+		RemapProjectionMap(op, child_index, old_child_bindings, replacements);
 	}
 	if (boundary_replacements.empty()) {
 		return;
 	}
 	CorrelatedColumnBindingReplacer replacer;
 	replacer.replacement_bindings = std::move(boundary_replacements);
-	if (op->type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN && child_index == 0) {
-		replacer.stop_operator = *op->children[child_index];
-		replacer.VisitOperator(*op);
+	if (op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN && child_index == 0) {
+		replacer.stop_operator = *op.children[child_index];
+		replacer.VisitOperator(op);
 	} else {
-		replacer.VisitOperatorBindings(*op);
+		replacer.VisitOperatorBindings(op);
+	}
+}
+
+struct BindingRewriteAncestorBoundary {
+	reference<LogicalOperator> parent;
+	idx_t child_index;
+	vector<ColumnBinding> old_child_output;
+	vector<ColumnBinding> old_parent_output;
+};
+
+static bool ReplacementsCanChangeOutput(const vector<ColumnBinding> &output,
+                                        const BindingReplacementGraph &replacements) {
+	column_binding_set_t output_bindings(output.begin(), output.end());
+	for (auto &replacement : replacements) {
+		if (output_bindings.find(replacement.old_binding) != output_bindings.end()) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static vector<BindingRewriteAncestorBoundary> GetBindingRewriteAncestors(LogicalPlanDataFlow &data_flow,
+                                                                         LogicalOperator &op,
+                                                                         const BindingReplacementGraph &replacements) {
+	vector<BindingRewriteAncestorBoundary> ancestors;
+	auto current = optional_ptr<LogicalOperator>(op);
+	auto current_output = op.GetColumnBindings();
+	while (current) {
+		auto owner = data_flow.GetOwnershipParent(*current);
+		if (owner.status != LogicalPlanDataFlowStatus::SUCCESS) {
+			throw InternalException("Cannot rewrite bindings through an unindexed logical plan ancestor");
+		}
+		if (!owner.parent) {
+			break;
+		}
+		auto parent_output = owner.parent->GetColumnBindings();
+		const bool continue_rewrite = ReplacementsCanChangeOutput(parent_output, replacements);
+		ancestors.push_back({*owner.parent, owner.child_index, std::move(current_output), parent_output});
+		if (!continue_rewrite) {
+			break;
+		}
+		current_output = std::move(parent_output);
+		current = owner.parent;
+	}
+	return ancestors;
+}
+
+static void RewriteBindingAncestors(vector<BindingRewriteAncestorBoundary> &ancestors,
+                                    LogicalPlanDataFlowMutator &mutator, const BindingReplacementGraph &replacements) {
+	for (auto &ancestor : ancestors) {
+		ColumnBindingRewrite::ApplyToChild(ancestor.parent.get(), ancestor.child_index,
+		                                   std::move(ancestor.old_child_output), replacements);
+		ColumnBindingRewrite::ValidateOutput(ancestor.old_parent_output, ancestor.parent.get().GetColumnBindings(),
+		                                     replacements);
+		mutator.RefreshOperator(ancestor.parent);
+	}
+}
+
+unique_ptr<LogicalOperator> ColumnBindingRewrite::ReplaceSubtreeAndRewriteBindings(
+    LogicalPlanDataFlow &data_flow, LogicalPlanDataFlowMutator &mutator, unique_ptr<LogicalOperator> &slot,
+    unique_ptr<LogicalOperator> replacement, const BindingReplacementGraph &replacements) {
+	auto ancestors = GetBindingRewriteAncestors(data_flow, *slot, replacements);
+	auto old_root_output = ancestors.empty() ? slot->GetColumnBindings() : vector<ColumnBinding>();
+	auto mutation = mutator.BeginMutation();
+	auto old_subtree = mutator.ReplaceSubtree(slot, std::move(replacement));
+	RewriteBindingAncestors(ancestors, mutator, replacements);
+	if (ancestors.empty()) {
+		ColumnBindingRewrite::ValidateOutput(old_root_output, slot->GetColumnBindings(), replacements);
+	}
+	return old_subtree;
+}
+
+unique_ptr<LogicalOperator> ColumnBindingRewrite::PromoteChildAndRewriteBindings(
+    LogicalPlanDataFlow &data_flow, LogicalPlanDataFlowMutator &mutator, unique_ptr<LogicalOperator> &slot,
+    idx_t child_index, const BindingReplacementGraph &replacements) {
+	auto ancestors = GetBindingRewriteAncestors(data_flow, *slot, replacements);
+	auto old_root_output = ancestors.empty() ? slot->GetColumnBindings() : vector<ColumnBinding>();
+	auto mutation = mutator.BeginMutation();
+	auto old_operator = mutator.PromoteChild(slot, child_index);
+	RewriteBindingAncestors(ancestors, mutator, replacements);
+	if (ancestors.empty()) {
+		ColumnBindingRewrite::ValidateOutput(old_root_output, slot->GetColumnBindings(), replacements);
+	}
+	return old_operator;
+}
+
+void ColumnBindingRewrite::InsertUnaryAndRewriteBindings(LogicalPlanDataFlow &data_flow,
+                                                         LogicalPlanDataFlowMutator &mutator,
+                                                         unique_ptr<LogicalOperator> &slot,
+                                                         unique_ptr<LogicalOperator> wrapper,
+                                                         const BindingReplacementGraph &replacements) {
+	auto ancestors = GetBindingRewriteAncestors(data_flow, *slot, replacements);
+	auto old_root_output = ancestors.empty() ? slot->GetColumnBindings() : vector<ColumnBinding>();
+	auto mutation = mutator.BeginMutation();
+	mutator.InsertUnary(slot, std::move(wrapper));
+	RewriteBindingAncestors(ancestors, mutator, replacements);
+	if (ancestors.empty()) {
+		ColumnBindingRewrite::ValidateOutput(old_root_output, slot->GetColumnBindings(), replacements);
 	}
 }
 

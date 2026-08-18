@@ -1,9 +1,12 @@
 #include "catch.hpp"
 
 #include "duckdb/optimizer/column_binding_replacer.hpp"
+#include "duckdb/planner/logical_plan_data_flow.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/operator/logical_any_join.hpp"
+#include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 
 using namespace duckdb;
@@ -151,4 +154,96 @@ TEST_CASE("Binding rewrites stop at child output boundaries", "[optimizer][bindi
 	auto &rewritten_expression = plan->Cast<LogicalFilter>().expressions[0]->Cast<BoundColumnRefExpression>();
 	REQUIRE(rewritten_expression.Binding() == binding_b1);
 	REQUIRE(rewritten_expression.GetReturnType() == LogicalType::INTEGER);
+}
+
+static unique_ptr<LogicalOperator> CreateBindingRewriteProjection(TableIndex table_index, idx_t column_count) {
+	vector<unique_ptr<Expression>> expressions;
+	for (idx_t i = 0; i < column_count; i++) {
+		expressions.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(NumericCast<int32_t>(i))));
+	}
+	return make_uniq<LogicalProjection>(table_index, std::move(expressions));
+}
+
+TEST_CASE("Indexed subtree replacement preserves projection maps through ancestors", "[optimizer][bindings]") {
+	auto table_a = TableIndex(10);
+	auto table_b = TableIndex(20);
+	auto binding_a0 = ColumnBinding(table_a, ProjectionIndex(0));
+	auto binding_a1 = ColumnBinding(table_a, ProjectionIndex(1));
+	auto binding_b0 = ColumnBinding(table_b, ProjectionIndex(0));
+	auto binding_b1 = ColumnBinding(table_b, ProjectionIndex(1));
+
+	auto filter = make_uniq<LogicalFilter>(make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, binding_a0));
+	filter->projection_map = {ProjectionIndex(1), ProjectionIndex(0)};
+	filter->children.push_back(CreateBindingRewriteProjection(table_a, 2));
+	auto order = make_uniq<LogicalOrder>(vector<BoundOrderByNode> {});
+	order->projection_map = {ProjectionIndex(1)};
+	order->children.push_back(std::move(filter));
+	unique_ptr<LogicalOperator> plan = std::move(order);
+
+	LogicalPlanDataFlow data_flow(*plan);
+	LogicalPlanDataFlowMutator mutator(data_flow);
+	BindingReplacementGraph replacements;
+	replacements.Add(binding_a0, binding_b0);
+	replacements.Add(binding_a1, binding_b1);
+	auto old_subtree = ColumnBindingRewrite::ReplaceSubtreeAndRewriteBindings(
+	    data_flow, mutator, plan->children[0]->children[0], CreateBindingRewriteProjection(table_b, 3), replacements);
+
+	REQUIRE(old_subtree->GetColumnBindings() == vector<ColumnBinding> {binding_a0, binding_a1});
+	auto &rewritten_filter = plan->children[0]->Cast<LogicalFilter>();
+	REQUIRE(rewritten_filter.projection_map == vector<ProjectionIndex> {ProjectionIndex(1), ProjectionIndex(0)});
+	REQUIRE(rewritten_filter.GetColumnBindings() == vector<ColumnBinding> {binding_b1, binding_b0});
+	auto &filter_expression = rewritten_filter.expressions[0]->Cast<BoundColumnRefExpression>();
+	REQUIRE(filter_expression.Binding() == binding_b0);
+	auto &rewritten_order = plan->Cast<LogicalOrder>();
+	REQUIRE(rewritten_order.projection_map == vector<ProjectionIndex> {ProjectionIndex(1)});
+	REQUIRE(plan->GetColumnBindings() == vector<ColumnBinding> {binding_b0});
+	REQUIRE(data_flow.Verify());
+}
+
+TEST_CASE("Pruning rewrites retain reachable projection-map bindings", "[optimizer][bindings]") {
+	auto old_table = TableIndex(10);
+	auto new_table = TableIndex(20);
+	auto old_binding = ColumnBinding(old_table, ProjectionIndex(2));
+	auto intermediate_binding = ColumnBinding(new_table, ProjectionIndex(2));
+	auto new_binding = ColumnBinding(new_table, ProjectionIndex(1));
+
+	auto filter = make_uniq<LogicalFilter>();
+	filter->projection_map = {ProjectionIndex(2)};
+	filter->children.push_back(CreateBindingRewriteProjection(old_table, 3));
+	auto old_child_bindings = filter->children[0]->GetColumnBindings();
+	filter->children[0] = CreateBindingRewriteProjection(new_table, 2);
+	BindingReplacementGraph replacements;
+	replacements.Add(old_binding, intermediate_binding);
+	replacements.Add(intermediate_binding, new_binding);
+	ColumnBindingRewrite::RemapPrunedProjectionMap(*filter, 0, old_child_bindings, replacements);
+	REQUIRE(filter->projection_map == vector<ProjectionIndex> {ProjectionIndex(1)});
+
+	filter->projection_map = {ProjectionIndex(0)};
+	filter->children[0] = CreateBindingRewriteProjection(old_table, 3);
+	old_child_bindings = filter->children[0]->GetColumnBindings();
+	filter->children[0] = CreateBindingRewriteProjection(new_table, 2);
+	ColumnBindingRewrite::RemapPrunedProjectionMap(*filter, 0, old_child_bindings, BindingReplacementGraph());
+	REQUIRE(filter->projection_map == vector<ProjectionIndex> {ProjectionIndex(0)});
+	REQUIRE(filter->GetColumnBindings() == vector<ColumnBinding> {ColumnBinding(new_table, ProjectionIndex(0))});
+}
+
+TEST_CASE("Projection map validation rejects invalid child indexes", "[optimizer][bindings]") {
+	auto valid_filter = make_uniq<LogicalFilter>();
+	valid_filter->projection_map = {ProjectionIndex(1), ProjectionIndex(0), ProjectionIndex(1)};
+	valid_filter->children.push_back(CreateBindingRewriteProjection(TableIndex(10), 2));
+	REQUIRE_NOTHROW(LogicalOperatorVisitor::ValidateProjectionMaps(*valid_filter));
+
+	valid_filter->projection_map.clear();
+	REQUIRE_NOTHROW(LogicalOperatorVisitor::ValidateProjectionMaps(*valid_filter));
+
+	valid_filter->projection_map = {ProjectionIndex(2)};
+	REQUIRE_THROWS_AS(LogicalOperatorVisitor::ValidateProjectionMaps(*valid_filter), InternalException);
+
+	auto join = make_uniq<LogicalAnyJoin>(JoinType::INNER);
+	join->condition = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
+	join->left_projection_map = {ProjectionIndex(0)};
+	join->right_projection_map = {ProjectionIndex(1)};
+	join->children.push_back(CreateBindingRewriteProjection(TableIndex(20), 1));
+	join->children.push_back(CreateBindingRewriteProjection(TableIndex(30), 1));
+	REQUIRE_THROWS_AS(LogicalOperatorVisitor::ValidateProjectionMaps(*join), InternalException);
 }

@@ -1,6 +1,7 @@
 #include "duckdb/planner/logical_plan_data_flow.hpp"
 
 #include "duckdb/common/enum_util.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/reference_map.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
@@ -66,9 +67,15 @@ struct LogicalPlanDataFlowEntry {
 	LogicalPlanPathSummary node_value;
 	LogicalPlanPathSummary edge_to_parent;
 	bool opaque = false;
+	vector<TableIndex> produced_table_indexes;
+	TableIndex cte_producer_index;
+	optional_ptr<LogicalOperator> cte_producer;
+	TableIndex cte_reader_index;
+	vector<LogicalPlanBindingUse> binding_uses;
 };
 
 struct LogicalPlanCTELineage {
+	optional_ptr<LogicalOperator> producer_owner;
 	optional_ptr<LogicalOperator> producer;
 	vector<reference<LogicalOperator>> readers;
 };
@@ -77,6 +84,14 @@ struct LogicalPlanBuildTask {
 	reference<LogicalOperator> op;
 	optional_ptr<LogicalOperator> owner_parent;
 	idx_t owner_child_index;
+};
+
+struct LogicalPlanDataFlowMetadata {
+	vector<TableIndex> produced_table_indexes;
+	TableIndex cte_producer_index;
+	optional_ptr<LogicalOperator> cte_producer;
+	TableIndex cte_reader_index;
+	vector<LogicalPlanBindingUse> binding_uses;
 };
 
 class LogicalPlanDataFlowState {
@@ -88,23 +103,23 @@ public:
 		BuildUses();
 	}
 
-	reference<LogicalOperator> root;
-	vector<unique_ptr<LogicalPlanDataFlowEntry>> entries;
-	reference_map_t<LogicalOperator, idx_t> entry_map;
+	optional_ptr<LogicalOperator> root;
+	reference_map_t<LogicalOperator, unique_ptr<LogicalPlanDataFlowEntry>> entries;
 	RootedDynamicForest forest;
-	reference_map_t<RootedDynamicForestNode, LogicalOperator *> forest_operators;
-	unordered_map<TableIndex, LogicalOperator *> binding_sources;
+	reference_map_t<RootedDynamicForestNode, reference<LogicalOperator>> forest_operators;
+	unordered_map<TableIndex, reference<LogicalOperator>> binding_sources;
 	unordered_map<TableIndex, LogicalPlanCTELineage> cte_lineage;
-	vector<LogicalPlanBindingUse> binding_uses;
+	mutable vector<LogicalPlanBindingUse> binding_uses;
+	mutable bool binding_uses_dirty = false;
 	bool valid = true;
 
 public:
 	optional_ptr<LogicalPlanDataFlowEntry> GetEntry(LogicalOperator &op) const {
-		auto entry = entry_map.find(op);
-		if (entry == entry_map.end()) {
+		auto entry = entries.find(op);
+		if (entry == entries.end()) {
 			return nullptr;
 		}
-		return *entries[entry->second];
+		return *entry->second;
 	}
 
 	bool IsFlowChild(const LogicalOperator &parent, idx_t child_index) const {
@@ -188,6 +203,26 @@ public:
 			return false;
 		}
 		return false;
+	}
+
+	bool SupportsUnaryInsertion(const LogicalOperator &op) const {
+		switch (op.type) {
+		case LogicalOperatorType::LOGICAL_PROJECTION:
+		case LogicalOperatorType::LOGICAL_FILTER:
+		case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+		case LogicalOperatorType::LOGICAL_WINDOW:
+		case LogicalOperatorType::LOGICAL_UNNEST:
+		case LogicalOperatorType::LOGICAL_LIMIT:
+		case LogicalOperatorType::LOGICAL_ORDER_BY:
+		case LogicalOperatorType::LOGICAL_TOP_N:
+		case LogicalOperatorType::LOGICAL_DISTINCT:
+		case LogicalOperatorType::LOGICAL_SAMPLE:
+		case LogicalOperatorType::LOGICAL_PIVOT:
+		case LogicalOperatorType::LOGICAL_GET:
+			return true;
+		default:
+			return false;
+		}
 	}
 
 	bool IsOpaque(const LogicalOperator &op) const {
@@ -318,11 +353,11 @@ public:
 
 	void BuildOwnership() {
 		vector<LogicalPlanBuildTask> pending;
-		pending.push_back({root, nullptr, DConstants::INVALID_INDEX});
+		pending.push_back({*root, nullptr, DConstants::INVALID_INDEX});
 		while (!pending.empty()) {
 			auto task = pending.back();
 			pending.pop_back();
-			if (entry_map.find(task.op) != entry_map.end()) {
+			if (entries.find(task.op) != entries.end()) {
 				valid = false;
 				continue;
 			}
@@ -332,9 +367,8 @@ public:
 			entry->opaque = IsOpaque(task.op.get());
 			entry->node_value = GetNodeValue(task.op.get());
 			forest.SetNodeValue(entry->forest_node, ToForestValue(entry->node_value));
-			entry_map.emplace(task.op, entries.size());
-			forest_operators.emplace(entry->forest_node, &task.op.get());
-			entries.push_back(std::move(entry));
+			forest_operators.emplace(entry->forest_node, task.op);
+			entries.emplace(task.op, std::move(entry));
 
 			for (idx_t child_idx = task.op.get().children.size(); child_idx > 0; child_idx--) {
 				auto actual_idx = child_idx - 1;
@@ -349,8 +383,8 @@ public:
 	}
 
 	void BuildFlow() {
-		for (auto &entry : entries) {
-			auto &parent = entry->op.get();
+		for (auto &entry_pair : entries) {
+			auto &parent = entry_pair.second->op.get();
 			for (idx_t child_idx = 0; child_idx < parent.children.size(); child_idx++) {
 				if (!IsFlowChild(parent, child_idx)) {
 					continue;
@@ -376,73 +410,511 @@ public:
 		if (entry == forest_operators.end()) {
 			return nullptr;
 		}
-		return entry->second;
+		return entry->second.get();
 	}
 
-	void RegisterSource(TableIndex table_index, LogicalOperator &op) {
+	bool RegisterSource(TableIndex table_index, LogicalOperator &op) {
 		if (!table_index.IsValid()) {
-			valid = false;
-			return;
+			return false;
 		}
 		auto source = binding_sources.find(table_index);
-		if (source != binding_sources.end() && source->second != &op) {
-			valid = false;
-			return;
+		if (source != binding_sources.end() && &source->second.get() != &op) {
+			return false;
 		}
-		binding_sources[table_index] = &op;
+		if (source == binding_sources.end()) {
+			binding_sources.emplace(table_index, op);
+		}
+		return true;
 	}
 
-	void RegisterProducer(TableIndex cte_index, LogicalOperator &producer) {
+	bool RegisterProducer(TableIndex cte_index, LogicalOperator &owner, LogicalOperator &producer) {
 		auto &lineage = cte_lineage[cte_index];
-		if (lineage.producer && lineage.producer.get() != &producer) {
-			valid = false;
-			return;
+		if (lineage.producer_owner && lineage.producer_owner.get() != &owner) {
+			return false;
 		}
+		lineage.producer_owner = owner;
 		lineage.producer = producer;
+		return true;
+	}
+
+	bool GetMetadata(LogicalOperator &op, LogicalPlanDataFlowMetadata &result) const {
+		unordered_set<TableIndex> produced_table_indexes;
+		for (auto table_index : GetProducedTableIndexes(op)) {
+			if (!table_index.IsValid()) {
+				return false;
+			}
+			if (produced_table_indexes.insert(table_index).second) {
+				result.produced_table_indexes.push_back(table_index);
+			}
+		}
+		switch (op.type) {
+		case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE: {
+			auto &cte = op.Cast<LogicalMaterializedCTE>();
+			if (cte.children.size() != 2 || !cte.children[0] || !cte.table_index.IsValid()) {
+				return false;
+			}
+			result.cte_producer_index = cte.table_index;
+			result.cte_producer = *cte.children[0];
+			break;
+		}
+		case LogicalOperatorType::LOGICAL_RECURSIVE_CTE: {
+			auto &cte = op.Cast<LogicalRecursiveCTE>();
+			if (!cte.table_index.IsValid()) {
+				return false;
+			}
+			result.cte_producer_index = cte.table_index;
+			result.cte_producer = cte;
+			break;
+		}
+		case LogicalOperatorType::LOGICAL_CTE_REF: {
+			auto &cte_ref = op.Cast<LogicalCTERef>();
+			if (!cte_ref.cte_index.IsValid()) {
+				return false;
+			}
+			result.cte_reader_index = cte_ref.cte_index;
+			break;
+		}
+		default:
+			break;
+		}
+		LogicalOperatorVisitor::EnumerateExpressions(
+		    static_cast<const LogicalOperator &>(op), [&](optional_ptr<const unique_ptr<Expression>> expression) {
+			    ExpressionIterator::VisitExpression<BoundColumnRefExpression>(
+			        **expression, [&](const BoundColumnRefExpression &column_ref) {
+				        result.binding_uses.push_back({column_ref.Binding(), column_ref.Depth(), op});
+			        });
+		    });
+		return true;
+	}
+
+	bool AddContributions(LogicalPlanDataFlowEntry &entry, LogicalPlanDataFlowMetadata metadata) {
+		auto &op = entry.op.get();
+		for (auto table_index : metadata.produced_table_indexes) {
+			if (!RegisterSource(table_index, op)) {
+				return false;
+			}
+		}
+		if (metadata.cte_producer_index.IsValid() &&
+		    !RegisterProducer(metadata.cte_producer_index, op, *metadata.cte_producer)) {
+			return false;
+		}
+		if (metadata.cte_reader_index.IsValid()) {
+			cte_lineage[metadata.cte_reader_index].readers.push_back(op);
+		}
+		entry.produced_table_indexes = std::move(metadata.produced_table_indexes);
+		entry.cte_producer_index = metadata.cte_producer_index;
+		entry.cte_producer = metadata.cte_producer;
+		entry.cte_reader_index = metadata.cte_reader_index;
+		entry.binding_uses = std::move(metadata.binding_uses);
+		binding_uses_dirty = true;
+		return true;
+	}
+
+	void RemoveContributions(LogicalPlanDataFlowEntry &entry) {
+		auto &op = entry.op.get();
+		for (auto table_index : entry.produced_table_indexes) {
+			auto source = binding_sources.find(table_index);
+			if (source != binding_sources.end() && &source->second.get() == &op) {
+				binding_sources.erase(source);
+			}
+		}
+		if (entry.cte_producer_index.IsValid()) {
+			auto lineage = cte_lineage.find(entry.cte_producer_index);
+			if (lineage != cte_lineage.end() && lineage->second.producer_owner.get() == &op) {
+				lineage->second.producer_owner = nullptr;
+				lineage->second.producer = nullptr;
+				if (lineage->second.readers.empty()) {
+					cte_lineage.erase(lineage);
+				}
+			}
+		}
+		if (entry.cte_reader_index.IsValid()) {
+			auto lineage = cte_lineage.find(entry.cte_reader_index);
+			if (lineage != cte_lineage.end()) {
+				auto &readers = lineage->second.readers;
+				readers.erase(
+				    std::remove_if(readers.begin(), readers.end(),
+				                   [&](const reference<LogicalOperator> &reader) { return &reader.get() == &op; }),
+				    readers.end());
+				if (!lineage->second.producer && readers.empty()) {
+					cte_lineage.erase(lineage);
+				}
+			}
+		}
+		entry.produced_table_indexes.clear();
+		entry.cte_producer_index = TableIndex();
+		entry.cte_producer = nullptr;
+		entry.cte_reader_index = TableIndex();
+		entry.binding_uses.clear();
+		binding_uses_dirty = true;
 	}
 
 	void BuildSourcesAndLineage() {
-		for (auto &entry : entries) {
-			auto &op = entry->op.get();
-			for (auto table_index : GetProducedTableIndexes(op)) {
-				RegisterSource(table_index, op);
-			}
-			switch (op.type) {
-			case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE: {
-				auto &cte = op.Cast<LogicalMaterializedCTE>();
-				if (cte.children.size() != 2) {
-					valid = false;
-					break;
-				}
-				RegisterProducer(cte.table_index, *cte.children[0]);
-				break;
-			}
-			case LogicalOperatorType::LOGICAL_RECURSIVE_CTE: {
-				auto &cte = op.Cast<LogicalRecursiveCTE>();
-				RegisterProducer(cte.table_index, cte);
-				break;
-			}
-			case LogicalOperatorType::LOGICAL_CTE_REF: {
-				auto &cte_ref = op.Cast<LogicalCTERef>();
-				cte_lineage[cte_ref.cte_index].readers.push_back(cte_ref);
-				break;
-			}
-			default:
-				break;
+		for (auto &entry_pair : entries) {
+			LogicalPlanDataFlowMetadata metadata;
+			if (!GetMetadata(entry_pair.second->op, metadata) ||
+			    !AddContributions(*entry_pair.second, std::move(metadata))) {
+				valid = false;
 			}
 		}
 	}
 
 	void BuildUses() {
-		for (auto &entry : entries) {
-			auto &op = entry->op.get();
-			LogicalOperatorVisitor::EnumerateExpressions(
-			    static_cast<const LogicalOperator &>(op), [&](const unique_ptr<Expression> *expression) {
-				    ExpressionIterator::VisitExpression<BoundColumnRefExpression>(
-				        **expression, [&](const BoundColumnRefExpression &column_ref) {
-					        binding_uses.push_back({column_ref.Binding(), column_ref.Depth(), op});
-				        });
-			    });
+		RebuildBindingUses();
+	}
+
+	void RebuildBindingUses() const {
+		binding_uses.clear();
+		for (auto &entry_pair : entries) {
+			for (auto &use : entry_pair.second->binding_uses) {
+				binding_uses.push_back(use);
+			}
+		}
+		binding_uses_dirty = false;
+	}
+
+	void
+	ValidateNewSubtree(LogicalOperator &subtree,
+	                   optional_ptr<const reference_set_t<const LogicalOperator>> ignored_operators = nullptr) const {
+		vector<reference<LogicalOperator>> pending {subtree};
+		reference_set_t<LogicalOperator> seen;
+		unordered_map<TableIndex, reference<LogicalOperator>> new_sources;
+		unordered_map<TableIndex, reference<LogicalOperator>> new_producers;
+		while (!pending.empty()) {
+			auto op = pending.back();
+			pending.pop_back();
+			if (!seen.insert(op).second) {
+				throw InternalException("Cannot register a logical plan subtree with repeated operators");
+			}
+			if (GetEntry(op)) {
+				throw InternalException("Cannot register an operator that is already indexed");
+			}
+			LogicalPlanDataFlowMetadata metadata;
+			if (!GetMetadata(op, metadata)) {
+				throw InternalException("Cannot register a logical plan subtree with invalid operator metadata");
+			}
+			for (auto table_index : metadata.produced_table_indexes) {
+				auto existing = binding_sources.find(table_index);
+				if (existing != binding_sources.end() && &existing->second.get() != &op.get() &&
+				    (!ignored_operators || ignored_operators->find(reference<const LogicalOperator>(
+				                               existing->second)) == ignored_operators->end())) {
+					throw InternalException("Cannot register duplicate logical plan table index %llu",
+					                        table_index.index);
+				}
+				auto inserted = new_sources.emplace(table_index, op);
+				if (!inserted.second && &inserted.first->second.get() != &op.get()) {
+					throw InternalException("Cannot register duplicate logical plan table index %llu",
+					                        table_index.index);
+				}
+			}
+			if (metadata.cte_producer_index.IsValid()) {
+				auto existing = cte_lineage.find(metadata.cte_producer_index);
+				if (existing != cte_lineage.end() && existing->second.producer_owner &&
+				    (!ignored_operators || ignored_operators->find(reference<const LogicalOperator>(
+				                               *existing->second.producer_owner)) == ignored_operators->end())) {
+					throw InternalException("Cannot register duplicate logical plan CTE producer %llu",
+					                        metadata.cte_producer_index.index);
+				}
+				if (!new_producers.emplace(metadata.cte_producer_index, op).second) {
+					throw InternalException("Cannot register duplicate logical plan CTE producer %llu",
+					                        metadata.cte_producer_index.index);
+				}
+			}
+			for (auto &child : op.get().children) {
+				if (!child) {
+					throw InternalException("Cannot register a logical plan subtree with a null child");
+				}
+				pending.push_back(*child);
+			}
+		}
+	}
+
+	void RegisterSubtree(LogicalOperator &subtree) {
+		ValidateNewSubtree(subtree);
+		vector<LogicalPlanBuildTask> pending {{subtree, nullptr, DConstants::INVALID_INDEX}};
+		vector<reference<LogicalOperator>> registered;
+		while (!pending.empty()) {
+			auto task = pending.back();
+			pending.pop_back();
+			auto entry = make_uniq<LogicalPlanDataFlowEntry>(task.op);
+			entry->owner_parent = task.owner_parent;
+			entry->owner_child_index = task.owner_child_index;
+			entry->opaque = IsOpaque(task.op);
+			entry->node_value = GetNodeValue(task.op);
+			forest.SetNodeValue(entry->forest_node, ToForestValue(entry->node_value));
+			forest_operators.emplace(entry->forest_node, task.op);
+			entries.emplace(task.op, std::move(entry));
+			registered.push_back(task.op);
+			for (idx_t child_idx = task.op.get().children.size(); child_idx > 0; child_idx--) {
+				auto actual_idx = child_idx - 1;
+				pending.push_back(
+				    {*task.op.get().children[actual_idx], optional_ptr<LogicalOperator>(task.op.get()), actual_idx});
+			}
+		}
+		for (auto op : registered) {
+			LogicalPlanDataFlowMetadata metadata;
+			const bool has_metadata = GetMetadata(op, metadata);
+			D_ASSERT(has_metadata);
+			const bool added = AddContributions(*GetEntry(op), std::move(metadata));
+			D_ASSERT(added);
+		}
+		for (auto op : registered) {
+			RefreshFlowChildren(op);
+		}
+	}
+
+	void UnregisterSubtree(LogicalOperator &subtree) {
+		auto subtree_entry = GetEntry(subtree);
+		if (!subtree_entry || subtree_entry->owner_parent) {
+			throw InternalException("Can only unregister the root of a detached indexed subtree");
+		}
+		if (root.get() == &subtree) {
+			throw InternalException("Cannot unregister the main logical plan root");
+		}
+		vector<reference<LogicalOperator>> pending {subtree};
+		vector<reference<LogicalOperator>> registered;
+		while (!pending.empty()) {
+			auto op = pending.back();
+			pending.pop_back();
+			auto entry = GetEntry(op);
+			if (!entry) {
+				throw InternalException("Detached logical plan subtree is not fully indexed");
+			}
+			registered.push_back(op);
+			for (idx_t child_idx = 0; child_idx < op.get().children.size(); child_idx++) {
+				auto &child = op.get().children[child_idx];
+				if (!child) {
+					throw InternalException("Detached logical plan subtree contains a null child");
+				}
+				auto child_entry = GetEntry(*child);
+				if (!child_entry || child_entry->owner_parent.get() != &op.get() ||
+				    child_entry->owner_child_index != child_idx) {
+					throw InternalException("Detached logical plan ownership changed outside its indexed mutator");
+				}
+				pending.push_back(*child);
+			}
+		}
+		for (auto op : registered) {
+			auto entry = GetEntry(op);
+			RemoveContributions(*entry);
+			if (entry->flow_parent) {
+				const bool cut = forest.CutFromParent(entry->forest_node);
+				D_ASSERT(cut);
+				entry->flow_parent = nullptr;
+				entry->flow_child_index = DConstants::INVALID_INDEX;
+			}
+		}
+		for (auto op : registered) {
+			auto entry = GetEntry(op);
+			forest_operators.erase(entry->forest_node);
+			entries.erase(op);
+		}
+	}
+
+	void RefreshFlowChildren(LogicalOperator &parent) {
+		auto parent_entry = GetEntry(parent);
+		if (!parent_entry) {
+			throw InternalException("Cannot refresh an operator that is not indexed");
+		}
+		for (idx_t child_idx = 0; child_idx < parent.children.size(); child_idx++) {
+			auto &child = parent.children[child_idx];
+			if (!child) {
+				throw InternalException("Cannot refresh an operator with a null child");
+			}
+			auto child_entry = GetEntry(*child);
+			if (!child_entry || child_entry->owner_parent.get() != &parent ||
+			    child_entry->owner_child_index != child_idx) {
+				throw InternalException("Logical plan ownership changed outside its indexed mutator");
+			}
+			const bool should_link = IsFlowChild(parent, child_idx);
+			const bool is_linked = child_entry->flow_parent.get() == &parent;
+			if (child_entry->flow_parent && !is_linked) {
+				throw InternalException("Logical plan flow child already has another parent");
+			}
+			if (is_linked && !should_link) {
+				const bool cut = forest.CutFromParent(child_entry->forest_node);
+				D_ASSERT(cut);
+				child_entry->flow_parent = nullptr;
+				child_entry->flow_child_index = DConstants::INVALID_INDEX;
+			} else if (!is_linked && should_link) {
+				child_entry->flow_parent = parent;
+				child_entry->flow_child_index = child_idx;
+				const bool linked = forest.Link(child_entry->forest_node, parent_entry->forest_node,
+				                                ToForestValue(child_entry->edge_to_parent));
+				if (!linked) {
+					throw InternalException("Cannot create a cyclic logical plan flow edge");
+				}
+			} else if (is_linked) {
+				child_entry->flow_child_index = child_idx;
+				const bool updated =
+				    forest.SetEdgeValue(child_entry->forest_node, ToForestValue(child_entry->edge_to_parent));
+				D_ASSERT(updated);
+			}
+		}
+	}
+
+	void RefreshOperator(LogicalOperator &op) {
+		auto entry = GetEntry(op);
+		if (!entry) {
+			throw InternalException("Cannot refresh an operator that is not indexed");
+		}
+		LogicalPlanDataFlowMetadata metadata;
+		if (!GetMetadata(op, metadata)) {
+			throw InternalException("Cannot refresh invalid logical plan operator metadata");
+		}
+		for (auto table_index : metadata.produced_table_indexes) {
+			auto source = binding_sources.find(table_index);
+			if (source != binding_sources.end() && &source->second.get() != &op) {
+				throw InternalException("Cannot refresh duplicate logical plan table index %llu", table_index.index);
+			}
+		}
+		if (metadata.cte_producer_index.IsValid()) {
+			auto lineage = cte_lineage.find(metadata.cte_producer_index);
+			if (lineage != cte_lineage.end() && lineage->second.producer_owner &&
+			    lineage->second.producer_owner.get() != &op) {
+				throw InternalException("Cannot refresh duplicate logical plan CTE producer %llu",
+				                        metadata.cte_producer_index.index);
+			}
+		}
+		RemoveContributions(*entry);
+		const bool added = AddContributions(*entry, std::move(metadata));
+		D_ASSERT(added);
+		entry->opaque = IsOpaque(op);
+		entry->node_value = GetNodeValue(op);
+		forest.SetNodeValue(entry->forest_node, ToForestValue(entry->node_value));
+		RefreshFlowChildren(op);
+	}
+
+	void ValidateChildren(LogicalOperator &parent) const {
+		if (!GetEntry(parent)) {
+			throw InternalException("Cannot mutate children of an operator that is not indexed");
+		}
+		for (idx_t child_idx = 0; child_idx < parent.children.size(); child_idx++) {
+			auto &child = parent.children[child_idx];
+			if (!child) {
+				throw InternalException("Cannot mutate an operator with a null child");
+			}
+			auto child_entry = GetEntry(*child);
+			if (!child_entry || child_entry->owner_parent.get() != &parent ||
+			    child_entry->owner_child_index != child_idx) {
+				throw InternalException("Logical plan ownership changed outside its indexed mutator");
+			}
+		}
+	}
+
+	void ValidateStructuralMutation(LogicalOperator &parent, idx_t future_child_count) const {
+		ValidateChildren(parent);
+		ValidateFutureChildCount(parent, future_child_count);
+		LogicalPlanDataFlowMetadata metadata;
+		auto entry = GetEntry(parent);
+		if (!GetMetadata(parent, metadata) || metadata.produced_table_indexes != entry->produced_table_indexes ||
+		    metadata.cte_producer_index != entry->cte_producer_index || metadata.cte_producer != entry->cte_producer ||
+		    metadata.cte_reader_index != entry->cte_reader_index ||
+		    metadata.binding_uses.size() != entry->binding_uses.size()) {
+			throw InternalException("Logical plan operator metadata changed without RefreshOperator");
+		}
+		for (idx_t use_idx = 0; use_idx < metadata.binding_uses.size(); use_idx++) {
+			auto &expected = metadata.binding_uses[use_idx];
+			auto &actual = entry->binding_uses[use_idx];
+			if (expected.binding != actual.binding || expected.depth != actual.depth ||
+			    &expected.consumer.get() != &actual.consumer.get()) {
+				throw InternalException("Logical plan operator expressions changed without RefreshOperator");
+			}
+		}
+	}
+
+	void ValidateFutureChildCount(const LogicalOperator &parent, idx_t future_child_count) const {
+		if (parent.type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
+			throw InternalException("Cannot incrementally mutate children of an opaque extension operator");
+		}
+		if (parent.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE && future_child_count != 2) {
+			throw InternalException("A materialized CTE must retain its producer and continuation children");
+		}
+	}
+
+	bool SupportsParentInsertion(const LogicalOperator &op) const {
+		switch (op.type) {
+		case LogicalOperatorType::LOGICAL_JOIN:
+		case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+		case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+		case LogicalOperatorType::LOGICAL_ANY_JOIN:
+		case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+		case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN:
+		case LogicalOperatorType::LOGICAL_ASOF_JOIN:
+		case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
+		case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	void ValidateAttachChild(LogicalOperator &parent, idx_t child_index, LogicalOperator &subtree) const {
+		ValidateChildren(parent);
+		if (child_index > parent.children.size()) {
+			throw InternalException("Cannot attach logical plan child index %llu", child_index);
+		}
+		auto subtree_entry = GetEntry(subtree);
+		if (!subtree_entry || subtree_entry->owner_parent) {
+			throw InternalException("Can only attach the root of a detached indexed subtree");
+		}
+		for (auto current = GetEntry(parent); current;
+		     current = current->owner_parent ? GetEntry(*current->owner_parent) : nullptr) {
+			if (&current->op.get() == &subtree) {
+				throw InternalException("Cannot create a cycle in logical plan ownership");
+			}
+		}
+	}
+
+	unique_ptr<LogicalOperator> DetachChild(LogicalOperator &parent, idx_t child_index, bool refresh_parent) {
+		ValidateChildren(parent);
+		if (child_index >= parent.children.size()) {
+			throw InternalException("Cannot detach logical plan child index %llu", child_index);
+		}
+		auto &child = *parent.children[child_index];
+		auto child_entry = GetEntry(child);
+		if (child_entry->flow_parent.get() == &parent) {
+			const bool cut = forest.CutFromParent(child_entry->forest_node);
+			D_ASSERT(cut);
+			child_entry->flow_parent = nullptr;
+			child_entry->flow_child_index = DConstants::INVALID_INDEX;
+		}
+		auto result = std::move(parent.children[child_index]);
+		parent.children.erase(parent.children.begin() + NumericCast<int64_t>(child_index));
+		child_entry->owner_parent = nullptr;
+		child_entry->owner_child_index = DConstants::INVALID_INDEX;
+		for (idx_t shifted_idx = child_index; shifted_idx < parent.children.size(); shifted_idx++) {
+			auto shifted_entry = GetEntry(*parent.children[shifted_idx]);
+			D_ASSERT(shifted_entry);
+			shifted_entry->owner_child_index = shifted_idx;
+			if (shifted_entry->flow_parent.get() == &parent) {
+				shifted_entry->flow_child_index = shifted_idx;
+			}
+		}
+		if (refresh_parent) {
+			RefreshOperator(parent);
+		}
+		return result;
+	}
+
+	void AttachChild(LogicalOperator &parent, idx_t child_index, unique_ptr<LogicalOperator> subtree,
+	                 bool refresh_parent) {
+		if (!subtree) {
+			throw InternalException("Cannot attach logical plan child index %llu", child_index);
+		}
+		ValidateAttachChild(parent, child_index, *subtree);
+		parent.children.insert(parent.children.begin() + NumericCast<int64_t>(child_index), std::move(subtree));
+		for (idx_t shifted_idx = child_index; shifted_idx < parent.children.size(); shifted_idx++) {
+			auto shifted_entry = GetEntry(*parent.children[shifted_idx]);
+			D_ASSERT(shifted_entry);
+			shifted_entry->owner_parent = parent;
+			shifted_entry->owner_child_index = shifted_idx;
+			if (shifted_entry->flow_parent.get() == &parent) {
+				shifted_entry->flow_child_index = shifted_idx;
+			}
+		}
+		if (refresh_parent) {
+			RefreshOperator(parent);
 		}
 	}
 
@@ -476,15 +948,15 @@ public:
 		if (FlowRoot(left) != FlowRoot(right)) {
 			return nullptr;
 		}
-		unordered_set<LogicalOperator *> left_path;
+		reference_set_t<LogicalOperator> left_path;
 		auto current = optional_ptr<LogicalPlanDataFlowEntry>(left);
 		while (current) {
-			left_path.insert(&current->op.get());
+			left_path.insert(current->op);
 			current = current->flow_parent ? GetEntry(*current->flow_parent) : nullptr;
 		}
 		current = right;
 		while (current) {
-			if (left_path.find(&current->op.get()) != left_path.end()) {
+			if (left_path.find(current->op) != left_path.end()) {
 				return current;
 			}
 			current = current->flow_parent ? GetEntry(*current->flow_parent) : nullptr;
@@ -510,14 +982,14 @@ public:
 	}
 
 	LogicalPlanDataFlowStatus BoundaryBetween(LogicalPlanDataFlowEntry &left, LogicalPlanDataFlowEntry &right) const {
-		unordered_set<LogicalOperator *> left_path;
+		reference_set_t<LogicalOperator> left_path;
 		auto current = optional_ptr<LogicalPlanDataFlowEntry>(left);
 		while (current) {
-			left_path.insert(&current->op.get());
+			left_path.insert(current->op);
 			current = current->owner_parent ? GetEntry(*current->owner_parent) : nullptr;
 		}
 		auto right_cursor = optional_ptr<LogicalPlanDataFlowEntry>(right);
-		while (right_cursor && left_path.find(&right_cursor->op.get()) == left_path.end()) {
+		while (right_cursor && left_path.find(right_cursor->op) == left_path.end()) {
 			right_cursor = right_cursor->owner_parent ? GetEntry(*right_cursor->owner_parent) : nullptr;
 		}
 		auto ownership_lca = right_cursor;
@@ -654,7 +1126,8 @@ public:
 	}
 };
 
-LogicalPlanDataFlow::LogicalPlanDataFlow(LogicalOperator &root) : state(make_uniq<LogicalPlanDataFlowState>(root)) {
+LogicalPlanDataFlow::LogicalPlanDataFlow(LogicalOperator &root)
+    : state(make_shared_ptr<LogicalPlanDataFlowState>(root)) {
 }
 
 LogicalPlanDataFlow::~LogicalPlanDataFlow() {
@@ -673,7 +1146,7 @@ LogicalPlanDataFlowOperatorResult LogicalPlanDataFlow::ResolveSource(const Colum
 	if (source == state->binding_sources.end()) {
 		return {LogicalPlanDataFlowStatus::BINDING_NOT_FOUND, nullptr};
 	}
-	auto source_entry = state->GetEntry(*source->second);
+	auto source_entry = state->GetEntry(source->second.get());
 	if (!source_entry) {
 		return {LogicalPlanDataFlowStatus::OPERATOR_NOT_INDEXED, nullptr};
 	}
@@ -696,7 +1169,7 @@ LogicalPlanDataFlowOperatorResult LogicalPlanDataFlow::ResolveSource(const Colum
 			return {LogicalPlanDataFlowStatus::BINDING_NOT_AVAILABLE, nullptr};
 		}
 	}
-	return {LogicalPlanDataFlowStatus::SUCCESS, source->second};
+	return {LogicalPlanDataFlowStatus::SUCCESS, source->second.get()};
 }
 
 LogicalPlanDataFlowParentResult LogicalPlanDataFlow::GetOwnershipParent(LogicalOperator &op) const {
@@ -800,6 +1273,9 @@ LogicalPlanDataFlowReadersResult LogicalPlanDataFlow::GetCTEReaders(TableIndex c
 }
 
 const vector<LogicalPlanBindingUse> &LogicalPlanDataFlow::GetBindingUses() const {
+	if (state->binding_uses_dirty) {
+		state->RebuildBindingUses();
+	}
 	return state->binding_uses;
 }
 
@@ -808,14 +1284,26 @@ idx_t LogicalPlanDataFlow::OperatorCount() const {
 }
 
 bool LogicalPlanDataFlow::Verify() const {
-	if (!state->valid || state->entries.empty() || &state->entries[0]->op.get() != &state->root.get()) {
+	if (!state->valid || state->entries.empty() || !state->root || !state->GetEntry(*state->root)) {
 		return false;
 	}
+	if (state->binding_uses_dirty) {
+		state->RebuildBindingUses();
+	}
 	idx_t ownership_count = 0;
-	vector<reference<LogicalOperator>> pending {state->root};
+	reference_set_t<LogicalOperator> visited;
+	vector<reference<LogicalOperator>> pending;
+	for (auto &entry_pair : state->entries) {
+		if (!entry_pair.second->owner_parent) {
+			pending.push_back(entry_pair.second->op);
+		}
+	}
 	while (!pending.empty()) {
 		auto op = pending.back();
 		pending.pop_back();
+		if (!visited.insert(op).second) {
+			return false;
+		}
 		auto entry = state->GetEntry(op);
 		if (!entry) {
 			return false;
@@ -840,7 +1328,67 @@ bool LogicalPlanDataFlow::Verify() const {
 	if (ownership_count != state->entries.size()) {
 		return false;
 	}
-	for (auto &entry : state->entries) {
+	idx_t produced_index_count = 0;
+	idx_t cte_producer_count = 0;
+	idx_t cte_reader_count = 0;
+	idx_t binding_use_count = 0;
+	for (auto &entry_pair : state->entries) {
+		auto &entry = *entry_pair.second;
+		LogicalPlanDataFlowMetadata metadata;
+		if (!state->GetMetadata(entry.op, metadata) ||
+		    metadata.produced_table_indexes != entry.produced_table_indexes ||
+		    metadata.cte_producer_index != entry.cte_producer_index || metadata.cte_producer != entry.cte_producer ||
+		    metadata.cte_reader_index != entry.cte_reader_index ||
+		    metadata.binding_uses.size() != entry.binding_uses.size()) {
+			return false;
+		}
+		for (idx_t use_idx = 0; use_idx < metadata.binding_uses.size(); use_idx++) {
+			auto &expected = metadata.binding_uses[use_idx];
+			auto &actual = entry.binding_uses[use_idx];
+			if (expected.binding != actual.binding || expected.depth != actual.depth ||
+			    &expected.consumer.get() != &actual.consumer.get()) {
+				return false;
+			}
+		}
+		for (auto table_index : entry.produced_table_indexes) {
+			auto source = state->binding_sources.find(table_index);
+			if (source == state->binding_sources.end() || &source->second.get() != &entry.op.get()) {
+				return false;
+			}
+			produced_index_count++;
+		}
+		if (entry.cte_producer_index.IsValid()) {
+			auto lineage = state->cte_lineage.find(entry.cte_producer_index);
+			if (lineage == state->cte_lineage.end() || lineage->second.producer_owner.get() != &entry.op.get() ||
+			    lineage->second.producer != entry.cte_producer) {
+				return false;
+			}
+			cte_producer_count++;
+		}
+		if (entry.cte_reader_index.IsValid()) {
+			auto lineage = state->cte_lineage.find(entry.cte_reader_index);
+			if (lineage == state->cte_lineage.end() ||
+			    std::none_of(
+			        lineage->second.readers.begin(), lineage->second.readers.end(),
+			        [&](const reference<LogicalOperator> &reader) { return &reader.get() == &entry.op.get(); })) {
+				return false;
+			}
+			cte_reader_count++;
+		}
+		binding_use_count += entry.binding_uses.size();
+	}
+	idx_t actual_cte_producers = 0;
+	idx_t actual_cte_readers = 0;
+	for (auto &lineage : state->cte_lineage) {
+		actual_cte_producers += lineage.second.producer ? 1 : 0;
+		actual_cte_readers += lineage.second.readers.size();
+	}
+	if (produced_index_count != state->binding_sources.size() || cte_producer_count != actual_cte_producers ||
+	    cte_reader_count != actual_cte_readers || binding_use_count != state->binding_uses.size()) {
+		return false;
+	}
+	for (auto &entry_pair : state->entries) {
+		auto &entry = entry_pair.second;
 		auto represented_parent = state->forest.GetRepresentedParent(entry->forest_node);
 		auto forest_parent = represented_parent ? state->GetForestOperator(*represented_parent) : nullptr;
 		if (forest_parent != entry->flow_parent) {
@@ -861,8 +1409,10 @@ bool LogicalPlanDataFlow::Verify() const {
 	}
 	constexpr idx_t ALL_PAIRS_LIMIT = 128;
 	if (state->entries.size() <= ALL_PAIRS_LIMIT) {
-		for (auto &left : state->entries) {
-			for (auto &right : state->entries) {
+		for (auto &left_pair : state->entries) {
+			auto &left = left_pair.second;
+			for (auto &right_pair : state->entries) {
+				auto &right = right_pair.second;
 				const bool expected_connected = state->FlowRoot(*left) == state->FlowRoot(*right);
 				if (state->forest.Connected(left->forest_node, right->forest_node) != expected_connected) {
 					return false;
@@ -911,6 +1461,450 @@ bool LogicalPlanDataFlow::Verify() const {
 		}
 	}
 	return true;
+}
+
+LogicalPlanDataFlowDetachedSubtree::LogicalPlanDataFlowDetachedSubtree(
+    const shared_ptr<LogicalPlanDataFlowState> &state_p, unique_ptr<LogicalOperator> subtree_p)
+    : state(state_p), subtree(std::move(subtree_p)) {
+}
+
+LogicalPlanDataFlowDetachedSubtree::~LogicalPlanDataFlowDetachedSubtree() {
+	Reset();
+}
+
+LogicalPlanDataFlowDetachedSubtree::LogicalPlanDataFlowDetachedSubtree(
+    LogicalPlanDataFlowDetachedSubtree &&other) noexcept
+    : state(std::move(other.state)), subtree(std::move(other.subtree)) {
+}
+
+LogicalPlanDataFlowDetachedSubtree &
+LogicalPlanDataFlowDetachedSubtree::operator=(LogicalPlanDataFlowDetachedSubtree &&other) noexcept {
+	if (this != &other) {
+		Reset();
+		state = std::move(other.state);
+		subtree = std::move(other.subtree);
+	}
+	return *this;
+}
+
+LogicalPlanDataFlowDetachedSubtree::operator bool() const {
+	return subtree != nullptr;
+}
+
+LogicalOperator &LogicalPlanDataFlowDetachedSubtree::Get() {
+	if (!subtree) {
+		throw InternalException("Cannot access an empty detached logical plan subtree");
+	}
+	return *subtree;
+}
+
+void LogicalPlanDataFlowDetachedSubtree::Reset() {
+	if (!subtree) {
+		return;
+	}
+	auto current_state = state.lock();
+	if (current_state) {
+		current_state->UnregisterSubtree(*subtree);
+	}
+	subtree.reset();
+	state.reset();
+}
+
+LogicalPlanDataFlowMutator::LogicalPlanDataFlowMutator(LogicalPlanDataFlow &data_flow_p) : data_flow(data_flow_p) {
+	D_ASSERT(data_flow.Verify());
+}
+
+LogicalPlanDataFlowDetachedSubtree LogicalPlanDataFlowMutator::RegisterSubtree(unique_ptr<LogicalOperator> subtree) {
+	if (!subtree) {
+		throw InternalException("Cannot register a null logical plan subtree");
+	}
+	data_flow.state->RegisterSubtree(*subtree);
+	D_ASSERT(data_flow.Verify());
+	return LogicalPlanDataFlowDetachedSubtree(data_flow.state, std::move(subtree));
+}
+
+unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::UnregisterSubtree(LogicalPlanDataFlowDetachedSubtree subtree) {
+	auto subtree_state = subtree.state.lock();
+	if (!subtree.subtree || subtree_state.get() != data_flow.state.get()) {
+		throw InternalException("Cannot unregister a subtree belonging to another logical plan data flow");
+	}
+	data_flow.state->UnregisterSubtree(*subtree.subtree);
+	auto result = std::move(subtree.subtree);
+	subtree.state.reset();
+	D_ASSERT(data_flow.Verify());
+	return result;
+}
+
+struct LogicalPlanDataFlowSlot {
+	optional_ptr<LogicalOperator> parent;
+	idx_t child_index = DConstants::INVALID_INDEX;
+	bool is_root = false;
+};
+
+static LogicalPlanDataFlowSlot GetMutationSlot(LogicalPlanDataFlowState &state, unique_ptr<LogicalOperator> &slot) {
+	if (!slot) {
+		throw InternalException("Cannot mutate a null logical plan slot");
+	}
+	auto entry = state.GetEntry(*slot);
+	if (!entry) {
+		throw InternalException("Cannot mutate a logical plan slot that is not indexed");
+	}
+	if (!entry->owner_parent) {
+		if (state.root.get() != slot.get()) {
+			throw InternalException("Cannot mutate a detached logical plan slot directly");
+		}
+		return {nullptr, DConstants::INVALID_INDEX, true};
+	}
+	auto &parent = *entry->owner_parent;
+	if (entry->owner_child_index >= parent.children.size() || &parent.children[entry->owner_child_index] != &slot) {
+		throw InternalException("Logical plan ownership changed outside its indexed mutator");
+	}
+	return {parent, entry->owner_child_index, false};
+}
+
+LogicalPlanDataFlowDetachedSubtree LogicalPlanDataFlowMutator::DetachChild(LogicalOperator &parent, idx_t child_index) {
+	if (child_index >= parent.children.size()) {
+		throw InternalException("Cannot detach logical plan child index %llu", child_index);
+	}
+	data_flow.state->ValidateStructuralMutation(parent, parent.children.size() - 1);
+	auto subtree = data_flow.state->DetachChild(parent, child_index, false);
+	data_flow.state->RefreshOperator(parent);
+	return LogicalPlanDataFlowDetachedSubtree(data_flow.state, std::move(subtree));
+}
+
+void LogicalPlanDataFlowMutator::AttachChild(LogicalOperator &parent, idx_t child_index,
+                                             LogicalPlanDataFlowDetachedSubtree subtree) {
+	auto subtree_state = subtree.state.lock();
+	if (!subtree.subtree || subtree_state.get() != data_flow.state.get()) {
+		throw InternalException("Cannot attach a subtree belonging to another logical plan data flow");
+	}
+	data_flow.state->ValidateStructuralMutation(parent, parent.children.size() + 1);
+	data_flow.state->ValidateAttachChild(parent, child_index, *subtree.subtree);
+	auto owned_subtree = std::move(subtree.subtree);
+	data_flow.state->AttachChild(parent, child_index, std::move(owned_subtree), false);
+	data_flow.state->RefreshOperator(parent);
+	subtree.state.reset();
+	D_ASSERT(data_flow.Verify());
+}
+
+void LogicalPlanDataFlowMutator::AttachChild(LogicalOperator &parent, idx_t child_index,
+                                             unique_ptr<LogicalOperator> subtree) {
+	auto detached = RegisterSubtree(std::move(subtree));
+	AttachChild(parent, child_index, std::move(detached));
+}
+
+unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::EraseChild(LogicalOperator &parent, idx_t child_index) {
+	if (child_index >= parent.children.size()) {
+		throw InternalException("Cannot erase logical plan child index %llu", child_index);
+	}
+	data_flow.state->ValidateStructuralMutation(parent, parent.children.size() - 1);
+	auto subtree = data_flow.state->DetachChild(parent, child_index, false);
+	data_flow.state->RefreshOperator(parent);
+	data_flow.state->UnregisterSubtree(*subtree);
+	D_ASSERT(data_flow.Verify());
+	return subtree;
+}
+
+unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::ReplaceSubtree(unique_ptr<LogicalOperator> &slot,
+                                                                       unique_ptr<LogicalOperator> replacement) {
+	if (!replacement) {
+		throw InternalException("Cannot replace a logical plan subtree with null");
+	}
+	auto location = GetMutationSlot(*data_flow.state, slot);
+	if (!location.is_root) {
+		data_flow.state->ValidateStructuralMutation(*location.parent, location.parent->children.size());
+	}
+	reference_set_t<const LogicalOperator> replaced_operators;
+	vector<reference<LogicalOperator>> pending {*slot};
+	while (!pending.empty()) {
+		auto op = pending.back();
+		pending.pop_back();
+		replaced_operators.insert(op);
+		for (auto &child : op.get().children) {
+			pending.push_back(*child);
+		}
+	}
+	data_flow.state->ValidateNewSubtree(*replacement, replaced_operators);
+	unique_ptr<LogicalOperator> old_subtree;
+	if (location.is_root) {
+		old_subtree = std::move(slot);
+		data_flow.state->root = nullptr;
+	} else {
+		old_subtree = data_flow.state->DetachChild(*location.parent, location.child_index, false);
+	}
+	data_flow.state->UnregisterSubtree(*old_subtree);
+	data_flow.state->RegisterSubtree(*replacement);
+	if (location.is_root) {
+		slot = std::move(replacement);
+		data_flow.state->root = slot.get();
+	} else {
+		data_flow.state->AttachChild(*location.parent, location.child_index, std::move(replacement), false);
+		data_flow.state->RefreshOperator(*location.parent);
+	}
+	D_ASSERT(data_flow.Verify());
+	return old_subtree;
+}
+
+unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::ReplaceOperator(unique_ptr<LogicalOperator> &slot,
+                                                                        unique_ptr<LogicalOperator> replacement) {
+	if (!replacement || !replacement->children.empty()) {
+		throw InternalException("Indexed operator replacement requires a childless replacement");
+	}
+	auto location = GetMutationSlot(*data_flow.state, slot);
+	data_flow.state->ValidateStructuralMutation(*slot, slot->children.size());
+	data_flow.state->ValidateFutureChildCount(*replacement, slot->children.size());
+	if (!location.is_root) {
+		data_flow.state->ValidateStructuralMutation(*location.parent, location.parent->children.size());
+	}
+	reference_set_t<const LogicalOperator> replaced_operators;
+	replaced_operators.insert(reference<const LogicalOperator>(*slot));
+	data_flow.state->ValidateNewSubtree(*replacement, replaced_operators);
+
+	unique_ptr<LogicalOperator> old_operator;
+	if (location.is_root) {
+		old_operator = std::move(slot);
+		data_flow.state->root = nullptr;
+	} else {
+		old_operator = data_flow.state->DetachChild(*location.parent, location.child_index, false);
+	}
+	vector<unique_ptr<LogicalOperator>> children;
+	children.reserve(old_operator->children.size());
+	while (!old_operator->children.empty()) {
+		children.push_back(data_flow.state->DetachChild(*old_operator, 0, false));
+	}
+	data_flow.state->UnregisterSubtree(*old_operator);
+	data_flow.state->RegisterSubtree(*replacement);
+	for (auto &child : children) {
+		data_flow.state->AttachChild(*replacement, replacement->children.size(), std::move(child), false);
+	}
+	data_flow.state->RefreshOperator(*replacement);
+	if (location.is_root) {
+		slot = std::move(replacement);
+		data_flow.state->root = slot.get();
+	} else {
+		data_flow.state->AttachChild(*location.parent, location.child_index, std::move(replacement), false);
+		data_flow.state->RefreshOperator(*location.parent);
+	}
+	D_ASSERT(data_flow.Verify());
+	return old_operator;
+}
+
+unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::PromoteChild(unique_ptr<LogicalOperator> &slot,
+                                                                     idx_t child_index) {
+	auto location = GetMutationSlot(*data_flow.state, slot);
+	if (child_index >= slot->children.size()) {
+		throw InternalException("Cannot promote logical plan child index %llu", child_index);
+	}
+	data_flow.state->ValidateStructuralMutation(*slot, 0);
+	if (!location.is_root) {
+		data_flow.state->ValidateStructuralMutation(*location.parent, location.parent->children.size());
+	}
+
+	unique_ptr<LogicalOperator> old_operator;
+	if (location.is_root) {
+		old_operator = std::move(slot);
+		data_flow.state->root = nullptr;
+	} else {
+		old_operator = data_flow.state->DetachChild(*location.parent, location.child_index, false);
+	}
+	auto promoted = data_flow.state->DetachChild(*old_operator, child_index, false);
+	while (!old_operator->children.empty()) {
+		auto discarded = data_flow.state->DetachChild(*old_operator, 0, false);
+		data_flow.state->UnregisterSubtree(*discarded);
+	}
+	data_flow.state->UnregisterSubtree(*old_operator);
+	if (location.is_root) {
+		slot = std::move(promoted);
+		data_flow.state->root = slot.get();
+	} else {
+		data_flow.state->AttachChild(*location.parent, location.child_index, std::move(promoted), false);
+		data_flow.state->RefreshOperator(*location.parent);
+	}
+	D_ASSERT(data_flow.Verify());
+	return old_operator;
+}
+
+void LogicalPlanDataFlowMutator::InsertUnary(unique_ptr<LogicalOperator> &slot, unique_ptr<LogicalOperator> wrapper) {
+	if (!wrapper || !wrapper->children.empty()) {
+		throw InternalException("Indexed unary insertion requires a childless wrapper");
+	}
+	auto location = GetMutationSlot(*data_flow.state, slot);
+	if (!data_flow.state->SupportsUnaryInsertion(*wrapper)) {
+		throw InternalException("Indexed unary insertion requires an operator with known child semantics");
+	}
+	if (!location.is_root) {
+		data_flow.state->ValidateStructuralMutation(*location.parent, location.parent->children.size());
+	}
+	data_flow.state->RegisterSubtree(*wrapper);
+	data_flow.state->ValidateStructuralMutation(*wrapper, 1);
+	unique_ptr<LogicalOperator> old_subtree;
+	if (location.is_root) {
+		old_subtree = std::move(slot);
+		data_flow.state->root = nullptr;
+	} else {
+		old_subtree = data_flow.state->DetachChild(*location.parent, location.child_index, false);
+	}
+	data_flow.state->AttachChild(*wrapper, 0, std::move(old_subtree), false);
+	data_flow.state->RefreshOperator(*wrapper);
+	if (location.is_root) {
+		slot = std::move(wrapper);
+		data_flow.state->root = slot.get();
+	} else {
+		data_flow.state->AttachChild(*location.parent, location.child_index, std::move(wrapper), false);
+		data_flow.state->RefreshOperator(*location.parent);
+	}
+	VerifyAfterMutation();
+}
+
+void LogicalPlanDataFlowMutator::InsertUnary(unique_ptr<LogicalOperator> &slot, unique_ptr<LogicalOperator> wrapper,
+                                             LogicalOperator &changed_parent) {
+	if (!wrapper || !wrapper->children.empty()) {
+		throw InternalException("Indexed unary insertion requires a childless wrapper");
+	}
+	auto location = GetMutationSlot(*data_flow.state, slot);
+	if (location.is_root || location.parent.get() != &changed_parent) {
+		throw InternalException("Changed operator must own the indexed unary insertion slot");
+	}
+	if (!data_flow.state->SupportsUnaryInsertion(*wrapper)) {
+		throw InternalException("Indexed unary insertion requires an operator with known child semantics");
+	}
+	data_flow.state->ValidateChildren(changed_parent);
+	data_flow.state->ValidateFutureChildCount(changed_parent, changed_parent.children.size());
+	LogicalPlanDataFlowMetadata parent_metadata;
+	data_flow.state->ValidateRefreshOperator(changed_parent, parent_metadata);
+	data_flow.state->RegisterSubtree(*wrapper);
+	data_flow.state->ValidateStructuralMutation(*wrapper, 1);
+	auto old_subtree = data_flow.state->DetachChild(changed_parent, location.child_index, false);
+	data_flow.state->AttachChild(*wrapper, 0, std::move(old_subtree), false);
+	data_flow.state->RefreshOperator(*wrapper);
+	data_flow.state->AttachChild(changed_parent, location.child_index, std::move(wrapper), false);
+	data_flow.state->RefreshOperator(changed_parent);
+	VerifyAfterMutation();
+}
+
+void LogicalPlanDataFlowMutator::InsertParent(unique_ptr<LogicalOperator> &slot, unique_ptr<LogicalOperator> parent,
+                                              idx_t child_index) {
+	if (!parent || parent->children.size() != 1 || child_index > 1) {
+		throw InternalException("Indexed parent insertion requires one fresh sibling and a valid child slot");
+	}
+	if (!data_flow.state->SupportsParentInsertion(*parent)) {
+		throw InternalException("Indexed parent insertion requires an operator with known binary child semantics");
+	}
+	auto location = GetMutationSlot(*data_flow.state, slot);
+	if (!location.is_root) {
+		data_flow.state->ValidateSlotReplacement(*location.parent);
+	}
+	data_flow.state->ValidateFutureChildCount(*parent, 2);
+	reference_set_t<const LogicalOperator> replaced_operators;
+	data_flow.state->ValidateNewSubtree(*parent->children[0], replaced_operators);
+
+	unique_ptr<LogicalOperator> old_subtree;
+	if (location.is_root) {
+		old_subtree = std::move(slot);
+		data_flow.state->root = nullptr;
+	} else {
+		old_subtree = data_flow.state->DetachChild(*location.parent, location.child_index, false);
+	}
+	data_flow.state->UnregisterSubtree(*old_subtree);
+	parent->children.insert(parent->children.begin() + NumericCast<int64_t>(child_index), std::move(old_subtree));
+	data_flow.state->RegisterSubtree(*parent);
+	if (location.is_root) {
+		slot = std::move(parent);
+		data_flow.state->root = slot.get();
+	} else {
+		data_flow.state->AttachChild(*location.parent, location.child_index, std::move(parent), false);
+		data_flow.state->RefreshOperator(*location.parent);
+	}
+	VerifyAfterMutation();
+}
+
+void LogicalPlanDataFlowMutator::RotateParentWithChild(unique_ptr<LogicalOperator> &slot, idx_t child_index,
+                                                       idx_t grandchild_index) {
+	auto location = GetMutationSlot(*data_flow.state, slot);
+	if (child_index >= slot->children.size()) {
+		throw InternalException("Cannot rotate logical plan child index %llu", child_index);
+	}
+	auto &child = *slot->children[child_index];
+	if (grandchild_index >= child.children.size()) {
+		throw InternalException("Cannot rotate logical plan grandchild index %llu", grandchild_index);
+	}
+	data_flow.state->ValidateStructuralMutation(*slot, slot->children.size());
+	data_flow.state->ValidateStructuralMutation(child, child.children.size());
+	if (!location.is_root) {
+		data_flow.state->ValidateSlotReplacement(*location.parent);
+	}
+
+	unique_ptr<LogicalOperator> old_parent;
+	if (location.is_root) {
+		old_parent = std::move(slot);
+		data_flow.state->root = nullptr;
+	} else {
+		old_parent = data_flow.state->DetachChild(*location.parent, location.child_index, false);
+	}
+	auto new_parent = data_flow.state->DetachChild(*old_parent, child_index, false);
+	auto replacement_child = data_flow.state->DetachChild(*new_parent, grandchild_index, false);
+	data_flow.state->AttachChild(*old_parent, child_index, std::move(replacement_child), false);
+	data_flow.state->RefreshOperator(*old_parent);
+	data_flow.state->AttachChild(*new_parent, grandchild_index, std::move(old_parent), false);
+	data_flow.state->RefreshOperator(*new_parent);
+	if (location.is_root) {
+		slot = std::move(new_parent);
+		data_flow.state->root = slot.get();
+	} else {
+		data_flow.state->AttachChild(*location.parent, location.child_index, std::move(new_parent), false);
+		data_flow.state->RefreshOperator(*location.parent);
+	}
+	VerifyAfterMutation();
+}
+
+unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::RemoveUnary(unique_ptr<LogicalOperator> &slot) {
+	auto location = GetMutationSlot(*data_flow.state, slot);
+	if (slot->children.size() != 1) {
+		throw InternalException("Indexed unary removal requires exactly one child");
+	}
+	auto &wrapper = *slot;
+	data_flow.state->ValidateStructuralMutation(wrapper, 0);
+	if (!location.is_root) {
+		data_flow.state->ValidateStructuralMutation(*location.parent, location.parent->children.size());
+	}
+	auto child = data_flow.state->DetachChild(wrapper, 0, false);
+	unique_ptr<LogicalOperator> removed;
+	if (location.is_root) {
+		removed = std::move(slot);
+		data_flow.state->root = nullptr;
+		slot = std::move(child);
+		data_flow.state->root = slot.get();
+	} else {
+		removed = data_flow.state->DetachChild(*location.parent, location.child_index, false);
+		data_flow.state->AttachChild(*location.parent, location.child_index, std::move(child), false);
+		data_flow.state->RefreshOperator(*location.parent);
+	}
+	data_flow.state->UnregisterSubtree(*removed);
+	D_ASSERT(data_flow.Verify());
+	return removed;
+}
+
+void LogicalPlanDataFlowMutator::SwapChildren(LogicalOperator &parent, idx_t left_index, idx_t right_index) {
+	data_flow.state->ValidateChildren(parent);
+	if (left_index >= parent.children.size() || right_index >= parent.children.size()) {
+		throw InternalException("Cannot swap logical plan child indexes %llu and %llu", left_index, right_index);
+	}
+	if (left_index == right_index) {
+		return;
+	}
+	data_flow.state->ValidateStructuralMutation(parent, parent.children.size());
+	std::swap(parent.children[left_index], parent.children[right_index]);
+	auto left_entry = data_flow.state->GetEntry(*parent.children[left_index]);
+	auto right_entry = data_flow.state->GetEntry(*parent.children[right_index]);
+	left_entry->owner_child_index = left_index;
+	right_entry->owner_child_index = right_index;
+	data_flow.state->RefreshOperator(parent);
+	D_ASSERT(data_flow.Verify());
+}
+
+void LogicalPlanDataFlowMutator::RefreshOperator(LogicalOperator &op) {
+	data_flow.state->RefreshOperator(op);
+	D_ASSERT(data_flow.Verify());
 }
 
 } // namespace duckdb

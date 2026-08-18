@@ -276,6 +276,7 @@ void ColumnBindingResolver::Verify(ClientContext &context, LogicalOperator &op) 
 	if (!Settings::Get<DebugVerifyColumnBindingsSetting>(context)) {
 		return;
 	}
+	LogicalOperatorVisitor::ValidateProjectionMaps(op);
 	op.ResolveOperatorTypes();
 	ColumnBindingResolver resolver(true);
 	resolver.VisitOperator(op);

@@ -1042,6 +1042,12 @@ bool GeneratedDedupRefEliminator::PreserveJoinAsSemi(unique_ptr<LogicalOperator>
 		generated_output_replacements.push_back(std::move(rewritten_expr));
 	}
 
+	ColumnBindingReplacer replacer;
+	replacement_bindings.AddTo(replacer);
+	replacer.stop_operator = join.get();
+	replacer.VisitOperator(rewrite_root);
+	ReplaceOperatorBindings(rewrite_root, dedup_ref->output_bindings, generated_output_replacements, join.get());
+
 	if (dedup_idx == 0) {
 		std::swap(comparison_join.children[0], comparison_join.children[1]);
 	}
@@ -1051,11 +1057,6 @@ bool GeneratedDedupRefEliminator::PreserveJoinAsSemi(unique_ptr<LogicalOperator>
 	comparison_join.right_projection_map.clear();
 	comparison_join.ResolveOperatorTypes();
 
-	ColumnBindingReplacer replacer;
-	replacement_bindings.AddTo(replacer);
-	replacer.stop_operator = join.get();
-	replacer.VisitOperator(rewrite_root);
-	ReplaceOperatorBindings(rewrite_root, dedup_ref->output_bindings, generated_output_replacements, join.get());
 	replacements.Merge(replacement_bindings);
 	MergeBindingExpressionReplacements(replacements, dedup_ref->output_bindings, generated_output_replacements);
 	return true;
@@ -1156,6 +1157,12 @@ bool GeneratedDedupRefEliminator::PreserveFilterCrossProductAsSemi(unique_ptr<Lo
 		generated_output_replacements.push_back(std::move(rewritten_expr));
 	}
 
+	ColumnBindingReplacer replacer;
+	replacement_bindings.AddTo(replacer);
+	replacer.stop_operator = filter_op.get();
+	replacer.VisitOperator(rewrite_root);
+	ReplaceOperatorBindings(rewrite_root, dedup_ref->output_bindings, generated_output_replacements, filter_op.get());
+
 	auto semi_join = make_uniq<LogicalComparisonJoin>(JoinType::SEMI);
 	semi_join->conditions = std::move(semi_conditions);
 	semi_join->children.push_back(std::move(cross_product.children[1 - dedup_idx]));
@@ -1171,11 +1178,6 @@ bool GeneratedDedupRefEliminator::PreserveFilterCrossProductAsSemi(unique_ptr<Lo
 	}
 
 	filter_op = std::move(replacement_op);
-	ColumnBindingReplacer replacer;
-	replacement_bindings.AddTo(replacer);
-	replacer.stop_operator = filter_op.get();
-	replacer.VisitOperator(rewrite_root);
-	ReplaceOperatorBindings(rewrite_root, dedup_ref->output_bindings, generated_output_replacements, filter_op.get());
 	replacements.Merge(replacement_bindings);
 	MergeBindingExpressionReplacements(replacements, dedup_ref->output_bindings, generated_output_replacements);
 	return true;
@@ -1297,6 +1299,12 @@ bool GeneratedDedupRefEliminator::RemoveJoin(unique_ptr<LogicalOperator> &join, 
 		}
 	}
 
+	ColumnBindingReplacer replacer;
+	replacement_bindings.AddTo(replacer);
+	replacer.stop_operator = join.get();
+	replacer.VisitOperator(rewrite_root);
+	ReplaceOperatorBindings(rewrite_root, dedup_ref->output_bindings, generated_output_replacements, join.get());
+
 	unique_ptr<LogicalOperator> replacement_op = std::move(comparison_join.children[1 - dedup_idx]);
 	if (!filter_expressions.empty()) {
 		auto new_filter = make_uniq<LogicalFilter>();
@@ -1307,10 +1315,6 @@ bool GeneratedDedupRefEliminator::RemoveJoin(unique_ptr<LogicalOperator> &join, 
 
 	join = std::move(replacement_op);
 
-	ColumnBindingReplacer replacer;
-	replacement_bindings.AddTo(replacer);
-	replacer.VisitOperator(rewrite_root);
-	ReplaceOperatorBindings(rewrite_root, dedup_ref->output_bindings, generated_output_replacements);
 	replacements.Merge(replacement_bindings);
 	MergeBindingExpressionReplacements(replacements, dedup_ref->output_bindings, generated_output_replacements);
 	return true;
@@ -1413,6 +1417,11 @@ bool GeneratedDedupRefEliminator::RemoveFilterCrossProduct(unique_ptr<LogicalOpe
 		return false;
 	}
 
+	ColumnBindingReplacer replacer;
+	replacement_bindings.AddTo(replacer);
+	replacer.stop_operator = filter_op.get();
+	replacer.VisitOperator(rewrite_root);
+
 	unique_ptr<LogicalOperator> replacement_op = std::move(cross_product.children[1 - dedup_idx]);
 	for (idx_t expr_idx = 0; expr_idx < filter.expressions.size(); expr_idx++) {
 		if (!consumed[expr_idx]) {
@@ -1428,9 +1437,6 @@ bool GeneratedDedupRefEliminator::RemoveFilterCrossProduct(unique_ptr<LogicalOpe
 
 	filter_op = std::move(replacement_op);
 
-	ColumnBindingReplacer replacer;
-	replacement_bindings.AddTo(replacer);
-	replacer.VisitOperator(rewrite_root);
 	replacements.Merge(replacement_bindings);
 	return true;
 }

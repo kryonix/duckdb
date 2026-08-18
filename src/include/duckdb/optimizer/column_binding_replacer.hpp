@@ -15,6 +15,8 @@ namespace duckdb {
 class BoundColumnRefExpression;
 class BoundSubqueryExpression;
 class ColumnBindingReplacer;
+class LogicalPlanDataFlow;
+class LogicalPlanDataFlowMutator;
 
 struct ReplacementBinding {
 public:
@@ -92,13 +94,37 @@ protected:
 //! Applies binding replacements together with their projection-layout invariants.
 class ColumnBindingRewrite {
 public:
+	//! Preserve the projected binding identities after one child output is rewritten.
+	static void RemapProjectionMap(LogicalOperator &op, idx_t child_index,
+	                               const vector<ColumnBinding> &old_child_bindings,
+	                               const BindingReplacementGraph &replacements);
+	//! Preserve reachable identities while allowing a pruning rewrite to remove dead selections.
+	static void RemapPrunedProjectionMap(LogicalOperator &op, idx_t child_index,
+	                                     const vector<ColumnBinding> &old_child_bindings,
+	                                     const BindingReplacementGraph &replacements);
 	//! Apply the output-boundary view of a complete replacement graph to one parent-child edge.
 	static void ApplyToChild(unique_ptr<LogicalOperator> &op, idx_t child_index,
 	                         vector<ColumnBinding> old_child_bindings, const BindingReplacementGraph &replacements);
+	static void ApplyToChild(LogicalOperator &op, idx_t child_index, vector<ColumnBinding> old_child_bindings,
+	                         const BindingReplacementGraph &replacements);
 	static void ApplyToOperatorBindings(LogicalOperator &op, const BindingReplacementGraph &replacements);
 	//! Verify that every previous public output binding is still reachable at the rewritten output boundary.
 	static void ValidateOutput(const vector<ColumnBinding> &old_output, const vector<ColumnBinding> &new_output,
 	                           const BindingReplacementGraph &replacements);
+	//! Replace one indexed subtree and preserve binding identities through every ownership ancestor.
+	static unique_ptr<LogicalOperator> ReplaceSubtreeAndRewriteBindings(LogicalPlanDataFlow &data_flow,
+	                                                                    LogicalPlanDataFlowMutator &mutator,
+	                                                                    unique_ptr<LogicalOperator> &slot,
+	                                                                    unique_ptr<LogicalOperator> replacement,
+	                                                                    const BindingReplacementGraph &replacements);
+	static unique_ptr<LogicalOperator> PromoteChildAndRewriteBindings(LogicalPlanDataFlow &data_flow,
+	                                                                  LogicalPlanDataFlowMutator &mutator,
+	                                                                  unique_ptr<LogicalOperator> &slot,
+	                                                                  idx_t child_index,
+	                                                                  const BindingReplacementGraph &replacements);
+	static void InsertUnaryAndRewriteBindings(LogicalPlanDataFlow &data_flow, LogicalPlanDataFlowMutator &mutator,
+	                                          unique_ptr<LogicalOperator> &slot, unique_ptr<LogicalOperator> wrapper,
+	                                          const BindingReplacementGraph &replacements);
 
 private:
 	static void RemapProjectionMapStrict(vector<ProjectionIndex> &projection_map,

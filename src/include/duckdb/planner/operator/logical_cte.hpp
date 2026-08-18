@@ -31,6 +31,13 @@ public:
 		children.push_back(std::move(top));
 		children.push_back(std::move(bottom));
 	}
+	explicit LogicalCTE(Identifier ctename_p, TableIndex table_index, idx_t column_count,
+	                    unique_ptr<LogicalOperator> top,
+	                    LogicalOperatorType logical_type = LogicalOperatorType::LOGICAL_INVALID)
+	    : LogicalOperator(logical_type), ctename(std::move(ctename_p)), table_index(table_index),
+	      column_count(column_count) {
+		children.push_back(std::move(top));
+	}
 
 	Identifier ctename;
 	TableIndex table_index;

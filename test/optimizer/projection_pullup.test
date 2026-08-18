@@ -234,4 +234,34 @@ SELECT a3 FROM (SELECT a2 AS a3 FROM (SELECT a1 AS a2 FROM (SELECT a AS a1 FROM 
 2
 4
 
+# Alternate removable column-reference projections with a computed projection in one branch.
+query I
+SELECT SUM(z)
+FROM (
+	SELECT y AS z
+	FROM (
+		SELECT x + 1 AS y
+		FROM (SELECT i AS x FROM range(5) source(i)) projected
+		WHERE x >= 0
+	) computed
+	WHERE y < 4
+) renamed;
+----
+6
+
+# Keep one indexed rewrite context across independent computed projection relocations.
+query I
+SELECT SUM(value)
+FROM (
+	SELECT computed AS value
+	FROM (SELECT i, i + 1 AS computed FROM range(3) first_source(i)) first_projection
+	WHERE i >= 0
+	UNION ALL
+	SELECT computed AS value
+	FROM (SELECT i, i + 10 AS computed FROM range(3) second_source(i)) second_projection
+	WHERE i >= 0
+) branches;
+----
+39
+
 endloop

@@ -3,11 +3,22 @@
 #include "duckdb/parser/expression_map.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/optimizer/column_binding_replacer.hpp"
 
 namespace duckdb {
 
 void CommonAggregateOptimizer::StandardVisitOperator(LogicalOperator &op) {
-	VisitOperatorChildren(op);
+	for (idx_t child_index = 0; child_index < op.children.size(); child_index++) {
+		auto old_child_bindings = op.children[child_index]->GetColumnBindings();
+		VisitOperator(*op.children[child_index]);
+		if (op.HasProjectionMap()) {
+			BindingReplacementGraph replacements;
+			for (auto &entry : aggregate_map) {
+				replacements.Add(entry.first, entry.second);
+			}
+			ColumnBindingRewrite::RemapProjectionMap(op, child_index, old_child_bindings, replacements);
+		}
+	}
 	if (!aggregate_map.empty()) {
 		VisitOperatorExpressions(op);
 	}

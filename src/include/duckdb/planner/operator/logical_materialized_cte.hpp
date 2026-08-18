@@ -28,6 +28,12 @@ public:
 	                 LogicalOperatorType::LOGICAL_MATERIALIZED_CTE),
 	      materialize(materialize) {
 	}
+	LogicalMaterializedCTE(Identifier ctename_p, TableIndex table_index, idx_t column_count,
+	                       unique_ptr<LogicalOperator> cte, CTEMaterialize materialize)
+	    : LogicalCTE(std::move(ctename_p), table_index, column_count, std::move(cte),
+	                 LogicalOperatorType::LOGICAL_MATERIALIZED_CTE),
+	      materialize(materialize) {
+	}
 
 	CTEMaterialize materialize = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
 

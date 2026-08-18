@@ -7,6 +7,7 @@
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/logical_plan_data_flow.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
@@ -47,7 +48,9 @@ void ColumnLifetimeAnalyzer::GenerateProjectionMap(vector<ColumnBinding> binding
 
 void ColumnLifetimeAnalyzer::StandardVisitOperator(LogicalOperator &op) {
 	VisitOperatorExpressions(op);
-	VisitOperatorChildren(op);
+	for (auto &child : op.children) {
+		VisitOperator(*child);
+	}
 }
 
 void ColumnLifetimeAnalyzer::ExtractColumnBindings(const Expression &expr, vector<ColumnBinding> &bindings) {
@@ -238,12 +241,12 @@ void ColumnLifetimeAnalyzer::AddVerificationProjection(unique_ptr<LogicalOperato
 
 	// Now place the "real" columns in their respective positions, while keeping track of which column becomes which
 	const auto table_index = optimizer.binder.GenerateTableIndex();
-	ColumnBindingReplacer replacer;
+	BindingReplacementGraph replacements;
 	for (idx_t col_idx = 0; col_idx < column_count; col_idx++) {
 		const auto &old_binding = child_bindings[col_idx];
 		ProjectionIndex new_col_idx(projection_column_count - 2 - col_idx * 2);
 		expressions[new_col_idx] = make_uniq<BoundColumnRefExpression>(child_types[col_idx], old_binding);
-		replacer.replacement_bindings.emplace_back(old_binding, ColumnBinding(table_index, new_col_idx));
+		replacements.Add(old_binding, ColumnBinding(table_index, new_col_idx));
 	}
 
 	// Create a projection and swap the operators accordingly
@@ -251,15 +254,12 @@ void ColumnLifetimeAnalyzer::AddVerificationProjection(unique_ptr<LogicalOperato
 	if (child->has_estimated_cardinality) {
 		projection->SetEstimatedCardinality(child->estimated_cardinality);
 	}
-	projection->children.emplace_back(std::move(child));
-	child = std::move(projection);
-
-	// Replace references to the old binding (higher up in the plan) with references to the new binding
-	replacer.stop_operator = child.get();
-	replacer.VisitOperator(root);
+	LogicalPlanDataFlow data_flow(root);
+	LogicalPlanDataFlowMutator mutator(data_flow);
+	ColumnBindingRewrite::InsertUnaryAndRewriteBindings(data_flow, mutator, child, std::move(projection), replacements);
 
 	// Add new bindings to column_references, else they are considered "unused"
-	for (const auto &replacement_binding : replacer.replacement_bindings) {
+	for (const auto &replacement_binding : replacements) {
 		if (column_references.find(replacement_binding.old_binding) != column_references.end()) {
 			column_references.insert(replacement_binding.new_binding);
 		}

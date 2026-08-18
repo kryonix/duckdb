@@ -35,6 +35,8 @@ public:
 	                                 const std::function<void(const unique_ptr<Expression> *child)> &callback);
 	//! Return the projection map owned by an operator for the given child, if any
 	static optional_ptr<vector<ProjectionIndex>> GetProjectionMap(LogicalOperator &op, idx_t child_index);
+	//! Verify that every projection map references a valid child output
+	static void ValidateProjectionMaps(LogicalOperator &op);
 
 protected:
 	//! Preserve the selected binding identities after a child rewrite changes its output layout

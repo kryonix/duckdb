@@ -150,6 +150,7 @@ private:
 
 	RemoveUnusedColumns &root;
 	unique_ptr<unordered_map<TableIndex, MaterializedCTEInfo>> root_cte_map;
+	column_binding_map_t<vector<ColumnBinding>> projection_map_replacements;
 
 private:
 	template <class T>
@@ -166,6 +167,10 @@ private:
 	void RewriteRecursiveCTEReferences(LogicalRecursiveCTE &rec,
 	                                   const unordered_set<ProjectionIndex> &required_columns);
 	bool TryPruneRecursiveCTE(LogicalRecursiveCTE &rec);
+	void VisitPrunableChildren(LogicalOperator &op);
+	void RemapProjectionMap(LogicalOperator &op, idx_t child_index, const vector<ColumnBinding> &old_child_bindings);
+	void ResolveProjectionBindings(ColumnBinding binding, const column_binding_set_t &new_bindings,
+	                               column_binding_set_t &active_bindings, vector<ColumnBinding> &resolved_bindings);
 	void WritePushdownExtractColumns(
 	    ReferencedColumn &col,
 	    const std::function<ProjectionIndex(const ColumnIndex &new_index, optional_ptr<const LogicalType> cast_type)>

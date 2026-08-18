@@ -11,6 +11,8 @@
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
+#include "duckdb/planner/logical_plan_data_flow.hpp"
+#include "duckdb/planner/subquery/column_binding_layout.hpp"
 
 #include <algorithm>
 
@@ -854,7 +856,6 @@ public:
 	void ConvertSubplansToCTEs(Optimizer &optimizer, unique_ptr<LogicalOperator> &op) {
 		const auto sorted_subplans = GetSortedSubplans();
 		idx_t index = 1;
-		bool converted_subplans = false;
 		for (auto &entry : sorted_subplans) {
 			auto &subplan_info = entry.get().second;
 			if (!ShouldMaterialize(subplan_info)) {
@@ -891,10 +892,19 @@ public:
 
 			if (required_canonical_bindings.size() != primary_subplan.canonical_bindings.size()) {
 				// The signature ignores projection maps. If duplicate subplans expose different
-				// subsets of the same work, widen the materialized producer just enough to make
-				// every referenced output available, then project each reader back to its original
-				// schema below.
-				ClearProjectionMaps(*primary_subplan.op.get());
+				// subsets of the same work, expose exactly the union needed by their readers.
+				auto expanded_bindings = GetExpandedColumnBindings(*primary_subplan.op.get());
+				auto expanded_canonical_bindings = GetCanonicalBindings(expanded_bindings);
+				column_binding_map_t<ColumnBinding> primary_bindings;
+				for (idx_t i = 0; i < expanded_bindings.size(); i++) {
+					primary_bindings.emplace(expanded_canonical_bindings[i], expanded_bindings[i]);
+				}
+				vector<ColumnBinding> required_primary_bindings;
+				required_primary_bindings.reserve(required_canonical_bindings.size());
+				for (auto &binding : required_canonical_bindings) {
+					required_primary_bindings.push_back(primary_bindings.at(binding));
+				}
+				SetProjectedBindings(*primary_subplan.op.get(), required_primary_bindings);
 				primary_subplan.op.get()->ResolveOperatorTypes();
 			}
 
@@ -946,7 +956,7 @@ public:
 
 			// Create CTE refs and figure out column binding replacements
 			vector<unique_ptr<LogicalOperator>> cte_refs;
-			ColumnBindingReplacer replacer;
+			vector<BindingReplacementGraph> replacement_graphs(subplan_info.subplans.size());
 			for (idx_t subplan_idx = 0; subplan_idx < subplan_info.subplans.size(); subplan_idx++) {
 				const auto &subplan = subplan_info.subplans[subplan_idx];
 				const auto cte_ref_index = optimizer.binder.GenerateTableIndex();
@@ -974,17 +984,28 @@ public:
 				D_ASSERT(old_bindings[subplan_idx].size() == new_bindings.size());
 				D_ASSERT(subplan.canonical_bindings.size() == new_bindings.size());
 				for (idx_t i = 0; i < old_bindings[subplan_idx].size(); i++) {
-					replacer.replacement_bindings.emplace_back(old_bindings[subplan_idx][i], new_bindings[i]);
+					replacement_graphs[subplan_idx].Add(old_bindings[subplan_idx][i], new_bindings[i]);
 					const auto inserted = generated_binding_map.emplace(new_bindings[i], subplan.canonical_bindings[i]);
 					D_ASSERT(inserted.second);
 				}
 			}
 
+			LogicalPlanDataFlow data_flow(*op);
+			LogicalPlanDataFlowMutator mutator(data_flow);
+
 			// Create the materialized CTE and replace the common subplans with references to it
 			auto &lowest_common_ancestor = subplan_info.lowest_common_ancestor.get();
 			const auto materialized_column_count = types.size();
-			auto materialized_subplan = std::move(primary_subplan.op.get());
-			auto remainder = std::move(lowest_common_ancestor);
+			unique_ptr<LogicalOperator> materialized_subplan;
+			for (idx_t subplan_idx = 0; subplan_idx < subplan_info.subplans.size(); subplan_idx++) {
+				const auto &subplan = subplan_info.subplans[subplan_idx];
+				auto replaced = ColumnBindingRewrite::ReplaceSubtreeAndRewriteBindings(
+				    data_flow, mutator, subplan.op.get(), std::move(cte_refs[subplan_idx]),
+				    replacement_graphs[subplan_idx]);
+				if (subplan_idx == 0) {
+					materialized_subplan = std::move(replaced);
+				}
+			}
 			vector<unique_ptr<Expression>> materialized_select_list;
 			for (idx_t i = 0; i < materialized_output_bindings.size(); i++) {
 				materialized_select_list.emplace_back(
@@ -994,18 +1015,9 @@ public:
 			                                                            std::move(materialized_select_list));
 			materialized_projection->children.emplace_back(std::move(materialized_subplan));
 			auto cte = make_uniq<LogicalMaterializedCTE>(Identifier(cte_name), cte_index, materialized_column_count,
-			                                             std::move(materialized_projection), std::move(remainder),
+			                                             std::move(materialized_projection),
 			                                             CTEMaterialize::CTE_MATERIALIZE_DEFAULT);
-			for (idx_t subplan_idx = 0; subplan_idx < subplan_info.subplans.size(); subplan_idx++) {
-				const auto &subplan = subplan_info.subplans[subplan_idx];
-				subplan.op.get() = std::move(cte_refs[subplan_idx]);
-			}
-			lowest_common_ancestor = std::move(cte);
-
-			// Replace bindings of subplans with those of the CTE refs
-			replacer.stop_operator = lowest_common_ancestor.get();
-			replacer.VisitOperator(*op);                                  // Replace from the root until CTE
-			replacer.VisitOperator(*lowest_common_ancestor->children[1]); // Replace in CTE child
+			mutator.InsertParent(lowest_common_ancestor, std::move(cte), 1);
 
 			// We have to be careful with the order in which we place the CTEs created by this optimizer
 			// Pipeline dependencies cannot be set up if CTEs are in the wrong order
@@ -1016,22 +1028,13 @@ public:
 				if (rhs_child->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
 					const auto child_table_index = rhs_child->Cast<LogicalMaterializedCTE>().table_index;
 					if (child_table_index >= min_cte_idx && child_table_index < cte_index) {
-						auto tmp = std::move(rhs_child->children[1]);
-						rhs_child->children[1] = std::move(current_op.get());
-						current_op.get() = std::move(rhs_child);
-						rhs_child = std::move(tmp);
+						mutator.RotateParentWithChild(current_op.get(), 1, 1);
 						current_op = current_op.get()->children[1];
 						continue;
 					}
 				}
 				break;
 			}
-			converted_subplans = true;
-		}
-		if (converted_subplans) {
-			// Subplan replacement changes child output bindings under existing positional projection maps.
-			// Invalidate them here; column lifetime runs again later and rebuilds the maps.
-			ClearProjectionMaps(*op);
 		}
 	}
 
@@ -1146,27 +1149,78 @@ private:
 		return GetCanonicalBindings(GetExpandedColumnBindings(op));
 	}
 
-	static void ClearProjectionMaps(LogicalOperator &op) {
+	void SetProjectedBindings(LogicalOperator &op, const vector<ColumnBinding> &bindings) {
 		switch (op.type) {
+		case LogicalOperatorType::LOGICAL_FILTER:
+		case LogicalOperatorType::LOGICAL_ORDER_BY: {
+			SetProjectedBindings(*op.children[0], bindings);
+			auto projection_map =
+			    ColumnBindingLayout(op.children[0]->GetColumnBindings()).CreateProjectionMap(bindings);
+			if (op.type == LogicalOperatorType::LOGICAL_FILTER) {
+				op.Cast<LogicalFilter>().projection_map = std::move(projection_map);
+			} else {
+				op.Cast<LogicalOrder>().projection_map = std::move(projection_map);
+			}
+			return;
+		}
 		case LogicalOperatorType::LOGICAL_ANY_JOIN:
 		case LogicalOperatorType::LOGICAL_ASOF_JOIN:
 		case LogicalOperatorType::LOGICAL_COMPARISON_JOIN: {
 			auto &join = op.Cast<LogicalJoin>();
-			join.left_projection_map.clear();
-			join.right_projection_map.clear();
-			break;
+			auto left_expanded = GetExpandedColumnBindings(*op.children[0]);
+			auto right_expanded = GetExpandedColumnBindings(*op.children[1]);
+			column_binding_set_t left_set(left_expanded.begin(), left_expanded.end());
+			column_binding_set_t right_set(right_expanded.begin(), right_expanded.end());
+			vector<ColumnBinding> left_bindings;
+			vector<ColumnBinding> right_bindings;
+			for (auto &binding : bindings) {
+				if (left_set.find(binding) != left_set.end()) {
+					left_bindings.push_back(binding);
+				} else if (right_set.find(binding) != right_set.end()) {
+					right_bindings.push_back(binding);
+				}
+			}
+			if (!left_bindings.empty()) {
+				SetProjectedBindings(*op.children[0], left_bindings);
+			}
+			if (!right_bindings.empty()) {
+				SetProjectedBindings(*op.children[1], right_bindings);
+			}
+			if (!left_bindings.empty()) {
+				join.left_projection_map =
+				    ColumnBindingLayout(op.children[0]->GetColumnBindings()).CreateProjectionMap(left_bindings);
+			}
+			if (!right_bindings.empty()) {
+				join.right_projection_map =
+				    ColumnBindingLayout(op.children[1]->GetColumnBindings()).CreateProjectionMap(right_bindings);
+			}
+			return;
 		}
-		case LogicalOperatorType::LOGICAL_FILTER:
-			op.Cast<LogicalFilter>().projection_map.clear();
-			break;
-		case LogicalOperatorType::LOGICAL_ORDER_BY:
-			op.Cast<LogicalOrder>().projection_map.clear();
-			break;
+		case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+		case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN: {
+			auto left_expanded = GetExpandedColumnBindings(*op.children[0]);
+			column_binding_set_t left_set(left_expanded.begin(), left_expanded.end());
+			vector<ColumnBinding> left_bindings;
+			vector<ColumnBinding> right_bindings;
+			for (auto &binding : bindings) {
+				(left_set.find(binding) != left_set.end() ? left_bindings : right_bindings).push_back(binding);
+			}
+			if (!left_bindings.empty()) {
+				SetProjectedBindings(*op.children[0], left_bindings);
+			}
+			if (!right_bindings.empty()) {
+				SetProjectedBindings(*op.children[1], right_bindings);
+			}
+			return;
+		}
 		default:
-			break;
-		}
-		for (auto &child : op.children) {
-			ClearProjectionMaps(*child);
+			auto output_bindings = op.GetColumnBindings();
+			for (auto &binding : bindings) {
+				if (std::find(output_bindings.begin(), output_bindings.end(), binding) == output_bindings.end()) {
+					throw InternalException("Common subplan producer cannot expose binding %s", binding.ToString());
+				}
+			}
+			return;
 		}
 	}
 
