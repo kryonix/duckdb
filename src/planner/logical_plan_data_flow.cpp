@@ -1836,32 +1836,6 @@ void LogicalPlanDataFlowMutator::InsertUnary(unique_ptr<LogicalOperator> &slot, 
 	VerifyAfterMutation();
 }
 
-void LogicalPlanDataFlowMutator::InsertUnary(unique_ptr<LogicalOperator> &slot, unique_ptr<LogicalOperator> wrapper,
-                                             LogicalOperator &changed_parent) {
-	if (!wrapper || !wrapper->children.empty()) {
-		throw InternalException("Indexed unary insertion requires a childless wrapper");
-	}
-	auto location = GetMutationSlot(*data_flow.state, slot);
-	if (location.is_root || location.parent.get() != &changed_parent) {
-		throw InternalException("Changed operator must own the indexed unary insertion slot");
-	}
-	if (!data_flow.state->SupportsUnaryInsertion(*wrapper)) {
-		throw InternalException("Indexed unary insertion requires an operator with known child semantics");
-	}
-	data_flow.state->ValidateChildren(changed_parent);
-	data_flow.state->ValidateFutureChildCount(changed_parent, changed_parent.children.size());
-	LogicalPlanDataFlowMetadata parent_metadata;
-	data_flow.state->ValidateRefreshOperator(changed_parent, parent_metadata);
-	data_flow.state->RegisterSubtree(*wrapper);
-	data_flow.state->ValidateStructuralMutation(*wrapper, 1);
-	auto old_subtree = data_flow.state->DetachChild(changed_parent, location.child_index, false);
-	data_flow.state->AttachChild(*wrapper, 0, std::move(old_subtree), false);
-	data_flow.state->RefreshOperator(*wrapper);
-	data_flow.state->AttachChild(changed_parent, location.child_index, std::move(wrapper), false);
-	data_flow.state->RefreshOperator(changed_parent);
-	VerifyAfterMutation();
-}
-
 void LogicalPlanDataFlowMutator::InsertParent(unique_ptr<LogicalOperator> &slot, unique_ptr<LogicalOperator> parent,
                                               idx_t child_index) {
 	if (!parent || parent->children.size() != 1 || child_index > 1) {

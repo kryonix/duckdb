@@ -189,8 +189,6 @@ public:
 	                                            unique_ptr<LogicalOperator> replacement);
 	unique_ptr<LogicalOperator> PromoteChild(unique_ptr<LogicalOperator> &slot, idx_t child_index);
 	void InsertUnary(unique_ptr<LogicalOperator> &slot, unique_ptr<LogicalOperator> wrapper);
-	void InsertUnary(unique_ptr<LogicalOperator> &slot, unique_ptr<LogicalOperator> wrapper,
-	                 LogicalOperator &changed_parent);
 	void InsertParent(unique_ptr<LogicalOperator> &slot, unique_ptr<LogicalOperator> parent, idx_t child_index);
 	void RotateParentWithChild(unique_ptr<LogicalOperator> &slot, idx_t child_index, idx_t grandchild_index);
 	unique_ptr<LogicalOperator> RemoveUnary(unique_ptr<LogicalOperator> &slot);
