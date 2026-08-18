@@ -1,0 +1,33 @@
+# name: ${FILE_PATH}
+# description: Compute a fixed-width expression before or after a hash join build
+# group: [join]
+
+name ${QUERY_NAME}
+group micro
+subgroup join
+
+load
+SET threads = 1;
+CREATE TABLE expression_placement_probe AS
+SELECT i % 100000 AS i FROM range(5000000) t(i);
+CREATE TABLE expression_placement_build AS
+SELECT i,
+       hash(i, 0) AS a,
+       hash(i, 1) AS b,
+       hash(i, 2) AS c,
+       hash(i, 3) AS d,
+       hash(i, 4) AS e,
+       hash(i, 5) AS f,
+       hash(i, 6) AS g,
+       hash(i, 7) AS h
+FROM range(100000) t(i);
+
+run
+SET disabled_optimizers = ${DISABLED_OPTIMIZERS};
+CREATE OR REPLACE TEMP TABLE expression_placement_result AS
+SELECT hash(a, b, c, d, e, f, g, h) AS value
+FROM expression_placement_probe
+JOIN expression_placement_build USING (i);
+
+result I
+5000000

@@ -1,0 +1,9 @@
+# name: benchmark/micro/join/expression_placement_planning_disabled.benchmark
+# description: Plan expression placement and protection queries with the optimizer disabled
+# group: [join]
+
+template benchmark/micro/join/expression_placement_planning.benchmark.in
+QUERY_NAME=Expression Placement Planning Disabled
+DISABLED_OPTIMIZERS='expression_placement'
+SELECT_LIST=hash(a, b, c, d, e, f, g, h)
+FROM_CLAUSE=expression_placement_plan_probe JOIN expression_placement_plan_build USING (i)

@@ -1,0 +1,7 @@
+# name: benchmark/micro/join/expression_placement_disabled.benchmark
+# description: Compute a fixed-width expression after the hash join
+# group: [join]
+
+template benchmark/micro/join/expression_placement.benchmark.in
+QUERY_NAME=Expression Placement Disabled
+DISABLED_OPTIMIZERS='expression_placement'

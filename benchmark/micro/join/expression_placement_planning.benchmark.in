@@ -1,0 +1,27 @@
+# name: ${FILE_PATH}
+# description: Plan an eligible hash join and a protection query
+# group: [join]
+
+name ${QUERY_NAME}
+group micro
+subgroup join
+
+load
+CREATE TABLE expression_placement_plan_probe(i INTEGER);
+CREATE TABLE expression_placement_plan_build(
+    i INTEGER,
+    a BIGINT,
+    b BIGINT,
+    c BIGINT,
+    d BIGINT,
+    e BIGINT,
+    f BIGINT,
+    g BIGINT,
+    h BIGINT
+);
+SET disabled_optimizers = ${DISABLED_OPTIMIZERS};
+
+run
+EXPLAIN
+SELECT ${SELECT_LIST}
+FROM ${FROM_CLAUSE};

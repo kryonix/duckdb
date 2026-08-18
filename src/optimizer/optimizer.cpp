@@ -16,6 +16,7 @@
 #include "duckdb/optimizer/distinct_aggregate_rewriter.hpp"
 #include "duckdb/optimizer/empty_result_pullup.hpp"
 #include "duckdb/optimizer/expression_heuristics.hpp"
+#include "duckdb/optimizer/expression_placement.hpp"
 #include "duckdb/optimizer/filter_pullup.hpp"
 #include "duckdb/optimizer/filter_pushdown.hpp"
 #include "duckdb/optimizer/grouping_sets_optimizer.hpp"
@@ -368,6 +369,11 @@ void Optimizer::RunBuiltInOptimizers() {
 	RunOptimizer(OptimizerType::BUILD_SIDE_PROBE_SIDE, [&]() {
 		BuildProbeSideOptimizer build_probe_side_optimizer(context, *plan);
 		build_probe_side_optimizer.VisitOperator(*plan);
+	});
+
+	RunOptimizer(OptimizerType::EXPRESSION_PLACEMENT, [&]() {
+		ExpressionPlacementOptimizer expression_placement(binder, context);
+		expression_placement.Optimize(*plan);
 	});
 
 	// convert common subplans into materialized CTEs

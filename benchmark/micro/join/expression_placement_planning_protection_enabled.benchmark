@@ -1,0 +1,9 @@
+# name: benchmark/micro/join/expression_placement_planning_protection_enabled.benchmark
+# description: Plan an unrelated projection with expression placement enabled
+# group: [join]
+
+template benchmark/micro/join/expression_placement_planning.benchmark.in
+QUERY_NAME=Expression Placement Planning Protection Enabled
+DISABLED_OPTIMIZERS=''
+SELECT_LIST=i
+FROM_CLAUSE=expression_placement_plan_probe WHERE i IN (42)

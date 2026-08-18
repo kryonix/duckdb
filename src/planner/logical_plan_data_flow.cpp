@@ -433,6 +433,10 @@ public:
 			return result;
 		}
 		auto &join = parent.Cast<LogicalComparisonJoin>();
+		idx_t range_count = 0;
+		if (child_idx == 1 && join.HasEquality(range_count)) {
+			result.Add(LogicalPlanPathProperty::HASH_JOIN_BUILD_BOUNDARY);
+		}
 		switch (join.join_type) {
 		case JoinType::LEFT:
 		case JoinType::SINGLE:
@@ -1195,6 +1199,23 @@ public:
 		return nullptr;
 	}
 
+	optional_ptr<LogicalPlanDataFlowEntry> ParentLastPathEdge(LogicalPlanDataFlowEntry &ancestor,
+	                                                          LogicalPlanDataFlowEntry &descendant,
+	                                                          const LogicalPlanPathSummary &properties) const {
+		if (properties.properties == 0 || !ParentIsAncestor(ancestor, descendant)) {
+			return nullptr;
+		}
+		auto current = optional_ptr<LogicalPlanDataFlowEntry>(descendant);
+		while (&current->op.get() != &ancestor.op.get()) {
+			if ((current->edge_to_parent.properties & properties.properties) != 0) {
+				return current;
+			}
+			current = current->flow_parent ? GetEntry(*current->flow_parent) : nullptr;
+			D_ASSERT(current);
+		}
+		return nullptr;
+	}
+
 	LogicalPlanDataFlowStatus BoundaryBetween(LogicalPlanDataFlowEntry &left, LogicalPlanDataFlowEntry &right) const {
 		reference_set_t<LogicalOperator> left_path;
 		auto current = optional_ptr<LogicalPlanDataFlowEntry>(left);
@@ -1561,6 +1582,35 @@ LogicalPlanDataFlow::FindFirstPathOperator(LogicalOperator &ancestor, LogicalOpe
 	return {LogicalPlanDataFlowStatus::SUCCESS, first_operator};
 }
 
+LogicalPlanDataFlowParentResult LogicalPlanDataFlow::FindLastPathEdge(LogicalOperator &ancestor,
+                                                                      LogicalOperator &descendant,
+                                                                      const LogicalPlanPathSummary &properties) const {
+	state->EnsureQueryable();
+	auto ancestor_entry = state->GetEntry(ancestor);
+	auto descendant_entry = state->GetEntry(descendant);
+	if (!ancestor_entry || !descendant_entry) {
+		return {LogicalPlanDataFlowStatus::OPERATOR_NOT_INDEXED, nullptr, DConstants::INVALID_INDEX};
+	}
+	if (!state->forest.Connected(ancestor_entry->forest_node, descendant_entry->forest_node)) {
+		return {state->BoundaryBetween(*ancestor_entry, *descendant_entry), nullptr, DConstants::INVALID_INDEX};
+	}
+	if (!state->forest.IsAncestor(ancestor_entry->forest_node, descendant_entry->forest_node)) {
+		return {LogicalPlanDataFlowStatus::NOT_ANCESTOR, nullptr, DConstants::INVALID_INDEX};
+	}
+	auto child = state->forest.FindLastEdgeOnPath(ancestor_entry->forest_node, descendant_entry->forest_node,
+	                                              ToForestValue(properties));
+	if (!child) {
+		return {LogicalPlanDataFlowStatus::PATH_PROPERTY_NOT_FOUND, nullptr, DConstants::INVALID_INDEX};
+	}
+	auto child_operator = state->GetForestOperator(*child);
+	if (!child_operator) {
+		return {LogicalPlanDataFlowStatus::UNSUPPORTED, nullptr, DConstants::INVALID_INDEX};
+	}
+	auto child_entry = state->GetEntry(*child_operator);
+	D_ASSERT(child_entry && child_entry->flow_parent);
+	return {LogicalPlanDataFlowStatus::SUCCESS, child_entry->flow_parent, child_entry->flow_child_index};
+}
+
 LogicalPlanDataFlowOperatorResult LogicalPlanDataFlow::GetCTEProducer(TableIndex cte_index) const {
 	state->EnsureQueryable();
 	auto lineage = state->cte_lineage.find(cte_index);
@@ -1884,7 +1934,8 @@ bool LogicalPlanDataFlow::Verify() const {
 				    LogicalPlanPathProperty::SIDE_EFFECT_BOUNDARY,
 				    LogicalPlanPathProperty::FILTER_PUSHDOWN_BOUNDARY,
 				    LogicalPlanPathProperty::NULLABILITY_BOUNDARY,
-				    LogicalPlanPathProperty::BINDING_AVAILABILITY_BOUNDARY};
+				    LogicalPlanPathProperty::BINDING_AVAILABILITY_BOUNDARY,
+				    LogicalPlanPathProperty::HASH_JOIN_BUILD_BOUNDARY};
 				for (auto property : guided_properties) {
 					LogicalPlanPathSummary properties;
 					properties.Add(property);
@@ -1900,6 +1951,13 @@ bool LogicalPlanDataFlow::Verify() const {
 					                                                    ToForestValue(properties));
 					auto actual_last = forest_last ? state->GetForestOperator(*forest_last) : nullptr;
 					if ((expected_last ? &expected_last->op.get() : nullptr) != actual_last.get()) {
+						return false;
+					}
+					auto expected_edge = state->ParentLastPathEdge(*left, *right, properties);
+					auto forest_edge = state->forest.FindLastEdgeOnPath(left->forest_node, right->forest_node,
+					                                                    ToForestValue(properties));
+					auto actual_edge = forest_edge ? state->GetForestOperator(*forest_edge) : nullptr;
+					if ((expected_edge ? &expected_edge->op.get() : nullptr) != actual_edge.get()) {
 						return false;
 					}
 				}

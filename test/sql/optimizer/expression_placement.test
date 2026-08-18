@@ -1,0 +1,341 @@
+# name: test/sql/optimizer/expression_placement.test
+# description: Place safe scalar expressions before hash join build boundaries
+# group: [optimizer]
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+PRAGMA explain_output = 'PHYSICAL_ONLY';
+
+statement ok
+CREATE TABLE expression_probe(i INTEGER);
+
+statement ok
+INSERT INTO expression_probe VALUES (1), (1), (2), (4), (NULL);
+
+statement ok
+INSERT INTO expression_probe SELECT i FROM range(5, 30) t(i);
+
+statement ok
+CREATE TABLE expression_build(i INTEGER, a BIGINT, b BIGINT, c BIGINT, d BIGINT);
+
+statement ok
+INSERT INTO expression_build VALUES
+    (1, 10, 11, 12, 13),
+    (1, NULL, 2, 3, 4),
+    (2, 20, 21, 22, 23),
+    (3, 30, 31, 32, 33),
+    (NULL, 40, 41, 42, 43);
+
+# The build projection computes the expression before the hash join.
+query II
+EXPLAIN SELECT hash(a, b, c, d)
+FROM expression_probe JOIN expression_build USING (i);
+----
+physical_plan	<REGEX>:.*HASH_JOIN.*PROJECTION.*hash\(a, b, c, d\).*
+
+# NULLs and duplicate join matches retain the same results with the pass disabled.
+query I rowsort expression_placement_inner
+SELECT hash(a, b, c, d)
+FROM expression_probe JOIN expression_build USING (i);
+----
+
+statement ok
+SET disabled_optimizers = 'expression_placement';
+
+query I rowsort expression_placement_inner
+SELECT hash(a, b, c, d)
+FROM expression_probe JOIN expression_build USING (i);
+----
+
+query II
+EXPLAIN SELECT hash(a, b, c, d)
+FROM expression_probe JOIN expression_build USING (i);
+----
+physical_plan	<!REGEX>:.*HASH_JOIN.*PROJECTION.*hash\(a, b, c, d\).*
+
+statement ok
+SET disabled_optimizers = '';
+
+# A short-circuit expression moves as one expression, not as independently evaluated branches.
+query II
+EXPLAIN SELECT CASE WHEN a IS NULL THEN false ELSE hash(a, b, c, d) > 0 END
+FROM expression_probe JOIN expression_build USING (i);
+----
+physical_plan	<REGEX>:.*HASH_JOIN.*PROJECTION.*CASE  WHEN.*hash\(a, b, c, d\).*
+
+query I rowsort expression_placement_case
+SELECT CASE WHEN a IS NULL THEN false ELSE hash(a, b, c, d) > 0 END
+FROM expression_probe JOIN expression_build USING (i);
+----
+
+statement ok
+SET disabled_optimizers = 'expression_placement';
+
+query I rowsort expression_placement_case
+SELECT CASE WHEN a IS NULL THEN false ELSE hash(a, b, c, d) > 0 END
+FROM expression_probe JOIN expression_build USING (i);
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+# Reused operands cannot leave the join payload.
+query II
+EXPLAIN SELECT hash(a, b, c, d), a
+FROM expression_probe JOIN expression_build USING (i);
+----
+physical_plan	<!REGEX>:.*HASH_JOIN.*PROJECTION.*hash\(a, b, c, d\).*
+
+# Equal-width replacements do not justify another projection.
+query II
+EXPLAIN SELECT hash(a)
+FROM expression_probe JOIN expression_build USING (i);
+----
+physical_plan	<!REGEX>:.*HASH_JOIN.*PROJECTION.*hash\(a\).*
+
+# Placement does not increase the expression's estimated evaluation count.
+statement ok
+CREATE TABLE expression_cardinality_probe AS SELECT i FROM range(1) t(i);
+
+statement ok
+CREATE TABLE expression_cardinality_build AS
+SELECT i,
+       i::BIGINT a,
+       (i + 1)::BIGINT b,
+       (i + 2)::BIGINT c,
+       (i + 3)::BIGINT d
+FROM range(1000) t(i);
+
+statement ok
+SET disabled_optimizers = 'build_side_probe_side';
+
+query II
+EXPLAIN SELECT hash(a, b, c, d)
+FROM expression_cardinality_probe
+JOIN expression_cardinality_build USING (i);
+----
+physical_plan	<!REGEX>:.*HASH_JOIN.*PROJECTION.*hash\(a, b, c, d\).*
+
+statement ok
+SET disabled_optimizers = '';
+
+# The current payload model does not guess widths for variable-sized operands.
+statement ok
+CREATE TABLE expression_strings(i INTEGER, a VARCHAR, b VARCHAR);
+
+statement ok
+INSERT INTO expression_strings VALUES (1, 'one', 'two'), (2, 'three', 'four');
+
+query II
+EXPLAIN SELECT hash(s.a, s.b)
+FROM expression_probe
+JOIN expression_strings s USING (i);
+----
+physical_plan	<!REGEX>:.*HASH_JOIN.*PROJECTION.*hash\(a, b\).*
+
+# Throwing expressions retain their original evaluation domain. The unmatched row must not throw.
+query I
+SELECT CAST(a AS TINYINT)
+FROM expression_probe JOIN expression_build USING (i)
+WHERE expression_build.i = 1;
+----
+10
+NULL
+10
+NULL
+
+statement ok
+INSERT INTO expression_build VALUES (99, 1000, 1, 1, 1);
+
+query I rowsort
+SELECT CAST(a AS TINYINT)
+FROM expression_probe JOIN expression_build USING (i);
+----
+10
+10
+20
+NULL
+NULL
+
+query II
+EXPLAIN SELECT CAST(a AS TINYINT)
+FROM expression_probe JOIN expression_build USING (i);
+----
+physical_plan	<!REGEX>:.*HASH_JOIN.*PROJECTION.*TINYINT.*
+
+# Volatile expressions are not moved into the build side.
+query II
+EXPLAIN SELECT hash(a, b, c, d) + random()
+FROM expression_probe JOIN expression_build USING (i);
+----
+physical_plan	<!REGEX>:.*HASH_JOIN.*PROJECTION.*random\(\).*
+
+# NULL extension changes expression semantics, so LEFT/FULL build edges are excluded.
+query I rowsort expression_placement_left
+SELECT hash(a, b, c, d)
+FROM expression_probe LEFT JOIN expression_build USING (i);
+----
+
+statement ok
+SET disabled_optimizers = 'expression_placement';
+
+query I rowsort expression_placement_left
+SELECT hash(a, b, c, d)
+FROM expression_probe LEFT JOIN expression_build USING (i);
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+query II
+EXPLAIN SELECT hash(a, b, c, d)
+FROM expression_probe LEFT JOIN expression_build USING (i);
+----
+physical_plan	<!REGEX>:.*HASH_JOIN.*PROJECTION.*hash\(a, b, c, d\).*
+
+# The preserved RHS of a RIGHT join is not NULL-extended and remains eligible.
+query II
+EXPLAIN SELECT hash(a, b, c, d)
+FROM expression_probe RIGHT JOIN expression_build USING (i);
+----
+physical_plan	<REGEX>:.*HASH_JOIN.*PROJECTION.*hash\(a, b, c, d\).*
+
+query I rowsort expression_placement_right
+SELECT hash(a, b, c, d)
+FROM expression_probe RIGHT JOIN expression_build USING (i);
+----
+
+statement ok
+SET disabled_optimizers = 'expression_placement';
+
+query I rowsort expression_placement_right
+SELECT hash(a, b, c, d)
+FROM expression_probe RIGHT JOIN expression_build USING (i);
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+# Both sides of a FULL join are NULL-extended.
+query II
+EXPLAIN SELECT hash(a, b, c, d)
+FROM expression_probe FULL JOIN expression_build USING (i);
+----
+physical_plan	<!REGEX>:.*HASH_JOIN.*PROJECTION.*hash\(a, b, c, d\).*
+
+# Specialized and non-equality joins are not hash-build placement boundaries.
+query II
+EXPLAIN SELECT hash(a, b, c, d)
+FROM expression_probe ASOF JOIN expression_build ON expression_probe.i >= expression_build.i;
+----
+physical_plan	<!REGEX>:.*ASOF_JOIN.*PROJECTION.*hash\(a, b, c, d\).*
+
+query II
+EXPLAIN SELECT hash(a, b, c, d)
+FROM expression_probe JOIN expression_build ON expression_probe.i < expression_build.i;
+----
+physical_plan	<!REGEX>:.*JOIN.*PROJECTION.*hash\(a, b, c, d\).*
+
+# Placement above individual CTE scans does not change a reused materialization.
+query I rowsort expression_placement_cte
+WITH placed_cte AS MATERIALIZED (SELECT * FROM expression_build)
+SELECT hash(x.a, x.b, x.c, x.d)
+FROM expression_probe JOIN placed_cte x USING (i)
+UNION ALL
+SELECT hash(y.a, y.b, y.c, y.d)
+FROM expression_probe JOIN placed_cte y USING (i);
+----
+
+statement ok
+SET disabled_optimizers = 'expression_placement';
+
+query I rowsort expression_placement_cte
+WITH placed_cte AS MATERIALIZED (SELECT * FROM expression_build)
+SELECT hash(x.a, x.b, x.c, x.d)
+FROM expression_probe JOIN placed_cte x USING (i)
+UNION ALL
+SELECT hash(y.a, y.b, y.c, y.d)
+FROM expression_probe JOIN placed_cte y USING (i);
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+# Equality-only joins remain hash joins when range joins are preferred.
+statement ok
+SET prefer_range_joins = true;
+
+query II
+EXPLAIN SELECT hash(a, b, c, d)
+FROM expression_probe JOIN expression_build USING (i);
+----
+physical_plan	<REGEX>:.*HASH_JOIN.*PROJECTION.*hash\(a, b, c, d\).*
+
+statement ok
+RESET prefer_range_joins;
+
+# Independent profitable components share one build projection.
+query II
+EXPLAIN SELECT hash(a, b), hash(c, d)
+FROM expression_probe JOIN expression_build USING (i);
+----
+physical_plan	<REGEX>:.*HASH_JOIN.*PROJECTION.*hash\(a, b\).*hash\(c, d\).*
+
+# Equivalent expressions on the same edge share one computed output.
+query II rowsort expression_placement_deduplicated
+SELECT hash(a, b, c, d), hash(a, b, c, d)
+FROM expression_probe JOIN expression_build USING (i);
+----
+
+statement ok
+SET disabled_optimizers = 'expression_placement';
+
+query II rowsort expression_placement_deduplicated
+SELECT hash(a, b, c, d), hash(a, b, c, d)
+FROM expression_probe JOIN expression_build USING (i);
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+# Nested placements carry the inner result through the outer join projection map.
+statement ok
+CREATE TABLE expression_outer AS SELECT i FROM range(100) t(i);
+
+statement ok
+CREATE TABLE expression_middle AS
+SELECT i, i::BIGINT c, (i + 1)::BIGINT d FROM range(10) t(i);
+
+statement ok
+CREATE TABLE expression_inner AS
+SELECT i, i::BIGINT a, (i + 1)::BIGINT b FROM range(5) t(i);
+
+statement ok
+SET disabled_optimizers = 'join_order,build_side_probe_side';
+
+query II
+EXPLAIN SELECT hash(hash(s.a, s.b), m.c, m.d)
+FROM expression_outer p
+JOIN (expression_middle m JOIN expression_inner s ON m.i = s.i) ON p.i = m.i;
+----
+physical_plan	<REGEX>:.*HASH_JOIN.*PROJECTION.*hash\(.*c, d\).*HASH_JOIN.*
+
+query I rowsort expression_placement_nested
+SELECT hash(hash(s.a, s.b), m.c, m.d)
+FROM expression_outer p
+JOIN (expression_middle m JOIN expression_inner s ON m.i = s.i) ON p.i = m.i;
+----
+
+statement ok
+SET disabled_optimizers = 'join_order,build_side_probe_side,expression_placement';
+
+query I rowsort expression_placement_nested
+SELECT hash(hash(s.a, s.b), m.c, m.d)
+FROM expression_outer p
+JOIN (expression_middle m JOIN expression_inner s ON m.i = s.i) ON p.i = m.i;
+----
+
+statement ok
+SET disabled_optimizers = '';

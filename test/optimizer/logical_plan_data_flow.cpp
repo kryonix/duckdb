@@ -132,14 +132,19 @@ static void RequireEquivalentDataFlow(LogicalOperator &root, LogicalPlanDataFlow
 			REQUIRE(live_path.summary == rebuilt_path.summary);
 			for (auto property :
 			     {LogicalPlanPathProperty::OPAQUE_BOUNDARY, LogicalPlanPathProperty::FILTER_PUSHDOWN_BOUNDARY,
-			      LogicalPlanPathProperty::NULLABILITY_BOUNDARY,
-			      LogicalPlanPathProperty::BINDING_AVAILABILITY_BOUNDARY}) {
+			      LogicalPlanPathProperty::NULLABILITY_BOUNDARY, LogicalPlanPathProperty::BINDING_AVAILABILITY_BOUNDARY,
+			      LogicalPlanPathProperty::HASH_JOIN_BUILD_BOUNDARY}) {
 				LogicalPlanPathSummary properties;
 				properties.Add(property);
 				auto live_first = live.FindFirstPathOperator(left, right, properties);
 				auto rebuilt_first = rebuilt.FindFirstPathOperator(left, right, properties);
 				REQUIRE(live_first.status == rebuilt_first.status);
 				REQUIRE(live_first.op == rebuilt_first.op);
+				auto live_edge = live.FindLastPathEdge(left, right, properties);
+				auto rebuilt_edge = rebuilt.FindLastPathEdge(left, right, properties);
+				REQUIRE(live_edge.status == rebuilt_edge.status);
+				REQUIRE(live_edge.parent == rebuilt_edge.parent);
+				REQUIRE(live_edge.child_index == rebuilt_edge.child_index);
 			}
 		}
 	}
@@ -471,6 +476,41 @@ TEST_CASE("Logical plan data flow indexes null-extending comparison join edges",
 		REQUIRE(data_flow.FindFirstPathOperator(*join, left, boundary).op.get() == &left);
 		REQUIRE(data_flow.FindFirstPathOperator(*join, right, boundary).op.get() == &right);
 	}
+}
+
+TEST_CASE("Logical plan data flow finds hash join build edges", "[optimizer][logical_plan_data_flow]") {
+	auto join = make_uniq<LogicalComparisonJoin>(JoinType::INNER);
+	join->conditions.emplace_back(
+	    make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, ColumnBinding(TableIndex(10), ProjectionIndex(0))),
+	    make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, ColumnBinding(TableIndex(30), ProjectionIndex(0))),
+	    ExpressionType::COMPARE_EQUAL);
+	join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(10)));
+	join->children.push_back(CreateProjection(TableIndex(20), TableIndex(30)));
+	auto &left = *join->children[0];
+	auto &right = *join->children[1];
+	auto &right_scan = *right.children[0];
+	LogicalPlanDataFlow data_flow(*join);
+	LogicalPlanPathSummary boundary;
+	boundary.Add(LogicalPlanPathProperty::HASH_JOIN_BUILD_BOUNDARY);
+
+	auto build_edge = data_flow.FindLastPathEdge(*join, right_scan, boundary);
+	REQUIRE(build_edge.status == LogicalPlanDataFlowStatus::SUCCESS);
+	REQUIRE(build_edge.parent.get() == join.get());
+	REQUIRE(build_edge.child_index == 1);
+	REQUIRE(data_flow.FindLastPathEdge(*join, right, boundary).status == LogicalPlanDataFlowStatus::SUCCESS);
+	REQUIRE(data_flow.FindLastPathEdge(*join, left, boundary).status ==
+	        LogicalPlanDataFlowStatus::PATH_PROPERTY_NOT_FOUND);
+	REQUIRE(data_flow.FindLastPathEdge(right, *join, boundary).status == LogicalPlanDataFlowStatus::NOT_ANCESTOR);
+
+	join->conditions[0] = JoinCondition(
+	    make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, ColumnBinding(TableIndex(10), ProjectionIndex(0))),
+	    make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, ColumnBinding(TableIndex(30), ProjectionIndex(0))),
+	    ExpressionType::COMPARE_LESSTHAN);
+	LogicalPlanDataFlowMutator mutator(data_flow);
+	mutator.RefreshOperator(*join);
+	REQUIRE(data_flow.FindLastPathEdge(*join, right_scan, boundary).status ==
+	        LogicalPlanDataFlowStatus::PATH_PROPERTY_NOT_FOUND);
+	REQUIRE(data_flow.Verify());
 }
 
 TEST_CASE("Indexed join mutations refresh null-extending edges", "[optimizer][logical_plan_data_flow]") {

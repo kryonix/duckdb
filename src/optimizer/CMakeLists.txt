@@ -27,6 +27,7 @@ add_library_unity(
   deliminator.cpp
   distinct_aggregate_rewriter.cpp
   expression_heuristics.cpp
+  expression_placement.cpp
   expression_rewriter.cpp
   filter_combiner.cpp
   filter_pullup.cpp

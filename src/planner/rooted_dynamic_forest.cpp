@@ -57,19 +57,24 @@ bool RootedDynamicForest::IsAuxiliaryRoot(const RootedDynamicForestNode &node) c
 void RootedDynamicForest::Update(RootedDynamicForestNode &node) {
 	RootedDynamicForestPathValue result;
 	RootedDynamicForestPathValue node_result;
+	RootedDynamicForestPathValue edge_result;
 	if (node.auxiliary_left) {
 		result.Merge(node.auxiliary_left->auxiliary_value);
 		node_result.Merge(node.auxiliary_left->auxiliary_node_value);
+		edge_result.Merge(node.auxiliary_left->auxiliary_edge_value);
 	}
 	result.Merge(node.node_value);
 	node_result.Merge(node.node_value);
 	result.Merge(node.edge_to_parent);
+	edge_result.Merge(node.edge_to_parent);
 	if (node.auxiliary_right) {
 		result.Merge(node.auxiliary_right->auxiliary_value);
 		node_result.Merge(node.auxiliary_right->auxiliary_node_value);
+		edge_result.Merge(node.auxiliary_right->auxiliary_edge_value);
 	}
 	node.auxiliary_value = result;
 	node.auxiliary_node_value = node_result;
+	node.auxiliary_edge_value = edge_result;
 #ifdef DEBUG
 	VerifyLocal(node);
 #endif
@@ -344,6 +349,40 @@ bool RootedDynamicForest::FindLastNodeOnPath(RootedDynamicForestNode &ancestor, 
 	return true;
 }
 
+optional_ptr<RootedDynamicForestNode>
+RootedDynamicForest::FindLastEdgeOnPath(RootedDynamicForestNode &ancestor, RootedDynamicForestNode &descendant,
+                                        const RootedDynamicForestPathValue &edge_mask) {
+	if (edge_mask.flags == 0 || !IsAncestor(ancestor, descendant)) {
+		return nullptr;
+	}
+	auto old_parent = ancestor.represented_parent;
+	auto old_edge = ancestor.edge_to_parent;
+	if (old_parent) {
+		const bool cut = CutFromParent(ancestor);
+		D_ASSERT(cut);
+	}
+	RootedDynamicForestRestoreGuard restore(*this, ancestor, old_parent, old_edge);
+	Expose(descendant);
+	if ((descendant.auxiliary_edge_value.flags & edge_mask.flags) == 0) {
+		return nullptr;
+	}
+	auto current = optional_ptr<RootedDynamicForestNode>(descendant);
+	while (current) {
+		if (current->auxiliary_right && (current->auxiliary_right->auxiliary_edge_value.flags & edge_mask.flags) != 0) {
+			current = current->auxiliary_right;
+			continue;
+		}
+		if ((current->edge_to_parent.flags & edge_mask.flags) != 0) {
+			Splay(*current);
+			return current;
+		}
+		D_ASSERT(current->auxiliary_left &&
+		         (current->auxiliary_left->auxiliary_edge_value.flags & edge_mask.flags) != 0);
+		current = current->auxiliary_left;
+	}
+	return nullptr;
+}
+
 optional_ptr<RootedDynamicForestNode> RootedDynamicForest::GetRepresentedParent(RootedDynamicForestNode &node) const {
 	return node.represented_parent;
 }
@@ -362,19 +401,24 @@ void RootedDynamicForest::VerifyLocal(const RootedDynamicForestNode &node) const
 	}
 	RootedDynamicForestPathValue expected;
 	RootedDynamicForestPathValue expected_nodes;
+	RootedDynamicForestPathValue expected_edges;
 	if (node.auxiliary_left) {
 		expected.Merge(node.auxiliary_left->auxiliary_value);
 		expected_nodes.Merge(node.auxiliary_left->auxiliary_node_value);
+		expected_edges.Merge(node.auxiliary_left->auxiliary_edge_value);
 	}
 	expected.Merge(node.node_value);
 	expected_nodes.Merge(node.node_value);
 	expected.Merge(node.edge_to_parent);
+	expected_edges.Merge(node.edge_to_parent);
 	if (node.auxiliary_right) {
 		expected.Merge(node.auxiliary_right->auxiliary_value);
 		expected_nodes.Merge(node.auxiliary_right->auxiliary_node_value);
+		expected_edges.Merge(node.auxiliary_right->auxiliary_edge_value);
 	}
 	D_ASSERT(expected == node.auxiliary_value);
 	D_ASSERT(expected_nodes == node.auxiliary_node_value);
+	D_ASSERT(expected_edges == node.auxiliary_edge_value);
 }
 #endif
 

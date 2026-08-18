@@ -44,6 +44,7 @@ private:
 	RootedDynamicForestPathValue edge_to_parent;
 	RootedDynamicForestPathValue auxiliary_value;
 	RootedDynamicForestPathValue auxiliary_node_value;
+	RootedDynamicForestPathValue auxiliary_edge_value;
 };
 
 //! A fixed-root link/cut forest. Represented edges point from a child toward its parent.
@@ -83,6 +84,10 @@ public:
 	                        const RootedDynamicForestPathValue &node_mask,
 	                        optional_ptr<RootedDynamicForestNode> &result,
 	                        optional_ptr<RootedDynamicForestNode> &path_child);
+	//! Returns the child endpoint of the last matching edge on the path.
+	optional_ptr<RootedDynamicForestNode> FindLastEdgeOnPath(RootedDynamicForestNode &ancestor,
+	                                                         RootedDynamicForestNode &descendant,
+	                                                         const RootedDynamicForestPathValue &edge_mask);
 
 	optional_ptr<RootedDynamicForestNode> GetRepresentedParent(RootedDynamicForestNode &node) const;
 	RootedDynamicForestPathValue GetEdgeValue(RootedDynamicForestNode &node) const;

@@ -114,6 +114,19 @@ public:
 			descendant = parents[descendant];
 		}
 	}
+
+	idx_t FindLastEdgeOnPath(idx_t ancestor, idx_t descendant, uint64_t edge_mask) const {
+		if (edge_mask == 0 || !IsAncestor(ancestor, descendant)) {
+			return DConstants::INVALID_INDEX;
+		}
+		while (descendant != ancestor) {
+			if ((edge_values[descendant].flags & edge_mask) != 0) {
+				return descendant;
+			}
+			descendant = parents[descendant];
+		}
+		return DConstants::INVALID_INDEX;
+	}
 };
 
 static vector<unique_ptr<RootedDynamicForestNode>> CreateForestNodes(idx_t count) {
@@ -296,6 +309,24 @@ TEST_CASE("Rooted dynamic forest finds the last matching path node", "[optimizer
 	REQUIRE(forest.GetRepresentedParent(*nodes[2]).get() == nodes[1].get());
 }
 
+TEST_CASE("Rooted dynamic forest finds the last matching path edge", "[optimizer][rooted_dynamic_forest]") {
+	RootedDynamicForest forest;
+	auto nodes = CreateForestNodes(7);
+	for (idx_t child_idx = 1; child_idx < 6; child_idx++) {
+		REQUIRE(forest.Link(*nodes[child_idx], *nodes[child_idx - 1], {uint64_t(1) << child_idx}));
+	}
+	forest.SetNodeValue(*nodes[5], {uint64_t(1) << 5});
+
+	REQUIRE(forest.FindLastEdgeOnPath(*nodes[0], *nodes[5], {uint64_t(1) << 4}).get() == nodes[4].get());
+	REQUIRE(forest.FindLastEdgeOnPath(*nodes[2], *nodes[5], {uint64_t(1) << 3}).get() == nodes[3].get());
+	REQUIRE_FALSE(forest.FindLastEdgeOnPath(*nodes[3], *nodes[5], {uint64_t(1) << 3}));
+	REQUIRE_FALSE(forest.FindLastEdgeOnPath(*nodes[5], *nodes[5], {uint64_t(1) << 5}));
+	REQUIRE_FALSE(forest.FindLastEdgeOnPath(*nodes[5], *nodes[0], {uint64_t(1) << 1}));
+	REQUIRE_FALSE(forest.FindLastEdgeOnPath(*nodes[0], *nodes[6], {uint64_t(1) << 1}));
+	REQUIRE_FALSE(forest.FindLastEdgeOnPath(*nodes[0], *nodes[5], {}));
+	REQUIRE(forest.GetRepresentedParent(*nodes[2]).get() == nodes[1].get());
+}
+
 TEST_CASE("Rooted dynamic forest preserves state after rejected mutations", "[optimizer][rooted_dynamic_forest]") {
 	RootedDynamicForest forest;
 	auto nodes = CreateForestNodes(4);
@@ -381,6 +412,9 @@ TEST_CASE("Rooted dynamic forest matches a naive randomized oracle", "[optimizer
 			auto actual_last = forest.FindLastNodeOnPath(*nodes[left], *nodes[right], {node_mask});
 			auto expected_last = oracle.FindLastNodeOnPath(left, right, node_mask);
 			REQUIRE((actual_last ? ForestNodeIndex(nodes, *actual_last) : DConstants::INVALID_INDEX) == expected_last);
+			auto actual_edge = forest.FindLastEdgeOnPath(*nodes[left], *nodes[right], {node_mask});
+			auto expected_edge = oracle.FindLastEdgeOnPath(left, right, node_mask);
+			REQUIRE((actual_edge ? ForestNodeIndex(nodes, *actual_edge) : DConstants::INVALID_INDEX) == expected_edge);
 		};
 
 		for (idx_t operation_idx = 0; operation_idx < OPERATION_COUNT; operation_idx++) {

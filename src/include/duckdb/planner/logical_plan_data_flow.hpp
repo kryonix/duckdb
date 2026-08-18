@@ -49,7 +49,8 @@ enum class LogicalPlanPathProperty {
 	FILTER_PUSHDOWN_BOUNDARY,
 	NULLABILITY_BOUNDARY,
 	NULL_EXTENDING,
-	BINDING_AVAILABILITY_BOUNDARY
+	BINDING_AVAILABILITY_BOUNDARY,
+	HASH_JOIN_BUILD_BOUNDARY
 };
 
 struct LogicalPlanPathSummary {
@@ -130,6 +131,9 @@ public:
 	LogicalPlanDataFlowPathResult GetPathSummary(LogicalOperator &ancestor, LogicalOperator &descendant) const;
 	LogicalPlanDataFlowOperatorResult FindFirstPathOperator(LogicalOperator &ancestor, LogicalOperator &descendant,
 	                                                        const LogicalPlanPathSummary &properties) const;
+	//! Returns the parent and child index of the deepest matching edge on the path.
+	LogicalPlanDataFlowParentResult FindLastPathEdge(LogicalOperator &ancestor, LogicalOperator &descendant,
+	                                                 const LogicalPlanPathSummary &properties) const;
 
 	LogicalPlanDataFlowOperatorResult GetCTEProducer(TableIndex cte_index) const;
 	LogicalPlanDataFlowReadersResult GetCTEReaders(TableIndex cte_index) const;
