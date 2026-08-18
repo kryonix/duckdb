@@ -11,6 +11,7 @@
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/optimizer/filter_combiner.hpp"
 #include "duckdb/optimizer/rule.hpp"
+#include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/joinside.hpp"
 #include "duckdb/planner/logical_plan_data_flow.hpp"
 
