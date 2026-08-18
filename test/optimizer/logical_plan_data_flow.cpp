@@ -854,17 +854,37 @@ TEST_CASE("Indexed logical plan mutations maintain materialized CTE producers", 
 	REQUIRE(data_flow.Verify());
 }
 
-TEST_CASE("Indexed logical plan mutations reject opaque extension child edits", "[optimizer][logical_plan_data_flow]") {
+TEST_CASE("Indexed logical plan mutations replace opaque extension child slots",
+          "[optimizer][logical_plan_data_flow]") {
 	auto extension = make_uniq<TestLogicalExtensionOperator>(TableIndex(), true);
 	extension->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(10)));
-	auto &child = *extension->children[0];
+	auto &old_child = *extension->children[0];
+	LogicalPlanDataFlow data_flow(*extension);
+	LogicalPlanDataFlowMutator mutator(data_flow);
+
+	auto removed = mutator.ReplaceSubtree(extension->children[0], make_uniq<LogicalDummyScan>(TableIndex(20)));
+	REQUIRE(removed.get() == &old_child);
+	REQUIRE(data_flow.GetOwnershipParent(*extension->children[0]).parent.get() == extension.get());
+	REQUIRE(data_flow.ResolveSource(ColumnBinding(TableIndex(20), ProjectionIndex(0)), 0, *extension).status ==
+	        LogicalPlanDataFlowStatus::OPAQUE_BOUNDARY);
+	RequireEquivalentDataFlow(*extension, data_flow);
+}
+
+TEST_CASE("Indexed logical plan mutations reject opaque extension child vector edits",
+          "[optimizer][logical_plan_data_flow]") {
+	auto extension = make_uniq<TestLogicalExtensionOperator>(TableIndex(), false);
+	extension->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(10)));
+	extension->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(20)));
+	auto &left = *extension->children[0];
+	auto &right = *extension->children[1];
 	LogicalPlanDataFlow data_flow(*extension);
 	LogicalPlanDataFlowMutator mutator(data_flow);
 
 	REQUIRE_THROWS_AS(mutator.DetachChild(*extension, 0), InternalException);
-	REQUIRE(extension->children[0].get() == &child);
-	REQUIRE(data_flow.GetOwnershipParent(child).parent.get() == extension.get());
-	REQUIRE(data_flow.Verify());
+	REQUIRE_THROWS_AS(mutator.SwapChildren(*extension, 0, 1), InternalException);
+	REQUIRE(extension->children[0].get() == &left);
+	REQUIRE(extension->children[1].get() == &right);
+	RequireEquivalentDataFlow(*extension, data_flow);
 }
 
 TEST_CASE("Indexed logical plan mutations agree with rebuilding after randomized edits",

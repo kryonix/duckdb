@@ -17,6 +17,7 @@ namespace duckdb {
 class LogicalOperator;
 class LogicalPlanDataFlowState;
 class LogicalPlanDataFlowMutator;
+class LogicalPlanDataFlowMutationScope;
 
 enum class LogicalPlanDataFlowStatus {
 	SUCCESS,
@@ -116,6 +117,7 @@ public:
 private:
 	friend class LogicalPlanDataFlowMutator;
 	friend class LogicalPlanDataFlowDetachedSubtree;
+	friend class LogicalPlanDataFlowMutationScope;
 
 	shared_ptr<LogicalPlanDataFlowState> state;
 };
@@ -147,12 +149,34 @@ private:
 	unique_ptr<LogicalOperator> subtree;
 };
 
+//! Defers full verification while coordinated indexed mutations leave metadata temporarily stale.
+class LogicalPlanDataFlowMutationScope {
+public:
+	~LogicalPlanDataFlowMutationScope();
+
+	LogicalPlanDataFlowMutationScope(LogicalPlanDataFlowMutationScope &&other) noexcept;
+	LogicalPlanDataFlowMutationScope &operator=(LogicalPlanDataFlowMutationScope &&other) noexcept;
+
+	LogicalPlanDataFlowMutationScope(const LogicalPlanDataFlowMutationScope &) = delete;
+	LogicalPlanDataFlowMutationScope &operator=(const LogicalPlanDataFlowMutationScope &) = delete;
+
+private:
+	friend class LogicalPlanDataFlowMutator;
+
+	explicit LogicalPlanDataFlowMutationScope(LogicalPlanDataFlowMutator &mutator);
+	void Reset();
+
+private:
+	optional_ptr<LogicalPlanDataFlowMutator> mutator;
+};
+
 //! Maintains a LogicalPlanDataFlow while its logical plan is rewritten.
 class LogicalPlanDataFlowMutator {
 public:
 	explicit LogicalPlanDataFlowMutator(LogicalPlanDataFlow &data_flow);
 
 public:
+	LogicalPlanDataFlowMutationScope BeginMutation();
 	LogicalPlanDataFlowDetachedSubtree RegisterSubtree(unique_ptr<LogicalOperator> subtree);
 	unique_ptr<LogicalOperator> UnregisterSubtree(LogicalPlanDataFlowDetachedSubtree subtree);
 	LogicalPlanDataFlowDetachedSubtree DetachChild(LogicalOperator &parent, idx_t child_index);
@@ -165,9 +189,19 @@ public:
 	                                            unique_ptr<LogicalOperator> replacement);
 	unique_ptr<LogicalOperator> PromoteChild(unique_ptr<LogicalOperator> &slot, idx_t child_index);
 	void InsertUnary(unique_ptr<LogicalOperator> &slot, unique_ptr<LogicalOperator> wrapper);
+	void InsertUnary(unique_ptr<LogicalOperator> &slot, unique_ptr<LogicalOperator> wrapper,
+	                 LogicalOperator &changed_parent);
+	void InsertParent(unique_ptr<LogicalOperator> &slot, unique_ptr<LogicalOperator> parent, idx_t child_index);
+	void RotateParentWithChild(unique_ptr<LogicalOperator> &slot, idx_t child_index, idx_t grandchild_index);
 	unique_ptr<LogicalOperator> RemoveUnary(unique_ptr<LogicalOperator> &slot);
 	void SwapChildren(LogicalOperator &parent, idx_t left_index, idx_t right_index);
 	void RefreshOperator(LogicalOperator &op);
+
+private:
+	friend class LogicalPlanDataFlowMutationScope;
+
+	void EndMutation();
+	void VerifyAfterMutation() const;
 
 private:
 	LogicalPlanDataFlow &data_flow;

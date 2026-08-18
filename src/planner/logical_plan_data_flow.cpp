@@ -111,9 +111,16 @@ public:
 	unordered_map<TableIndex, LogicalPlanCTELineage> cte_lineage;
 	mutable vector<LogicalPlanBindingUse> binding_uses;
 	mutable bool binding_uses_dirty = false;
+	idx_t active_mutation_scopes = 0;
 	bool valid = true;
 
 public:
+	void EnsureQueryable() const {
+		if (active_mutation_scopes != 0) {
+			throw InternalException("Cannot query logical plan data flow during a coordinated mutation");
+		}
+	}
+
 	optional_ptr<LogicalPlanDataFlowEntry> GetEntry(LogicalOperator &op) const {
 		auto entry = entries.find(op);
 		if (entry == entries.end()) {
@@ -802,9 +809,8 @@ public:
 		}
 	}
 
-	void ValidateStructuralMutation(LogicalOperator &parent, idx_t future_child_count) const {
+	void ValidateOperatorMetadata(LogicalOperator &parent) const {
 		ValidateChildren(parent);
-		ValidateFutureChildCount(parent, future_child_count);
 		LogicalPlanDataFlowMetadata metadata;
 		auto entry = GetEntry(parent);
 		if (!GetMetadata(parent, metadata) || metadata.produced_table_indexes != entry->produced_table_indexes ||
@@ -820,6 +826,18 @@ public:
 			    &expected.consumer.get() != &actual.consumer.get()) {
 				throw InternalException("Logical plan operator expressions changed without RefreshOperator");
 			}
+		}
+	}
+
+	void ValidateStructuralMutation(LogicalOperator &parent, idx_t future_child_count) const {
+		ValidateOperatorMetadata(parent);
+		ValidateFutureChildCount(parent, future_child_count);
+	}
+
+	void ValidateSlotReplacement(LogicalOperator &parent) const {
+		ValidateOperatorMetadata(parent);
+		if (parent.type != LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
+			ValidateFutureChildCount(parent, parent.children.size());
 		}
 	}
 
@@ -1135,6 +1153,7 @@ LogicalPlanDataFlow::~LogicalPlanDataFlow() {
 
 LogicalPlanDataFlowOperatorResult LogicalPlanDataFlow::ResolveSource(const ColumnBinding &binding, idx_t depth,
                                                                      LogicalOperator &consumer) const {
+	state->EnsureQueryable();
 	if (depth != 0) {
 		return {LogicalPlanDataFlowStatus::CORRELATED_REFERENCE, nullptr};
 	}
@@ -1173,6 +1192,7 @@ LogicalPlanDataFlowOperatorResult LogicalPlanDataFlow::ResolveSource(const Colum
 }
 
 LogicalPlanDataFlowParentResult LogicalPlanDataFlow::GetOwnershipParent(LogicalOperator &op) const {
+	state->EnsureQueryable();
 	auto entry = state->GetEntry(op);
 	if (!entry) {
 		return {LogicalPlanDataFlowStatus::OPERATOR_NOT_INDEXED, nullptr, DConstants::INVALID_INDEX};
@@ -1181,6 +1201,7 @@ LogicalPlanDataFlowParentResult LogicalPlanDataFlow::GetOwnershipParent(LogicalO
 }
 
 LogicalPlanDataFlowParentResult LogicalPlanDataFlow::GetFlowParent(LogicalOperator &op) const {
+	state->EnsureQueryable();
 	auto entry = state->GetEntry(op);
 	if (!entry) {
 		return {LogicalPlanDataFlowStatus::OPERATOR_NOT_INDEXED, nullptr, DConstants::INVALID_INDEX};
@@ -1190,6 +1211,7 @@ LogicalPlanDataFlowParentResult LogicalPlanDataFlow::GetFlowParent(LogicalOperat
 
 LogicalPlanDataFlowBooleanResult LogicalPlanDataFlow::SameFlowTree(LogicalOperator &left,
                                                                    LogicalOperator &right) const {
+	state->EnsureQueryable();
 	auto left_entry = state->GetEntry(left);
 	auto right_entry = state->GetEntry(right);
 	if (!left_entry || !right_entry) {
@@ -1203,6 +1225,7 @@ LogicalPlanDataFlowBooleanResult LogicalPlanDataFlow::SameFlowTree(LogicalOperat
 
 LogicalPlanDataFlowBooleanResult LogicalPlanDataFlow::IsFlowAncestor(LogicalOperator &ancestor,
                                                                      LogicalOperator &descendant) const {
+	state->EnsureQueryable();
 	auto ancestor_entry = state->GetEntry(ancestor);
 	auto descendant_entry = state->GetEntry(descendant);
 	if (!ancestor_entry || !descendant_entry) {
@@ -1217,6 +1240,7 @@ LogicalPlanDataFlowBooleanResult LogicalPlanDataFlow::IsFlowAncestor(LogicalOper
 
 LogicalPlanDataFlowOperatorResult LogicalPlanDataFlow::LowestCommonAncestor(LogicalOperator &left,
                                                                             LogicalOperator &right) const {
+	state->EnsureQueryable();
 	auto left_entry = state->GetEntry(left);
 	auto right_entry = state->GetEntry(right);
 	if (!left_entry || !right_entry) {
@@ -1238,6 +1262,7 @@ LogicalPlanDataFlowOperatorResult LogicalPlanDataFlow::LowestCommonAncestor(Logi
 
 LogicalPlanDataFlowPathResult LogicalPlanDataFlow::GetPathSummary(LogicalOperator &ancestor,
                                                                   LogicalOperator &descendant) const {
+	state->EnsureQueryable();
 	auto ancestor_entry = state->GetEntry(ancestor);
 	auto descendant_entry = state->GetEntry(descendant);
 	if (!ancestor_entry || !descendant_entry) {
@@ -1257,6 +1282,7 @@ LogicalPlanDataFlowPathResult LogicalPlanDataFlow::GetPathSummary(LogicalOperato
 }
 
 LogicalPlanDataFlowOperatorResult LogicalPlanDataFlow::GetCTEProducer(TableIndex cte_index) const {
+	state->EnsureQueryable();
 	auto lineage = state->cte_lineage.find(cte_index);
 	if (lineage == state->cte_lineage.end() || !lineage->second.producer) {
 		return {LogicalPlanDataFlowStatus::BINDING_NOT_FOUND, nullptr};
@@ -1265,6 +1291,7 @@ LogicalPlanDataFlowOperatorResult LogicalPlanDataFlow::GetCTEProducer(TableIndex
 }
 
 LogicalPlanDataFlowReadersResult LogicalPlanDataFlow::GetCTEReaders(TableIndex cte_index) const {
+	state->EnsureQueryable();
 	auto lineage = state->cte_lineage.find(cte_index);
 	if (lineage == state->cte_lineage.end()) {
 		return {LogicalPlanDataFlowStatus::BINDING_NOT_FOUND, {}};
@@ -1273,6 +1300,7 @@ LogicalPlanDataFlowReadersResult LogicalPlanDataFlow::GetCTEReaders(TableIndex c
 }
 
 const vector<LogicalPlanBindingUse> &LogicalPlanDataFlow::GetBindingUses() const {
+	state->EnsureQueryable();
 	if (state->binding_uses_dirty) {
 		state->RebuildBindingUses();
 	}
@@ -1280,10 +1308,12 @@ const vector<LogicalPlanBindingUse> &LogicalPlanDataFlow::GetBindingUses() const
 }
 
 idx_t LogicalPlanDataFlow::OperatorCount() const {
+	state->EnsureQueryable();
 	return state->entries.size();
 }
 
 bool LogicalPlanDataFlow::Verify() const {
+	state->EnsureQueryable();
 	if (!state->valid || state->entries.empty() || !state->root || !state->GetEntry(*state->root)) {
 		return false;
 	}
@@ -1510,8 +1540,58 @@ void LogicalPlanDataFlowDetachedSubtree::Reset() {
 	state.reset();
 }
 
+LogicalPlanDataFlowMutationScope::LogicalPlanDataFlowMutationScope(LogicalPlanDataFlowMutator &mutator_p)
+    : mutator(mutator_p) {
+	mutator_p.data_flow.state->active_mutation_scopes++;
+}
+
+LogicalPlanDataFlowMutationScope::~LogicalPlanDataFlowMutationScope() {
+	Reset();
+}
+
+LogicalPlanDataFlowMutationScope::LogicalPlanDataFlowMutationScope(LogicalPlanDataFlowMutationScope &&other) noexcept
+    : mutator(other.mutator) {
+	other.mutator = nullptr;
+}
+
+LogicalPlanDataFlowMutationScope &
+LogicalPlanDataFlowMutationScope::operator=(LogicalPlanDataFlowMutationScope &&other) noexcept {
+	if (this != &other) {
+		Reset();
+		mutator = other.mutator;
+		other.mutator = nullptr;
+	}
+	return *this;
+}
+
+void LogicalPlanDataFlowMutationScope::Reset() {
+	if (!mutator) {
+		return;
+	}
+	mutator->EndMutation();
+	mutator = nullptr;
+}
+
 LogicalPlanDataFlowMutator::LogicalPlanDataFlowMutator(LogicalPlanDataFlow &data_flow_p) : data_flow(data_flow_p) {
 	D_ASSERT(data_flow.Verify());
+}
+
+LogicalPlanDataFlowMutationScope LogicalPlanDataFlowMutator::BeginMutation() {
+	return LogicalPlanDataFlowMutationScope(*this);
+}
+
+void LogicalPlanDataFlowMutator::EndMutation() {
+	D_ASSERT(data_flow.state->active_mutation_scopes > 0);
+	data_flow.state->active_mutation_scopes--;
+	if (data_flow.state->active_mutation_scopes == 0 && !Exception::UncaughtException()) {
+		D_ASSERT(data_flow.Verify());
+	}
+}
+
+void LogicalPlanDataFlowMutator::VerifyAfterMutation() const {
+	if (data_flow.state->active_mutation_scopes == 0) {
+		D_ASSERT(data_flow.Verify());
+	}
 }
 
 LogicalPlanDataFlowDetachedSubtree LogicalPlanDataFlowMutator::RegisterSubtree(unique_ptr<LogicalOperator> subtree) {
@@ -1519,7 +1599,7 @@ LogicalPlanDataFlowDetachedSubtree LogicalPlanDataFlowMutator::RegisterSubtree(u
 		throw InternalException("Cannot register a null logical plan subtree");
 	}
 	data_flow.state->RegisterSubtree(*subtree);
-	D_ASSERT(data_flow.Verify());
+	VerifyAfterMutation();
 	return LogicalPlanDataFlowDetachedSubtree(data_flow.state, std::move(subtree));
 }
 
@@ -1531,7 +1611,7 @@ unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::UnregisterSubtree(Logica
 	data_flow.state->UnregisterSubtree(*subtree.subtree);
 	auto result = std::move(subtree.subtree);
 	subtree.state.reset();
-	D_ASSERT(data_flow.Verify());
+	VerifyAfterMutation();
 	return result;
 }
 
@@ -1584,7 +1664,7 @@ void LogicalPlanDataFlowMutator::AttachChild(LogicalOperator &parent, idx_t chil
 	data_flow.state->AttachChild(parent, child_index, std::move(owned_subtree), false);
 	data_flow.state->RefreshOperator(parent);
 	subtree.state.reset();
-	D_ASSERT(data_flow.Verify());
+	VerifyAfterMutation();
 }
 
 void LogicalPlanDataFlowMutator::AttachChild(LogicalOperator &parent, idx_t child_index,
@@ -1601,7 +1681,7 @@ unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::EraseChild(LogicalOperat
 	auto subtree = data_flow.state->DetachChild(parent, child_index, false);
 	data_flow.state->RefreshOperator(parent);
 	data_flow.state->UnregisterSubtree(*subtree);
-	D_ASSERT(data_flow.Verify());
+	VerifyAfterMutation();
 	return subtree;
 }
 
@@ -1612,7 +1692,7 @@ unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::ReplaceSubtree(unique_pt
 	}
 	auto location = GetMutationSlot(*data_flow.state, slot);
 	if (!location.is_root) {
-		data_flow.state->ValidateStructuralMutation(*location.parent, location.parent->children.size());
+		data_flow.state->ValidateSlotReplacement(*location.parent);
 	}
 	reference_set_t<const LogicalOperator> replaced_operators;
 	vector<reference<LogicalOperator>> pending {*slot};
@@ -1641,7 +1721,7 @@ unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::ReplaceSubtree(unique_pt
 		data_flow.state->AttachChild(*location.parent, location.child_index, std::move(replacement), false);
 		data_flow.state->RefreshOperator(*location.parent);
 	}
-	D_ASSERT(data_flow.Verify());
+	VerifyAfterMutation();
 	return old_subtree;
 }
 
@@ -1654,7 +1734,7 @@ unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::ReplaceOperator(unique_p
 	data_flow.state->ValidateStructuralMutation(*slot, slot->children.size());
 	data_flow.state->ValidateFutureChildCount(*replacement, slot->children.size());
 	if (!location.is_root) {
-		data_flow.state->ValidateStructuralMutation(*location.parent, location.parent->children.size());
+		data_flow.state->ValidateSlotReplacement(*location.parent);
 	}
 	reference_set_t<const LogicalOperator> replaced_operators;
 	replaced_operators.insert(reference<const LogicalOperator>(*slot));
@@ -1685,7 +1765,7 @@ unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::ReplaceOperator(unique_p
 		data_flow.state->AttachChild(*location.parent, location.child_index, std::move(replacement), false);
 		data_flow.state->RefreshOperator(*location.parent);
 	}
-	D_ASSERT(data_flow.Verify());
+	VerifyAfterMutation();
 	return old_operator;
 }
 
@@ -1697,7 +1777,7 @@ unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::PromoteChild(unique_ptr<
 	}
 	data_flow.state->ValidateStructuralMutation(*slot, 0);
 	if (!location.is_root) {
-		data_flow.state->ValidateStructuralMutation(*location.parent, location.parent->children.size());
+		data_flow.state->ValidateSlotReplacement(*location.parent);
 	}
 
 	unique_ptr<LogicalOperator> old_operator;
@@ -1720,7 +1800,7 @@ unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::PromoteChild(unique_ptr<
 		data_flow.state->AttachChild(*location.parent, location.child_index, std::move(promoted), false);
 		data_flow.state->RefreshOperator(*location.parent);
 	}
-	D_ASSERT(data_flow.Verify());
+	VerifyAfterMutation();
 	return old_operator;
 }
 
@@ -1733,7 +1813,7 @@ void LogicalPlanDataFlowMutator::InsertUnary(unique_ptr<LogicalOperator> &slot, 
 		throw InternalException("Indexed unary insertion requires an operator with known child semantics");
 	}
 	if (!location.is_root) {
-		data_flow.state->ValidateStructuralMutation(*location.parent, location.parent->children.size());
+		data_flow.state->ValidateSlotReplacement(*location.parent);
 	}
 	data_flow.state->RegisterSubtree(*wrapper);
 	data_flow.state->ValidateStructuralMutation(*wrapper, 1);
@@ -1865,7 +1945,7 @@ unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::RemoveUnary(unique_ptr<L
 	auto &wrapper = *slot;
 	data_flow.state->ValidateStructuralMutation(wrapper, 0);
 	if (!location.is_root) {
-		data_flow.state->ValidateStructuralMutation(*location.parent, location.parent->children.size());
+		data_flow.state->ValidateSlotReplacement(*location.parent);
 	}
 	auto child = data_flow.state->DetachChild(wrapper, 0, false);
 	unique_ptr<LogicalOperator> removed;
@@ -1880,7 +1960,7 @@ unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::RemoveUnary(unique_ptr<L
 		data_flow.state->RefreshOperator(*location.parent);
 	}
 	data_flow.state->UnregisterSubtree(*removed);
-	D_ASSERT(data_flow.Verify());
+	VerifyAfterMutation();
 	return removed;
 }
 
@@ -1899,12 +1979,12 @@ void LogicalPlanDataFlowMutator::SwapChildren(LogicalOperator &parent, idx_t lef
 	left_entry->owner_child_index = left_index;
 	right_entry->owner_child_index = right_index;
 	data_flow.state->RefreshOperator(parent);
-	D_ASSERT(data_flow.Verify());
+	VerifyAfterMutation();
 }
 
 void LogicalPlanDataFlowMutator::RefreshOperator(LogicalOperator &op) {
 	data_flow.state->RefreshOperator(op);
-	D_ASSERT(data_flow.Verify());
+	VerifyAfterMutation();
 }
 
 } // namespace duckdb
