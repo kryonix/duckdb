@@ -25,6 +25,7 @@ class LogicalEmptyResult;
 class LogicalExpressionGet;
 class LogicalGet;
 class LogicalProjection;
+class LogicalPlanDataFlow;
 class LogicalWindow;
 
 class RelationStatisticsHelper {
@@ -51,6 +52,8 @@ public:
 	static optional<RelationStats> ProjectOutputStats(const RelationStats &stats, LogicalOperator &op);
 	static optional<RelationStats> RebindOutputStats(const RelationStats &stats, LogicalOperator &op);
 	static idx_t EstimateDistinctCardinality(const vector<DistinctCount> &distinct_counts, idx_t input_cardinality);
+	static bool ApplyDistinctCountPathBound(const LogicalPlanDataFlow &data_flow, LogicalOperator &consumer,
+	                                        ColumnBinding binding, RelationStats &stats);
 
 private:
 	static unique_ptr<BaseStatistics> GetColumnStatistics(LogicalGet &get, ClientContext &context,

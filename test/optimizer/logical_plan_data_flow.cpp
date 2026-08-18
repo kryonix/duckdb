@@ -215,6 +215,38 @@ TEST_CASE("Logical plan data flow resolves renamed bindings", "[optimizer][logic
 	REQUIRE(path.summary.Has(LogicalPlanPathProperty::PROJECTION_BOUNDARY));
 }
 
+TEST_CASE("Logical plan data flow maintains minimum cardinality estimates", "[optimizer][logical_plan_data_flow]") {
+	auto projection = CreateProjection(TableIndex(10), TableIndex(20));
+	auto &scan = *projection->children[0];
+	auto &projection_ref = *projection;
+	auto filter = make_uniq<LogicalFilter>();
+	filter->children.push_back(std::move(projection));
+	filter->SetEstimatedCardinality(100);
+	scan.SetEstimatedCardinality(25);
+
+	LogicalPlanDataFlow data_flow(*filter);
+	LogicalPlanDataFlowMutator mutator(data_flow);
+	auto path = data_flow.GetPathSummary(*filter, scan);
+	REQUIRE(path.status == LogicalPlanDataFlowStatus::SUCCESS);
+	REQUIRE(path.summary.minimum_cardinality.GetIndex() == 25);
+
+	projection_ref.SetEstimatedCardinality(5);
+	REQUIRE_FALSE(data_flow.Verify());
+	mutator.RefreshOperator(projection_ref);
+	REQUIRE(data_flow.GetPathSummary(*filter, scan).summary.minimum_cardinality.GetIndex() == 5);
+
+	scan.SetEstimatedCardinality(0);
+	REQUIRE_FALSE(data_flow.Verify());
+	mutator.RefreshOperator(scan);
+	REQUIRE(data_flow.GetPathSummary(*filter, scan).summary.minimum_cardinality.GetIndex() == 0);
+
+	scan.has_estimated_cardinality = false;
+	REQUIRE_FALSE(data_flow.Verify());
+	mutator.RefreshOperator(scan);
+	REQUIRE(data_flow.GetPathSummary(*filter, scan).summary.minimum_cardinality.GetIndex() == 5);
+	REQUIRE(data_flow.Verify());
+}
+
 TEST_CASE("Logical plan data flow validates source binding layouts", "[optimizer][logical_plan_data_flow]") {
 	auto scan = make_uniq<LogicalDummyScan>(TableIndex(10));
 	LogicalPlanDataFlow data_flow(*scan);

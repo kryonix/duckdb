@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/types.hpp"
 
@@ -14,6 +15,7 @@ namespace duckdb {
 
 struct RootedDynamicForestPathValue {
 	uint64_t flags = 0;
+	optional_idx minimum_cardinality;
 
 	void Merge(const RootedDynamicForestPathValue &other);
 	bool operator==(const RootedDynamicForestPathValue &other) const;

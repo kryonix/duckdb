@@ -2,6 +2,7 @@
 
 #include "duckdb/planner/expression/list.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/logical_plan_data_flow.hpp"
 #include "duckdb/planner/operator/list.hpp"
 
 #include <math.h>
@@ -103,6 +104,30 @@ idx_t RelationStatisticsHelper::EstimateDistinctCardinality(const vector<Distinc
 	const auto estimate = multiplier == 0 ? static_cast<double>(input_cardinality) : product * multiplier;
 	auto result = LossyNumericCast<idx_t>(MinValue(estimate, static_cast<double>(input_cardinality)));
 	return input_cardinality > 0 ? MaxValue<idx_t>(result, 1) : 0;
+}
+
+bool RelationStatisticsHelper::ApplyDistinctCountPathBound(const LogicalPlanDataFlow &data_flow,
+                                                           LogicalOperator &consumer, ColumnBinding binding,
+                                                           RelationStats &stats) {
+	auto source = data_flow.ResolveSource(binding, 0, consumer);
+	if (source.status != LogicalPlanDataFlowStatus::SUCCESS || !source.op) {
+		return false;
+	}
+	if (source.op->type == LogicalOperatorType::LOGICAL_CTE_REF && source.op->Cast<LogicalCTERef>().is_recurring) {
+		return false;
+	}
+	auto path = data_flow.GetPathSummary(consumer, *source.op);
+	if (path.status != LogicalPlanDataFlowStatus::SUCCESS || !path.summary.minimum_cardinality.IsValid()) {
+		return false;
+	}
+	auto column_idx = stats.FindColumn(binding);
+	if (!column_idx.IsValid()) {
+		return false;
+	}
+	auto &column = stats.columns[column_idx.GetIndex()];
+	column.distinct_count.distinct_count =
+	    MinValue(column.distinct_count.distinct_count, path.summary.minimum_cardinality.GetIndex());
+	return true;
 }
 
 optional<RelationStats> RelationStatisticsHelper::ExtractAggregationStats(LogicalAggregate &aggregate,

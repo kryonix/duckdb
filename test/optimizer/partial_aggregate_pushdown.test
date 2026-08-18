@@ -1317,3 +1317,104 @@ FROM outer_count_owner o LEFT JOIN outer_count_events e ON o.k = e.k AND e.keep
 GROUP BY o.k
 ----
 physical_plan	<!REGEX>:.*COALESCE.*
+
+# A filtering join can reduce a key domain before a later join expands the row count again.
+statement ok
+CREATE TABLE outer_indexed_owner AS
+SELECT i % 5 AS k FROM range(1000) t(i) UNION ALL SELECT NULL
+
+statement ok
+CREATE TABLE outer_indexed_events AS SELECT i AS k, i AS event_id FROM range(1000) t(i)
+
+statement ok
+CREATE TABLE outer_indexed_keys AS SELECT i AS k FROM range(5) t(i)
+
+statement ok
+CREATE TABLE outer_indexed_expand AS SELECT i % 5 AS k FROM range(500) t(i)
+
+statement ok
+ANALYZE
+
+query II
+EXPLAIN SELECT o.k, count(e.event_id)
+FROM outer_indexed_owner o LEFT JOIN (
+  outer_indexed_events e
+  JOIN outer_indexed_keys k ON e.k = k.k
+  JOIN outer_indexed_expand x ON e.k = x.k
+) ON o.k = e.k
+GROUP BY o.k
+----
+physical_plan	<REGEX>:(?s).*COALESCE.*Hash Join.*Hash Group By.*outer_indexed_events.*
+
+query II rowsort
+SELECT o.k, count(e.event_id)
+FROM outer_indexed_owner o LEFT JOIN (
+  outer_indexed_events e
+  JOIN outer_indexed_keys k ON e.k = k.k
+  JOIN outer_indexed_expand x ON e.k = x.k
+) ON o.k = e.k
+GROUP BY o.k
+----
+0	20000
+1	20000
+2	20000
+3	20000
+4	20000
+NULL	0
+
+query II
+EXPLAIN SELECT o.k, count(e.event_id)
+FROM (
+  outer_indexed_events e
+  JOIN outer_indexed_keys k ON e.k = k.k
+  JOIN outer_indexed_expand x ON e.k = x.k
+) RIGHT JOIN outer_indexed_owner o ON e.k = o.k
+GROUP BY o.k
+----
+physical_plan	<REGEX>:.*COALESCE.*
+
+statement ok
+CREATE TEMP TABLE outer_indexed_enabled AS
+SELECT o.k, count(e.event_id) AS n
+FROM outer_indexed_owner o LEFT JOIN (
+  outer_indexed_events e
+  JOIN outer_indexed_keys k ON e.k = k.k
+  JOIN outer_indexed_expand x ON e.k = x.k
+) ON o.k = e.k
+GROUP BY o.k
+
+statement ok
+SET disabled_optimizers = 'partial_aggregate_pushdown'
+
+query II
+EXPLAIN SELECT o.k, count(e.event_id)
+FROM outer_indexed_owner o LEFT JOIN (
+  outer_indexed_events e
+  JOIN outer_indexed_keys k ON e.k = k.k
+  JOIN outer_indexed_expand x ON e.k = x.k
+) ON o.k = e.k
+GROUP BY o.k
+----
+physical_plan	<!REGEX>:.*COALESCE.*
+
+statement ok
+CREATE TEMP TABLE outer_indexed_baseline AS
+SELECT o.k, count(e.event_id) AS n
+FROM outer_indexed_owner o LEFT JOIN (
+  outer_indexed_events e
+  JOIN outer_indexed_keys k ON e.k = k.k
+  JOIN outer_indexed_expand x ON e.k = x.k
+) ON o.k = e.k
+GROUP BY o.k
+
+statement ok
+RESET disabled_optimizers
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM outer_indexed_enabled EXCEPT ALL SELECT * FROM outer_indexed_baseline)
+	UNION ALL
+	(SELECT * FROM outer_indexed_baseline EXCEPT ALL SELECT * FROM outer_indexed_enabled)
+) differences
+----
+0

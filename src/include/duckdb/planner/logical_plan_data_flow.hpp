@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/table_index.hpp"
 #include "duckdb/common/types.hpp"
@@ -53,6 +54,7 @@ enum class LogicalPlanPathProperty {
 
 struct LogicalPlanPathSummary {
 	uint64_t properties = 0;
+	optional_idx minimum_cardinality;
 
 	void Add(LogicalPlanPathProperty property);
 	void Merge(const LogicalPlanPathSummary &other);

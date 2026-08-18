@@ -1,0 +1,88 @@
+# name: test/optimizer/joins/indexed_cardinality_bounds.test
+# description: Test indexed cardinality bounds for grouped join relations
+# group: [joins]
+
+statement ok
+PRAGMA explain_output = 'physical_only'
+
+statement ok
+CREATE TABLE card_domain AS SELECT i AS k FROM range(25) t(i)
+
+statement ok
+CREATE TABLE card_filter AS SELECT i AS k FROM range(5) t(i)
+
+statement ok
+CREATE TABLE card_expand AS SELECT i % 25 AS k FROM range(10000) t(i)
+
+statement ok
+CREATE TABLE card_mid AS SELECT i AS k FROM range(10) t(i)
+
+statement ok
+CREATE TABLE card_fact AS SELECT i % 10 AS k, i AS v FROM range(100000) t(i)
+
+statement ok
+ANALYZE card_domain
+
+statement ok
+ANALYZE card_filter
+
+statement ok
+ANALYZE card_expand
+
+statement ok
+ANALYZE card_mid
+
+statement ok
+ANALYZE card_fact
+
+query II rowsort
+SELECT d.k, count(*)
+FROM card_domain d
+JOIN card_filter s USING (k)
+JOIN card_expand e USING (k)
+GROUP BY d.k
+----
+0	400
+1	400
+2	400
+3	400
+4	400
+
+query II
+EXPLAIN SELECT d.k, count(*)
+FROM card_domain d
+JOIN card_filter s USING (k)
+JOIN card_expand e USING (k)
+GROUP BY d.k
+----
+physical_plan	<REGEX>:(?s).*Group By.*~4 rows.*
+
+query II
+EXPLAIN WITH grouped AS (
+    SELECT d.k, count(*) AS n
+    FROM card_domain d
+    JOIN card_filter s USING (k)
+    JOIN card_expand e USING (k)
+    GROUP BY d.k
+)
+SELECT count(*), sum(grouped.n)
+FROM grouped
+JOIN card_mid USING (k)
+JOIN card_fact USING (k)
+----
+physical_plan	<REGEX>:(?s).*Hash Join.*card_mid.*Group By.*~4 rows.*
+
+query II
+WITH grouped AS (
+    SELECT d.k, count(*) AS n
+    FROM card_domain d
+    JOIN card_filter s USING (k)
+    JOIN card_expand e USING (k)
+    GROUP BY d.k
+)
+SELECT count(*), sum(grouped.n)
+FROM grouped
+JOIN card_mid USING (k)
+JOIN card_fact USING (k)
+----
+50000	20000000

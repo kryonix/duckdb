@@ -8,6 +8,7 @@
 #include "duckdb/optimizer/relation_statistics/relation_statistics_helper.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/planner/logical_plan_data_flow.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -124,6 +125,69 @@ TEST_CASE("Aggregate group and result statistics use distinct bindings", "[optim
 	REQUIRE(relation_manager.TryNormalizeBinding(output_bindings[1], normalized_result));
 	REQUIRE(normalized_group == ColumnBinding(TableIndex(0), ProjectionIndex(0)));
 	REQUIRE(normalized_result == ColumnBinding(TableIndex(0), ProjectionIndex(1)));
+}
+
+TEST_CASE("Indexed path cardinality bounds aggregate distinct counts", "[optimizer][relation_statistics]") {
+	auto left = make_uniq<LogicalDummyScan>(TableIndex(10));
+	left->SetEstimatedCardinality(25);
+	auto filter = make_uniq<LogicalFilter>();
+	filter->SetEstimatedCardinality(5);
+	filter->children.push_back(std::move(left));
+	auto right = make_uniq<LogicalDummyScan>(TableIndex(20));
+	right->SetEstimatedCardinality(10000);
+	auto cross = make_uniq<LogicalCrossProduct>(std::move(filter), std::move(right));
+	cross->SetEstimatedCardinality(31000);
+
+	LogicalAggregate aggregate(TableIndex(30), TableIndex(31), vector<unique_ptr<Expression>> {});
+	aggregate.groups.push_back(
+	    make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, ColumnBinding(TableIndex(10), ProjectionIndex(0))));
+	aggregate.grouping_sets.emplace_back();
+	aggregate.grouping_sets.back().insert(ProjectionIndex(0));
+	aggregate.children.push_back(std::move(cross));
+	auto child_stats = CreateStats(aggregate.children[0]->GetColumnBindings(), {25, 100},
+	                               aggregate.children[0]->estimated_cardinality);
+
+	LogicalPlanDataFlow data_flow(aggregate);
+	auto binding = aggregate.groups[0]->Cast<BoundColumnRefExpression>().Binding();
+	REQUIRE(RelationStatisticsHelper::ApplyDistinctCountPathBound(data_flow, aggregate, binding, child_stats));
+	REQUIRE(child_stats.GetColumnStats(binding)->distinct_count.distinct_count == 5);
+	auto stats = RelationStatisticsHelper::ExtractAggregationStats(aggregate, child_stats);
+	REQUIRE(stats);
+	REQUIRE(stats->cardinality == 5);
+
+	auto unrelated = ColumnBinding(TableIndex(20), ProjectionIndex(0));
+	REQUIRE(RelationStatisticsHelper::ApplyDistinctCountPathBound(data_flow, aggregate, unrelated, child_stats));
+	REQUIRE(child_stats.GetColumnStats(unrelated)->distinct_count.distinct_count == 100);
+}
+
+TEST_CASE("Indexed distinct-count bounds preserve unsupported statistics", "[optimizer][relation_statistics]") {
+	auto binding = ColumnBinding(TableIndex(10), ProjectionIndex(0));
+	auto scan = make_uniq<LogicalDummyScan>(TableIndex(10));
+	auto filter = make_uniq<LogicalFilter>();
+	filter->children.push_back(std::move(scan));
+	auto stats = CreateStats({binding}, {10}, 100);
+	LogicalPlanDataFlow missing_estimates(*filter);
+	REQUIRE_FALSE(RelationStatisticsHelper::ApplyDistinctCountPathBound(missing_estimates, *filter, binding, stats));
+	REQUIRE(stats.GetColumnStats(binding)->distinct_count.distinct_count == 10);
+
+	filter->SetEstimatedCardinality(0);
+	LogicalPlanDataFlow zero_estimate(*filter);
+	REQUIRE(RelationStatisticsHelper::ApplyDistinctCountPathBound(zero_estimate, *filter, binding, stats));
+	REQUIRE(stats.GetColumnStats(binding)->distinct_count.distinct_count == 0);
+
+	auto recurring =
+	    make_uniq<LogicalCTERef>(TableIndex(20), TableIndex(30), vector<LogicalType> {LogicalType::INTEGER},
+	                             vector<Identifier> {Identifier("k")});
+	recurring->is_recurring = true;
+	recurring->SetEstimatedCardinality(2);
+	auto recurring_filter = make_uniq<LogicalFilter>();
+	recurring_filter->children.push_back(std::move(recurring));
+	auto recurring_binding = ColumnBinding(TableIndex(20), ProjectionIndex(0));
+	auto recurring_stats = CreateStats({recurring_binding}, {10}, 100);
+	LogicalPlanDataFlow recurring_data_flow(*recurring_filter);
+	REQUIRE_FALSE(RelationStatisticsHelper::ApplyDistinctCountPathBound(recurring_data_flow, *recurring_filter,
+	                                                                    recurring_binding, recurring_stats));
+	REQUIRE(recurring_stats.GetColumnStats(recurring_binding)->distinct_count.distinct_count == 10);
 }
 
 static unique_ptr<LogicalOperator> CreateProjectedDummy(TableIndex input_index, TableIndex projection_index) {

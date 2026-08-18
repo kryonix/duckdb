@@ -29,10 +29,14 @@ private:
 
 void RootedDynamicForestPathValue::Merge(const RootedDynamicForestPathValue &other) {
 	flags |= other.flags;
+	if (other.minimum_cardinality.IsValid() &&
+	    (!minimum_cardinality.IsValid() || other.minimum_cardinality.GetIndex() < minimum_cardinality.GetIndex())) {
+		minimum_cardinality = other.minimum_cardinality;
+	}
 }
 
 bool RootedDynamicForestPathValue::operator==(const RootedDynamicForestPathValue &other) const {
-	return flags == other.flags;
+	return flags == other.flags && minimum_cardinality == other.minimum_cardinality;
 }
 
 bool RootedDynamicForestPathValue::operator!=(const RootedDynamicForestPathValue &other) const {

@@ -25,11 +25,11 @@
 namespace duckdb {
 
 static RootedDynamicForestPathValue ToForestValue(const LogicalPlanPathSummary &summary) {
-	return {summary.properties};
+	return {summary.properties, summary.minimum_cardinality};
 }
 
 static LogicalPlanPathSummary FromForestValue(const RootedDynamicForestPathValue &value) {
-	return {value.flags};
+	return {value.flags, value.minimum_cardinality};
 }
 
 static uint64_t PathPropertyMask(LogicalPlanPathProperty property) {
@@ -42,6 +42,10 @@ void LogicalPlanPathSummary::Add(LogicalPlanPathProperty property) {
 
 void LogicalPlanPathSummary::Merge(const LogicalPlanPathSummary &other) {
 	properties |= other.properties;
+	if (other.minimum_cardinality.IsValid() &&
+	    (!minimum_cardinality.IsValid() || other.minimum_cardinality.GetIndex() < minimum_cardinality.GetIndex())) {
+		minimum_cardinality = other.minimum_cardinality;
+	}
 }
 
 bool LogicalPlanPathSummary::Has(LogicalPlanPathProperty property) const {
@@ -49,7 +53,7 @@ bool LogicalPlanPathSummary::Has(LogicalPlanPathProperty property) const {
 }
 
 bool LogicalPlanPathSummary::operator==(const LogicalPlanPathSummary &other) const {
-	return properties == other.properties;
+	return properties == other.properties && minimum_cardinality == other.minimum_cardinality;
 }
 
 bool LogicalPlanPathSummary::operator!=(const LogicalPlanPathSummary &other) const {
@@ -367,6 +371,9 @@ public:
 
 	LogicalPlanPathSummary GetNodeValue(const LogicalOperator &op) const {
 		LogicalPlanPathSummary result;
+		if (op.has_estimated_cardinality) {
+			result.minimum_cardinality = op.estimated_cardinality;
+		}
 		if (IsOpaque(op)) {
 			result.Add(LogicalPlanPathProperty::OPAQUE_BOUNDARY);
 		}
@@ -1711,6 +1718,9 @@ bool LogicalPlanDataFlow::Verify() const {
 		if (!entry) {
 			return false;
 		}
+		if (entry->node_value != state->GetNodeValue(op)) {
+			return false;
+		}
 		ownership_count++;
 		for (idx_t child_idx = 0; child_idx < op.get().children.size(); child_idx++) {
 			auto child_entry = state->GetEntry(*op.get().children[child_idx]);
@@ -1727,7 +1737,7 @@ bool LogicalPlanDataFlow::Verify() const {
 				}
 			} else if (child_entry->flow_parent.get() == &op.get()) {
 				return false;
-			} else if (child_entry->edge_to_parent.properties != 0) {
+			} else if (child_entry->edge_to_parent != LogicalPlanPathSummary()) {
 				return false;
 			}
 			pending.push_back(*op.get().children[child_idx]);

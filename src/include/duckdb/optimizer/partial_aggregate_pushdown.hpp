@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -19,6 +20,7 @@ class PartialAggregatePushdown : public LogicalOperatorVisitor {
 public:
 	explicit PartialAggregatePushdown(Optimizer &optimizer);
 
+	void Optimize(unique_ptr<LogicalOperator> &plan);
 	void VisitOperator(unique_ptr<LogicalOperator> &op) override;
 
 private:
@@ -31,10 +33,12 @@ private:
 	bool TryOwnerOuterCountPushdown(unique_ptr<LogicalOperator> &op);
 	//! One-sided eager group-by: push a partial aggregate (via state export) below the join on one side only.
 	bool TryPushdownAggregate(unique_ptr<LogicalOperator> &op);
+	void CollectIndexedCardinalityBounds(LogicalOperator &plan);
 	unique_ptr<Expression> VisitReplace(BoundColumnRefExpression &expr, unique_ptr<Expression> *expr_ptr) override;
 
 private:
 	Optimizer &optimizer;
 	column_binding_map_t<ColumnBinding> replacement_map;
+	unordered_map<TableIndex, idx_t> owner_outer_key_bounds;
 };
 } // namespace duckdb

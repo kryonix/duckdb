@@ -18,12 +18,12 @@ static idx_t ForestNodeIndex(const vector<unique_ptr<RootedDynamicForestNode>> &
 class NaiveRootedForest {
 public:
 	explicit NaiveRootedForest(idx_t count)
-	    : parents(count, DConstants::INVALID_INDEX), node_values(count, 0), edge_values(count, 0) {
+	    : parents(count, DConstants::INVALID_INDEX), node_values(count), edge_values(count) {
 	}
 
 	vector<idx_t> parents;
-	vector<uint64_t> node_values;
-	vector<uint64_t> edge_values;
+	vector<RootedDynamicForestPathValue> node_values;
+	vector<RootedDynamicForestPathValue> edge_values;
 
 public:
 	idx_t FindRoot(idx_t node) const {
@@ -62,24 +62,24 @@ public:
 		return right;
 	}
 
-	uint64_t RootPathValue(idx_t node) const {
-		uint64_t result = 0;
+	RootedDynamicForestPathValue RootPathValue(idx_t node) const {
+		RootedDynamicForestPathValue result;
 		while (node != DConstants::INVALID_INDEX) {
-			result |= node_values[node];
-			result |= edge_values[node];
+			result.Merge(node_values[node]);
+			result.Merge(edge_values[node]);
 			node = parents[node];
 		}
 		return result;
 	}
 
-	uint64_t PathValue(idx_t ancestor, idx_t descendant) const {
-		uint64_t result = 0;
+	RootedDynamicForestPathValue PathValue(idx_t ancestor, idx_t descendant) const {
+		RootedDynamicForestPathValue result;
 		while (true) {
-			result |= node_values[descendant];
+			result.Merge(node_values[descendant]);
 			if (descendant == ancestor) {
 				return result;
 			}
-			result |= edge_values[descendant];
+			result.Merge(edge_values[descendant]);
 			descendant = parents[descendant];
 		}
 	}
@@ -90,7 +90,7 @@ public:
 		}
 		idx_t result = DConstants::INVALID_INDEX;
 		while (true) {
-			if ((node_values[descendant] & node_mask) != 0) {
+			if ((node_values[descendant].flags & node_mask) != 0) {
 				result = descendant;
 			}
 			if (descendant == ancestor) {
@@ -197,6 +197,33 @@ TEST_CASE("Rooted dynamic forest preserves path values across cuts", "[optimizer
 	}
 	REQUIRE_FALSE(forest.CutFromParent(*nodes[0]));
 	REQUIRE_FALSE(forest.Link(*nodes[7], *nodes[0]));
+}
+
+TEST_CASE("Rooted dynamic forest maintains minimum path cardinality", "[optimizer][rooted_dynamic_forest]") {
+	RootedDynamicForest forest;
+	auto nodes = CreateForestNodes(5);
+	forest.SetNodeValue(*nodes[0], {1, 100});
+	forest.SetNodeValue(*nodes[1], {2});
+	forest.SetNodeValue(*nodes[2], {4, 20});
+	forest.SetNodeValue(*nodes[3], {8, 0});
+	forest.SetNodeValue(*nodes[4], {16, 50});
+	for (idx_t child_idx = 1; child_idx < nodes.size(); child_idx++) {
+		REQUIRE(forest.Link(*nodes[child_idx], *nodes[child_idx - 1]));
+	}
+
+	RootedDynamicForestPathValue path;
+	REQUIRE(forest.GetPathValue(*nodes[0], *nodes[2], path));
+	REQUIRE(path.minimum_cardinality.GetIndex() == 20);
+	REQUIRE(forest.GetPathValue(*nodes[1], *nodes[1], path));
+	REQUIRE_FALSE(path.minimum_cardinality.IsValid());
+	REQUIRE(forest.GetPathValue(*nodes[1], *nodes[4], path));
+	REQUIRE(path.minimum_cardinality.GetIndex() == 0);
+
+	forest.SetNodeValue(*nodes[3], {8, 30});
+	REQUIRE(forest.GetPathValue(*nodes[1], *nodes[4], path));
+	REQUIRE(path.minimum_cardinality.GetIndex() == 20);
+	REQUIRE(forest.CutFromParent(*nodes[3]));
+	REQUIRE(forest.GetRootPathValue(*nodes[4]).minimum_cardinality.GetIndex() == 30);
 }
 
 TEST_CASE("Rooted dynamic forest finds the first matching path node", "[optimizer][rooted_dynamic_forest]") {
@@ -331,6 +358,13 @@ TEST_CASE("Rooted dynamic forest matches a naive randomized oracle", "[optimizer
 		auto nodes = CreateForestNodes(NODE_COUNT);
 		NaiveRootedForest oracle(NODE_COUNT);
 		std::mt19937_64 random(random_seed);
+		auto RandomValue = [&]() {
+			RootedDynamicForestPathValue result {uint64_t(1) << (random() % 63)};
+			if (random() % 3 != 0) {
+				result.minimum_cardinality = random() % 1000;
+			}
+			return result;
+		};
 
 		auto ComparePair = [&](idx_t left, idx_t right) {
 			INFO("seed=" << random_seed << " left=" << left << " right=" << right);
@@ -357,8 +391,8 @@ TEST_CASE("Rooted dynamic forest matches a naive randomized oracle", "[optimizer
 			case 0:
 				if (node != other && oracle.parents[node] == DConstants::INVALID_INDEX &&
 				    !oracle.Connected(node, other)) {
-					const uint64_t edge = uint64_t(1) << (random() % 63);
-					REQUIRE(forest.Link(*nodes[node], *nodes[other], {edge}));
+					const auto edge = RandomValue();
+					REQUIRE(forest.Link(*nodes[node], *nodes[other], edge));
 					oracle.parents[node] = other;
 					oracle.edge_values[node] = edge;
 				}
@@ -368,20 +402,20 @@ TEST_CASE("Rooted dynamic forest matches a naive randomized oracle", "[optimizer
 				REQUIRE(forest.CutFromParent(*nodes[node]) == expected);
 				if (expected) {
 					oracle.parents[node] = DConstants::INVALID_INDEX;
-					oracle.edge_values[node] = 0;
+					oracle.edge_values[node] = {};
 				}
 				break;
 			}
 			case 2: {
-				const uint64_t value = uint64_t(1) << (random() % 63);
-				forest.SetNodeValue(*nodes[node], {value});
+				const auto value = RandomValue();
+				forest.SetNodeValue(*nodes[node], value);
 				oracle.node_values[node] = value;
 				break;
 			}
 			case 3: {
-				const uint64_t value = uint64_t(1) << (random() % 63);
+				const auto value = RandomValue();
 				const bool expected = oracle.parents[node] != DConstants::INVALID_INDEX;
-				REQUIRE(forest.SetEdgeValue(*nodes[node], {value}) == expected);
+				REQUIRE(forest.SetEdgeValue(*nodes[node], value) == expected);
 				if (expected) {
 					oracle.edge_values[node] = value;
 				}
@@ -389,14 +423,14 @@ TEST_CASE("Rooted dynamic forest matches a naive randomized oracle", "[optimizer
 			}
 			case 4:
 				REQUIRE(ForestNodeIndex(nodes, forest.FindRoot(*nodes[node])) == oracle.FindRoot(node));
-				REQUIRE(forest.GetRootPathValue(*nodes[node]).flags == oracle.RootPathValue(node));
+				REQUIRE(forest.GetRootPathValue(*nodes[node]) == oracle.RootPathValue(node));
 				break;
 			case 5: {
 				RootedDynamicForestPathValue path;
 				const bool expected = oracle.IsAncestor(node, other);
 				REQUIRE(forest.GetPathValue(*nodes[node], *nodes[other], path) == expected);
 				if (expected) {
-					REQUIRE(path.flags == oracle.PathValue(node, other));
+					REQUIRE(path == oracle.PathValue(node, other));
 				}
 				break;
 			}

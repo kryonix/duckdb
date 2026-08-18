@@ -10,6 +10,7 @@
 #include "duckdb/planner/expression/list.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/joinside.hpp"
+#include "duckdb/planner/logical_plan_data_flow.hpp"
 #include "duckdb/planner/operator/list.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 
@@ -456,6 +457,16 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 		auto child_optimizer = optimizer.CreateChildOptimizer();
 		op->children[0] = child_optimizer.Optimize(std::move(op->children[0]), &child_stats);
 		auto &aggr = op->Cast<LogicalAggregate>();
+		{
+			LogicalPlanDataFlow data_flow(aggr);
+			for (auto &group : aggr.groups) {
+				if (group->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+					continue;
+				}
+				auto binding = group->Cast<BoundColumnRefExpression>().Binding();
+				RelationStatisticsHelper::ApplyDistinctCountPathBound(data_flow, aggr, binding, child_stats);
+			}
+		}
 		auto operator_stats = RelationStatisticsHelper::ExtractAggregationStats(aggr, child_stats);
 		if (!operator_stats) {
 			stats_complete = false;
@@ -675,6 +686,16 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 		RelationStats lhs_stats;
 		auto lhs_optimizer = optimizer.CreateChildOptimizer();
 		op->children[0] = lhs_optimizer.Optimize(std::move(op->children[0]), &lhs_stats);
+		{
+			LogicalPlanDataFlow data_flow(*op->children[0]);
+			for (auto &delim_col : delim_join.duplicate_eliminated_columns) {
+				if (delim_col->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+					continue;
+				}
+				auto binding = delim_col->Cast<BoundColumnRefExpression>().Binding();
+				RelationStatisticsHelper::ApplyDistinctCountPathBound(data_flow, *op->children[0], binding, lhs_stats);
+			}
+		}
 
 		// create dummy aggregation for the duplicate elimination
 		auto dummy_aggr = make_uniq<LogicalAggregate>(TableIndex(DConstants::INVALID_INDEX - 1), TableIndex(),
