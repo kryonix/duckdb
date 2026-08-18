@@ -9,19 +9,20 @@ namespace duckdb {
 
 using Filter = FilterPushdown::Filter;
 
-unique_ptr<LogicalOperator> FilterPushdown::PushdownSemiAntiJoin(unique_ptr<LogicalOperator> op) {
+void FilterPushdown::PushdownSemiAntiJoin(unique_ptr<LogicalOperator> &op, RewriteContext &context) {
 	auto &join = op->Cast<LogicalJoin>();
 
 	// push all current filters down the left side
-	op->children[0] = Rewrite(std::move(op->children[0]));
+	Rewrite(op->children[0], context);
 	FilterPushdown right_pushdown(optimizer, convert_mark_joins, projection_mode);
-	op->children[1] = right_pushdown.Rewrite(std::move(op->children[1]));
+	right_pushdown.Rewrite(op->children[1], context);
 
 	bool left_empty = op->children[0]->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT;
 	bool right_empty = op->children[1]->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT;
 	if (left_empty && right_empty) {
 		// both empty: return empty result
-		return make_uniq<LogicalEmptyResult>(std::move(op));
+		ReplaceWithEmptyResult(op, context);
+		return;
 	}
 	// TODO: if semi/anti join is created from a intersect/except statement, then we can
 	//  push filters down into both children.
@@ -31,7 +32,8 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownSemiAntiJoin(unique_ptr<Logi
 		switch (join.join_type) {
 		case JoinType::ANTI:
 		case JoinType::SEMI:
-			return make_uniq<LogicalEmptyResult>(std::move(op));
+			ReplaceWithEmptyResult(op, context);
+			return;
 		default:
 			break;
 		}
@@ -40,14 +42,15 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownSemiAntiJoin(unique_ptr<Logi
 		switch (join.join_type) {
 		case JoinType::ANTI:
 			// just return the left child.
-			return std::move(op->children[0]);
+			context.mutator.PromoteChild(op, 0);
+			return;
 		case JoinType::SEMI:
-			return make_uniq<LogicalEmptyResult>(std::move(op));
+			ReplaceWithEmptyResult(op, context);
+			return;
 		default:
 			break;
 		}
 	}
-	return op;
 }
 
 } // namespace duckdb

@@ -41,6 +41,7 @@ private:
 	RootedDynamicForestPathValue node_value;
 	RootedDynamicForestPathValue edge_to_parent;
 	RootedDynamicForestPathValue auxiliary_value;
+	RootedDynamicForestPathValue auxiliary_node_value;
 };
 
 //! A fixed-root link/cut forest. Represented edges point from a child toward its parent.
@@ -63,6 +64,23 @@ public:
 	RootedDynamicForestPathValue GetRootPathValue(RootedDynamicForestNode &node);
 	bool GetPathValue(RootedDynamicForestNode &ancestor, RootedDynamicForestNode &descendant,
 	                  RootedDynamicForestPathValue &result);
+	//! Returns the first matching node on the inclusive path, starting at ancestor.
+	optional_ptr<RootedDynamicForestNode> FindFirstNodeOnPath(RootedDynamicForestNode &ancestor,
+	                                                          RootedDynamicForestNode &descendant,
+	                                                          const RootedDynamicForestPathValue &node_mask);
+	//! Returns the last matching node on the inclusive path, ending at descendant.
+	optional_ptr<RootedDynamicForestNode> FindLastNodeOnPath(RootedDynamicForestNode &ancestor,
+	                                                         RootedDynamicForestNode &descendant,
+	                                                         const RootedDynamicForestPathValue &node_mask);
+	//! Sets result to the last matching node and returns whether the path exists.
+	bool FindLastNodeOnPath(RootedDynamicForestNode &ancestor, RootedDynamicForestNode &descendant,
+	                        const RootedDynamicForestPathValue &node_mask,
+	                        optional_ptr<RootedDynamicForestNode> &result);
+	//! Also sets path_child to the first node after ancestor, when one exists.
+	bool FindLastNodeOnPath(RootedDynamicForestNode &ancestor, RootedDynamicForestNode &descendant,
+	                        const RootedDynamicForestPathValue &node_mask,
+	                        optional_ptr<RootedDynamicForestNode> &result,
+	                        optional_ptr<RootedDynamicForestNode> &path_child);
 
 	optional_ptr<RootedDynamicForestNode> GetRepresentedParent(RootedDynamicForestNode &node) const;
 	RootedDynamicForestPathValue GetEdgeValue(RootedDynamicForestNode &node) const;

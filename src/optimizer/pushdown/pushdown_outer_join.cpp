@@ -171,11 +171,9 @@ PushDownFiltersOnCoalescedEqualJoinKeys(vector<unique_ptr<Filter>> &filters, vec
 	return has_applied_pushdown;
 }
 
-unique_ptr<LogicalOperator> FilterPushdown::PushdownOuterJoin(unique_ptr<LogicalOperator> op,
-                                                              unordered_set<TableIndex> &left_bindings,
-                                                              unordered_set<TableIndex> &right_bindings) {
+void FilterPushdown::PushdownOuterJoin(unique_ptr<LogicalOperator> &op, RewriteContext &context) {
 	if (op->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		return FinishPushdown(std::move(op));
+		return FinishPushdown(op, context);
 	}
 
 	auto &join = op->Cast<LogicalComparisonJoin>();
@@ -188,14 +186,14 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownOuterJoin(unique_ptr<Logical
 	    [&](unique_ptr<Expression> filter) { right_pushdown.AddFilter(std::move(filter)); });
 
 	if (!has_applied_pushdown) {
-		return FinishPushdown(std::move(op));
+		return FinishPushdown(op, context);
 	}
 
 	left_pushdown.GenerateFilters();
 	right_pushdown.GenerateFilters();
-	op->children[0] = left_pushdown.Rewrite(std::move(op->children[0]));
-	op->children[1] = right_pushdown.Rewrite(std::move(op->children[1]));
-	return PushFinalFilters(std::move(op));
+	left_pushdown.Rewrite(op->children[0], context);
+	right_pushdown.Rewrite(op->children[1], context);
+	PushFinalFilters(op, context);
 }
 
 } // namespace duckdb

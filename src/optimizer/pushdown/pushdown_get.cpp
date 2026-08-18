@@ -41,7 +41,7 @@ static void NormalizeColumnRefAliases(unique_ptr<Expression> &expr, const Logica
 	});
 }
 
-unique_ptr<LogicalOperator> FilterPushdown::PushdownGet(unique_ptr<LogicalOperator> op) {
+void FilterPushdown::PushdownGet(unique_ptr<LogicalOperator> &op, RewriteContext &context) {
 	D_ASSERT(op->type == LogicalOperatorType::LOGICAL_GET);
 	auto &get = op->Cast<LogicalGet>();
 
@@ -70,9 +70,10 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownGet(unique_ptr<LogicalOperat
 		filters.clear();
 
 		get.function.pushdown_complex_filter(optimizer.context, get, get.bind_data.get(), expressions);
+		context.mutator.RefreshOperator(get);
 
 		if (expressions.empty()) {
-			return op;
+			return;
 		}
 		// re-generate the filters
 		for (auto &expr : expressions) {
@@ -85,10 +86,11 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownGet(unique_ptr<LogicalOperat
 
 	if (get.table_filters.HasFilters() || !get.function.filter_pushdown) {
 		// the table function does not support filter pushdown: push a LogicalFilter on top
-		return FinishPushdown(std::move(op));
+		return FinishPushdown(op, context);
 	}
 	if (PushFilters() == FilterResult::UNSATISFIABLE) {
-		return make_uniq<LogicalEmptyResult>(std::move(op));
+		ReplaceWithEmptyResult(op, context);
+		return;
 	}
 
 	auto &column_ids = get.GetColumnIds();
@@ -141,7 +143,8 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownGet(unique_ptr<LogicalOperat
 	}
 
 	//! Now we try to pushdown the remaining filters to perform zonemap checking
-	return FinishPushdown(std::move(op));
+	context.mutator.RefreshOperator(get);
+	FinishPushdown(op, context);
 }
 
 } // namespace duckdb

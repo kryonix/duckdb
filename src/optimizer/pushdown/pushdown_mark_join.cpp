@@ -25,9 +25,8 @@ static void SimplifyNullSafeSemiJoinConditions(ClientContext &context, LogicalCo
 	}
 }
 
-unique_ptr<LogicalOperator> FilterPushdown::PushdownMarkJoin(unique_ptr<LogicalOperator> op,
-                                                             unordered_set<TableIndex> &left_bindings,
-                                                             unordered_set<TableIndex> &right_bindings) {
+void FilterPushdown::PushdownMarkJoin(unique_ptr<LogicalOperator> &op, JoinBindingState &binding_state,
+                                      RewriteContext &context) {
 	auto op_bindings = op->GetColumnBindings();
 	auto &join = op->Cast<LogicalJoin>();
 	auto &comp_join = op->Cast<LogicalComparisonJoin>();
@@ -35,7 +34,7 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownMarkJoin(unique_ptr<LogicalO
 	D_ASSERT(op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
 	         op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN || op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN);
 
-	right_bindings.insert(comp_join.mark_index);
+	binding_state.AddRightBinding(comp_join.mark_index);
 	FilterPushdown left_pushdown(optimizer, convert_mark_joins, projection_mode);
 	FilterPushdown right_pushdown(optimizer, convert_mark_joins, projection_mode);
 #ifdef DEBUG
@@ -43,7 +42,7 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownMarkJoin(unique_ptr<LogicalO
 #endif
 	// now check the set of filters
 	for (idx_t i = 0; i < filters.size(); i++) {
-		auto side = JoinSide::GetJoinSide(filters[i]->bindings, left_bindings, right_bindings);
+		auto side = GetJoinSide(*filters[i], JoinDecisionPolicy::MARK_JOIN, binding_state);
 		if (side == JoinSide::LEFT) {
 			// bindings match left side: push into left
 			left_pushdown.filters.push_back(std::move(filters[i]));
@@ -100,12 +99,14 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownMarkJoin(unique_ptr<LogicalO
 			}
 		}
 	}
-	op->children[0] = left_pushdown.Rewrite(std::move(op->children[0]));
-	op->children[1] = right_pushdown.Rewrite(std::move(op->children[1]));
+	context.mutator.RefreshOperator(join);
+	left_pushdown.Rewrite(op->children[0], context);
+	right_pushdown.Rewrite(op->children[1], context);
 	if (join.join_type == JoinType::SEMI) {
 		SimplifyNullSafeSemiJoinConditions(GetContext(), comp_join);
+		context.mutator.RefreshOperator(comp_join);
 	}
-	return PushFinalFilters(std::move(op));
+	PushFinalFilters(op, context);
 }
 
 } // namespace duckdb

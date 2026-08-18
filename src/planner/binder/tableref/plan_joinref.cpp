@@ -149,14 +149,14 @@ static bool IsComparisonExpression(const Expression &expr) {
 }
 
 //! Create a JoinCondition from a comparison
-static bool CreateJoinCondition(Expression &expr, const unordered_set<TableIndex> &left_bindings,
-                                const unordered_set<TableIndex> &right_bindings, vector<JoinCondition> &conditions) {
+template <class GET_JOIN_SIDE>
+static bool CreateJoinCondition(Expression &expr, vector<JoinCondition> &conditions, GET_JOIN_SIDE &&get_join_side) {
 	// comparison
 	auto &comparison = expr.Cast<BoundFunctionExpression>();
 	auto &left_expr = BoundComparisonExpression::Left(comparison);
 	auto &right_expr = BoundComparisonExpression::Right(comparison);
-	auto left_side = JoinSide::GetJoinSide(left_expr, left_bindings, right_bindings);
-	auto right_side = JoinSide::GetJoinSide(right_expr, left_bindings, right_bindings);
+	auto left_side = get_join_side(left_expr);
+	auto right_side = get_join_side(right_expr);
 	if (left_side != JoinSide::BOTH && right_side != JoinSide::BOTH) {
 		// join condition can be divided in a left/right side
 		auto comp_type = expr.GetExpressionType();
@@ -200,7 +200,9 @@ void LogicalComparisonJoin::ExtractJoinConditions(ClientContext &context, JoinTy
 			}
 		} else if (side == JoinSide::BOTH) {
 			if (IsComparisonExpression(*expr) && IsJoinTypeCondition(ref_type, expr->GetExpressionType()) &&
-			    CreateJoinCondition(*expr, left_bindings, right_bindings, conditions)) {
+			    CreateJoinCondition(*expr, conditions, [&](const Expression &condition) {
+				    return JoinSide::GetJoinSide(condition, left_bindings, right_bindings);
+			    })) {
 				continue;
 			}
 		}
@@ -230,6 +232,49 @@ void LogicalComparisonJoin::ExtractJoinConditions(ClientContext &context, JoinTy
 	expressions.push_back(std::move(condition));
 	LogicalFilter::SplitPredicates(expressions);
 	return ExtractJoinConditions(context, type, ref_type, left_child, right_child, expressions, conditions);
+}
+
+void LogicalComparisonJoin::ExtractJoinConditionsWithoutPushdown(ClientContext &context, JoinType type,
+                                                                 JoinRefType ref_type,
+                                                                 const unordered_set<TableIndex> &left_bindings,
+                                                                 const unordered_set<TableIndex> &right_bindings,
+                                                                 vector<unique_ptr<Expression>> &expressions,
+                                                                 vector<JoinCondition> &conditions) {
+	for (auto &expr : expressions) {
+		auto side = JoinSide::GetJoinSide(*expr, left_bindings, right_bindings);
+		if (side == JoinSide::NONE && CanEliminate(context, type, expr)) {
+			continue;
+		}
+		if (side == JoinSide::BOTH && IsComparisonExpression(*expr) &&
+		    IsJoinTypeCondition(ref_type, expr->GetExpressionType()) &&
+		    CreateJoinCondition(*expr, conditions, [&](const Expression &condition) {
+			    return JoinSide::GetJoinSide(condition, left_bindings, right_bindings);
+		    })) {
+			continue;
+		}
+		D_ASSERT(side == JoinSide::BOTH || side == JoinSide::NONE);
+		conditions.emplace_back(std::move(expr));
+	}
+}
+
+void LogicalComparisonJoin::ExtractJoinConditionsWithoutPushdown(ClientContext &context, JoinType type,
+                                                                 JoinRefType ref_type,
+                                                                 const JoinSideCallback &get_join_side,
+                                                                 vector<unique_ptr<Expression>> &expressions,
+                                                                 vector<JoinCondition> &conditions) {
+	for (auto &expr : expressions) {
+		auto side = get_join_side(*expr);
+		if (side == JoinSide::NONE && CanEliminate(context, type, expr)) {
+			continue;
+		}
+		if (side == JoinSide::BOTH && IsComparisonExpression(*expr) &&
+		    IsJoinTypeCondition(ref_type, expr->GetExpressionType()) &&
+		    CreateJoinCondition(*expr, conditions, get_join_side)) {
+			continue;
+		}
+		D_ASSERT(side == JoinSide::BOTH || side == JoinSide::NONE);
+		conditions.emplace_back(std::move(expr));
+	}
 }
 
 //! Create the join operator based on conditions and join type

@@ -1,5 +1,7 @@
 #include "benchmark_runner.hpp"
 #include "duckdb_benchmark_macro.hpp"
+#include "duckdb/optimizer/filter_pullup.hpp"
+#include "duckdb/optimizer/filter_pushdown.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/projection_pullup.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -25,6 +27,24 @@ struct ProjectionPullupState : public DuckDBBenchmarkState {
 		planner = make_uniq<Planner>(*conn.context);
 		planner->CreatePlan(std::move(parser.statements[0]));
 		plan = std::move(planner->plan);
+	}
+
+	unique_ptr<Planner> planner;
+	unique_ptr<LogicalOperator> plan;
+};
+
+struct FilterPushdownState : public DuckDBBenchmarkState {
+	explicit FilterPushdownState(const string &query) : DuckDBBenchmarkState(string()) {
+		conn.BeginTransaction();
+		Parser parser(conn.context->GetParserOptions());
+		parser.ParseQuery(query);
+		if (parser.statements.size() != 1) {
+			throw InvalidInputException("Filter pushdown benchmark requires one statement");
+		}
+		planner = make_uniq<Planner>(*conn.context);
+		planner->CreatePlan(std::move(parser.statements[0]));
+		FilterPullup filter_pullup;
+		plan = filter_pullup.Rewrite(std::move(planner->plan));
 	}
 
 	unique_ptr<Planner> planner;
@@ -150,6 +170,32 @@ static string GenerateComputedProjectionBranches(idx_t branch_count) {
 	}                                                                                                                  \
 	FINISH_BENCHMARK(NAME)
 
+#define FILTER_PUSHDOWN_BENCHMARK(NAME, QUERY)                                                                         \
+	DUCKDB_BENCHMARK(NAME, "[optimizer_planning]")                                                                     \
+	unique_ptr<DuckDBBenchmarkState> CreateBenchmarkState() override {                                                 \
+		return make_uniq<FilterPushdownState>(QUERY);                                                                  \
+	}                                                                                                                  \
+	void Load(DuckDBBenchmarkState *state) override {                                                                  \
+	}                                                                                                                  \
+	void RunBenchmark(DuckDBBenchmarkState *state) override {                                                          \
+		auto &pushdown_state = static_cast<FilterPushdownState &>(*state);                                             \
+		Optimizer optimizer(*pushdown_state.planner->binder, *pushdown_state.conn.context);                            \
+		FilterPushdown filter_pushdown(optimizer);                                                                     \
+		unordered_set<TableIndex> top_bindings;                                                                        \
+		filter_pushdown.CheckMarkToSemi(*pushdown_state.plan, top_bindings);                                           \
+		pushdown_state.plan = filter_pushdown.Rewrite(std::move(pushdown_state.plan));                                 \
+	}                                                                                                                  \
+	string VerifyResult(QueryResult *result) override {                                                                \
+		return string();                                                                                               \
+	}                                                                                                                  \
+	string BenchmarkInfo() override {                                                                                  \
+		return "Run filter pushdown on a generated bound plan";                                                        \
+	}                                                                                                                  \
+	bool RequireReinit() override {                                                                                    \
+		return true;                                                                                                   \
+	}                                                                                                                  \
+	FINISH_BENCHMARK(NAME)
+
 OPTIMIZER_PLANNING_BENCHMARK(OptimizerPlanningShallow, "SELECT i FROM range(1) source(i) WHERE i = 0")
 OPTIMIZER_PLANNING_BENCHMARK(OptimizerPlanningProjectionNarrow100, GenerateProjectionChain(100, 1))
 OPTIMIZER_PLANNING_BENCHMARK(OptimizerPlanningProjectionNarrow300, GenerateProjectionChain(300, 1))
@@ -166,3 +212,7 @@ PROJECTION_PULLUP_BENCHMARK(OptimizerProjectionPullupNarrow300, GenerateProjecti
 PROJECTION_PULLUP_BENCHMARK(OptimizerProjectionPullupWide30x64, GenerateProjectionChain(30, 64))
 PROJECTION_PULLUP_BENCHMARK(OptimizerProjectionPullupComputedBranches10, GenerateComputedProjectionBranches(10))
 PROJECTION_PULLUP_BENCHMARK(OptimizerProjectionPullupComputedBranches50, GenerateComputedProjectionBranches(50))
+
+FILTER_PUSHDOWN_BENCHMARK(OptimizerFilterPushdownJoin10, GenerateLeftDeepJoin(10))
+FILTER_PUSHDOWN_BENCHMARK(OptimizerFilterPushdownJoin30, GenerateLeftDeepJoin(30))
+FILTER_PUSHDOWN_BENCHMARK(OptimizerFilterPushdownJoin50, GenerateLeftDeepJoin(50))

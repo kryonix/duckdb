@@ -21,6 +21,9 @@ namespace duckdb {
 class LogicalComparisonJoin : public LogicalJoin {
 public:
 	static constexpr const LogicalOperatorType TYPE = LogicalOperatorType::LOGICAL_INVALID;
+	using PushFilterCallback =
+	    std::function<void(unique_ptr<LogicalOperator> &child, unique_ptr<Expression> &expression)>;
+	using JoinSideCallback = std::function<JoinSide(const Expression &expression)>;
 
 public:
 	explicit LogicalComparisonJoin(JoinType type,
@@ -68,6 +71,15 @@ public:
 	static void ExtractJoinConditions(ClientContext &context, JoinType type, JoinRefType ref_type,
 	                                  unique_ptr<LogicalOperator> &left_child, unique_ptr<LogicalOperator> &right_child,
 	                                  unique_ptr<Expression> condition, vector<JoinCondition> &conditions);
+	static void ExtractJoinConditionsWithoutPushdown(ClientContext &context, JoinType type, JoinRefType ref_type,
+	                                                 const unordered_set<TableIndex> &left_bindings,
+	                                                 const unordered_set<TableIndex> &right_bindings,
+	                                                 vector<unique_ptr<Expression>> &expressions,
+	                                                 vector<JoinCondition> &conditions);
+	static void ExtractJoinConditionsWithoutPushdown(ClientContext &context, JoinType type, JoinRefType ref_type,
+	                                                 const JoinSideCallback &get_join_side,
+	                                                 vector<unique_ptr<Expression>> &expressions,
+	                                                 vector<JoinCondition> &conditions);
 
 	bool HasEquality(idx_t &range_count) const;
 	bool HasArbitraryConditions() const;

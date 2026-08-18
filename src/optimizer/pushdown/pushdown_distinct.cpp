@@ -4,16 +4,16 @@
 
 namespace duckdb {
 
-unique_ptr<LogicalOperator> FilterPushdown::PushdownDistinct(unique_ptr<LogicalOperator> op) {
+void FilterPushdown::PushdownDistinct(unique_ptr<LogicalOperator> &op, RewriteContext &context) {
 	D_ASSERT(op->type == LogicalOperatorType::LOGICAL_DISTINCT);
 	auto &distinct = op->Cast<LogicalDistinct>();
 	if (!distinct.order_by) {
 		// regular DISTINCT - can just push down
-		op->children[0] = Rewrite(std::move(op->children[0]));
-		return op;
+		Rewrite(op->children[0], context);
+		return;
 	}
 	// no pushdown through DISTINCT ON (yet?)
-	return FinishPushdown(std::move(op));
+	FinishPushdown(op, context);
 }
 
 } // namespace duckdb

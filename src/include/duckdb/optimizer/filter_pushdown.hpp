@@ -11,6 +11,8 @@
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/optimizer/filter_combiner.hpp"
 #include "duckdb/optimizer/rule.hpp"
+#include "duckdb/planner/joinside.hpp"
+#include "duckdb/planner/logical_plan_data_flow.hpp"
 
 namespace duckdb {
 
@@ -43,73 +45,168 @@ public:
 	};
 
 private:
+	struct RewriteContext {
+		explicit RewriteContext(LogicalOperator &root) : data_flow(root), mutator(data_flow) {
+		}
+
+		LogicalPlanDataFlow data_flow;
+		LogicalPlanDataFlowMutator mutator;
+	};
+
+	enum class JoinDecisionPolicy {
+		CROSS_PRODUCT,
+		LEFT_JOIN,
+		ASOF_JOIN,
+		SINGLE_JOIN,
+		MARK_JOIN,
+		GENERATED_RIGHT_FILTER
+	};
+
+	struct IndexedJoinSourceResult {
+		LogicalPlanDataFlowStatus status = LogicalPlanDataFlowStatus::SUCCESS;
+		bool left = false;
+		bool right = false;
+		bool join = false;
+	};
+
+	struct IndexedJoinSideResult {
+		LogicalPlanDataFlowStatus status = LogicalPlanDataFlowStatus::SUCCESS;
+		JoinSide side = JoinSide::NONE;
+	};
+
+	struct IndexedDelimJoinResult {
+		LogicalPlanDataFlowStatus status = LogicalPlanDataFlowStatus::SUCCESS;
+		bool should_push = false;
+	};
+
+	LogicalPlanDataFlowOperatorResult GetFilterConvergence(const Filter &filter, LogicalOperator &consumer,
+	                                                       RewriteContext &context) const;
+	LogicalPlanDataFlowOperatorResult GetIndexedFilterTarget(const Filter &filter, LogicalOperator &consumer,
+	                                                         RewriteContext &context) const;
+	bool TryRewriteAtIndexedTarget(unique_ptr<LogicalOperator> &op, RewriteContext &context);
+
+	class JoinBindingState {
+	public:
+		JoinBindingState(LogicalOperator &join, LogicalPlanDataFlow &data_flow);
+
+		LogicalOperator &Join();
+		void AddRightBinding(TableIndex table_index);
+		bool IsExtraRightBinding(TableIndex table_index) const;
+		LogicalPlanDataFlowOperatorResult ResolveSource(const ColumnBinding &binding, idx_t depth);
+#ifdef DEBUG
+		JoinSide GetLegacyJoinSide(const Filter &filter);
+		JoinSide GetLegacyJoinSide(const Expression &expression);
+#endif
+
+	private:
+#ifdef DEBUG
+		void Initialize();
+		void InitializeLeft();
+		void InitializeRight();
+#endif
+
+	private:
+		reference<LogicalOperator> join;
+		reference<LogicalPlanDataFlow> data_flow;
+#ifdef DEBUG
+		bool left_initialized = false;
+		bool right_initialized = false;
+		unordered_set<TableIndex> left_bindings;
+		unordered_set<TableIndex> right_bindings;
+#endif
+		unordered_set<TableIndex> extra_right_bindings;
+		column_binding_map_t<LogicalPlanDataFlowOperatorResult> indexed_sources;
+	};
+
+#ifdef DEBUG
+	enum class JoinFilterDecision {
+		PUSH_LEFT,
+		PUSH_RIGHT,
+		CREATE_JOIN_CONDITION,
+		INSPECT_NULL_REJECTION,
+		INSPECT_MARK,
+		KEEP,
+		DISCARD
+	};
+
+	LogicalPlanDataFlowOperatorResult GetLegacyFilterTarget(LogicalOperator &consumer, LogicalOperator &convergence,
+	                                                        RewriteContext &context) const;
+	static bool IsLegacyFilterPushdownBoundary(const LogicalOperator &op);
+	void VerifyIndexedFilterTargets(LogicalOperator &consumer, RewriteContext &context) const;
+#endif
+
 	Optimizer &optimizer;
 	FilterCombiner combiner;
 	bool convert_mark_joins;
 	ProjectionMode projection_mode;
 
 	vector<unique_ptr<Filter>> filters;
+	void Rewrite(unique_ptr<LogicalOperator> &op, RewriteContext &context);
 	//! Push down a LogicalAggregate op
-	unique_ptr<LogicalOperator> PushdownAggregate(unique_ptr<LogicalOperator> op);
+	void PushdownAggregate(unique_ptr<LogicalOperator> &op, RewriteContext &context);
 	//! Push down a distinct operator
-	unique_ptr<LogicalOperator> PushdownDistinct(unique_ptr<LogicalOperator> op);
+	void PushdownDistinct(unique_ptr<LogicalOperator> &op, RewriteContext &context);
 	//! Push down a LogicalFilter op
-	unique_ptr<LogicalOperator> PushdownFilter(unique_ptr<LogicalOperator> op);
+	void PushdownFilter(unique_ptr<LogicalOperator> &op, RewriteContext &context);
 	//! Push down a LogicalCrossProduct op
-	unique_ptr<LogicalOperator> PushdownCrossProduct(unique_ptr<LogicalOperator> op);
+	void PushdownCrossProduct(unique_ptr<LogicalOperator> &op, RewriteContext &context);
 	//! Push down a join operator
-	unique_ptr<LogicalOperator> PushdownJoin(unique_ptr<LogicalOperator> op);
+	void PushdownJoin(unique_ptr<LogicalOperator> &op, RewriteContext &context);
 	//! Push down a LogicalProjection op
-	unique_ptr<LogicalOperator> PushdownProjection(unique_ptr<LogicalOperator> op);
+	void PushdownProjection(unique_ptr<LogicalOperator> &op, RewriteContext &context);
 	//! Split a projection so filters can reuse computed outputs without forcing all expressions to be evaluated early
-	unique_ptr<LogicalOperator> SplitProjection(unique_ptr<LogicalOperator> op,
-	                                            vector<unique_ptr<Expression>> split_expressions);
+	void SplitProjection(unique_ptr<LogicalOperator> &op, vector<unique_ptr<Expression>> split_expressions,
+	                     RewriteContext &context);
 	//! Push down a LogicalProjection op
-	unique_ptr<LogicalOperator> PushdownUnnest(unique_ptr<LogicalOperator> op);
+	void PushdownUnnest(unique_ptr<LogicalOperator> &op, RewriteContext &context);
 	//! Push down a LogicalSetOperation op
-	unique_ptr<LogicalOperator> PushdownSetOperation(unique_ptr<LogicalOperator> op);
+	void PushdownSetOperation(unique_ptr<LogicalOperator> &op, RewriteContext &context);
 	//! Push down a LogicalGet op
-	unique_ptr<LogicalOperator> PushdownGet(unique_ptr<LogicalOperator> op);
+	void PushdownGet(unique_ptr<LogicalOperator> &op, RewriteContext &context);
 	//! Push down a LogicalLimit op
-	unique_ptr<LogicalOperator> PushdownLimit(unique_ptr<LogicalOperator> op);
+	void PushdownLimit(unique_ptr<LogicalOperator> &op, RewriteContext &context);
 	//! Push down a LogicalWindow op
-	unique_ptr<LogicalOperator> PushdownWindow(unique_ptr<LogicalOperator> op);
+	void PushdownWindow(unique_ptr<LogicalOperator> &op, RewriteContext &context);
 	// Pushdown an inner join
-	unique_ptr<LogicalOperator> PushdownInnerJoin(unique_ptr<LogicalOperator> op,
-	                                              unordered_set<TableIndex> &left_bindings,
-	                                              unordered_set<TableIndex> &right_bindings);
+	void PushdownInnerJoin(unique_ptr<LogicalOperator> &op, RewriteContext &context);
 	// Pushdown a left join
-	unique_ptr<LogicalOperator> PushdownLeftJoin(unique_ptr<LogicalOperator> op,
-	                                             unordered_set<TableIndex> &left_bindings,
-	                                             unordered_set<TableIndex> &right_bindings);
+	void PushdownLeftJoin(unique_ptr<LogicalOperator> &op, JoinBindingState &binding_state, RewriteContext &context);
 
 	// Pushdown an outer join
-	unique_ptr<LogicalOperator> PushdownOuterJoin(unique_ptr<LogicalOperator> op,
-	                                              unordered_set<TableIndex> &left_bindings,
-	                                              unordered_set<TableIndex> &right_bindings);
-	unique_ptr<LogicalOperator> PushdownSemiAntiJoin(unique_ptr<LogicalOperator> op);
+	void PushdownOuterJoin(unique_ptr<LogicalOperator> &op, RewriteContext &context);
+	void PushdownSemiAntiJoin(unique_ptr<LogicalOperator> &op, RewriteContext &context);
 	// Pushdown a mark join
-	unique_ptr<LogicalOperator> PushdownMarkJoin(unique_ptr<LogicalOperator> op,
-	                                             unordered_set<TableIndex> &left_bindings,
-	                                             unordered_set<TableIndex> &right_bindings);
+	void PushdownMarkJoin(unique_ptr<LogicalOperator> &op, JoinBindingState &binding_state, RewriteContext &context);
 	// Pushdown a single join
-	unique_ptr<LogicalOperator> PushdownSingleJoin(unique_ptr<LogicalOperator> op,
-	                                               unordered_set<TableIndex> &left_bindings,
-	                                               unordered_set<TableIndex> &right_bindings);
+	void PushdownSingleJoin(unique_ptr<LogicalOperator> &op, JoinBindingState &binding_state, RewriteContext &context);
 
 	// AddLogicalFilter used to add an extra LogicalFilter at this level,
 	// because in some cases, some expressions can not be pushed down.
-	unique_ptr<LogicalOperator> AddLogicalFilter(unique_ptr<LogicalOperator> op,
-	                                             vector<unique_ptr<Expression>> expressions);
+	void AddLogicalFilter(unique_ptr<LogicalOperator> &op, vector<unique_ptr<Expression>> expressions,
+	                      RewriteContext &context);
 	//! Push any remaining filters into a LogicalFilter at this level
-	unique_ptr<LogicalOperator> PushFinalFilters(unique_ptr<LogicalOperator> op);
+	void PushFinalFilters(unique_ptr<LogicalOperator> &op, RewriteContext &context);
 	// Finish pushing down at this operator, creating a LogicalFilter to store any of the stored filters and recursively
 	// pushing down into its children (if any)
-	unique_ptr<LogicalOperator> FinishPushdown(unique_ptr<LogicalOperator> op);
+	void FinishPushdown(unique_ptr<LogicalOperator> &op, RewriteContext &context);
 	//! Adds a filter to the set of filters. Returns FilterResult::UNSATISFIABLE if the subtree should be stripped, or
 	//! FilterResult::SUCCESS otherwise
 
-	unique_ptr<LogicalOperator> PushFiltersIntoDelimJoin(unique_ptr<LogicalOperator> op);
+	bool PushFiltersIntoDelimJoin(unique_ptr<LogicalOperator> &op, RewriteContext &context);
+	void ReplaceWithEmptyResult(unique_ptr<LogicalOperator> &op, RewriteContext &context);
+	IndexedJoinSourceResult ClassifyJoinSources(const Expression &expression, JoinBindingState &binding_state) const;
+	static IndexedJoinSideResult GetIndexedJoinSide(const IndexedJoinSourceResult &sources, JoinDecisionPolicy policy);
+	JoinSide GetJoinSide(const Filter &filter, JoinDecisionPolicy policy, JoinBindingState &binding_state) const;
+	JoinSide GetJoinSide(const Expression &expression, JoinDecisionPolicy policy,
+	                     JoinBindingState &binding_state) const;
+	IndexedDelimJoinResult GetIndexedDelimJoinDecision(const Expression &expression, LogicalOperator &child,
+	                                                   JoinBindingState &binding_state) const;
+#ifdef DEBUG
+	static bool GetLegacyDelimJoinDecision(const Filter &filter, LogicalOperator &child);
+#endif
+#ifdef DEBUG
+	static JoinFilterDecision GetJoinFilterDecision(JoinSide side, JoinDecisionPolicy policy);
+#endif
 	FilterResult AddFilter(unique_ptr<Expression> expr);
 	//! Extract filter bindings to compare them with expressions in an operator and determine if the filter
 	//! can be pushed down

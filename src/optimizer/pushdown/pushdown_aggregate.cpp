@@ -24,7 +24,7 @@ void FilterPushdown::ExtractFilterBindings(const Expression &expr, vector<Column
 	    expr, [&](const BoundColumnRefExpression &colref) { bindings.push_back(colref.Binding()); });
 }
 
-unique_ptr<LogicalOperator> FilterPushdown::PushdownAggregate(unique_ptr<LogicalOperator> op) {
+void FilterPushdown::PushdownAggregate(unique_ptr<LogicalOperator> &op, RewriteContext &context) {
 	D_ASSERT(op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY);
 	auto &aggr = op->Cast<LogicalAggregate>();
 
@@ -77,7 +77,8 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownAggregate(unique_ptr<Logical
 		// add the filter to the child node
 		if (child_pushdown.AddFilter(std::move(f.filter)) == FilterResult::UNSATISFIABLE) {
 			// filter statically evaluates to false, strip tree
-			return make_uniq<LogicalEmptyResult>(std::move(op));
+			ReplaceWithEmptyResult(op, context);
+			return;
 		}
 		// erase the filter from here
 		filters.erase_at(i);
@@ -85,8 +86,8 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownAggregate(unique_ptr<Logical
 	}
 	child_pushdown.GenerateFilters();
 
-	op->children[0] = child_pushdown.Rewrite(std::move(op->children[0]));
-	return FinishPushdown(std::move(op));
+	child_pushdown.Rewrite(op->children[0], context);
+	FinishPushdown(op, context);
 }
 
 } // namespace duckdb

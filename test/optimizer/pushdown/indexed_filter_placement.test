@@ -1,0 +1,119 @@
+# name: test/optimizer/pushdown/indexed_filter_placement.test
+# description: Protect indexed filter placement across transparent operators and semantic boundaries
+# group: [pushdown]
+
+statement ok
+SET default_null_order = 'nulls_last';
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+CREATE TABLE placement(g INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO placement VALUES (1, 10), (1, 20), (2, 30), (2, 40), (3, NULL);
+
+# ORDER BY and regular DISTINCT are transparent to filter pushdown.
+query II
+SELECT *
+FROM (SELECT DISTINCT g, v FROM placement ORDER BY g, v) distinct_values
+WHERE v > 15
+ORDER BY ALL;
+----
+1	20
+2	30
+2	40
+
+statement ok
+PRAGMA explain_output = 'optimized_only';
+
+query II
+EXPLAIN SELECT *
+FROM (SELECT DISTINCT g, v FROM placement ORDER BY g, v) distinct_values
+WHERE v > 15;
+----
+logical_opt	<REGEX>:.*SEQ_SCAN.*Filters: v > 15.*
+
+# Indexed placement stops before a materialized CTE boundary.
+query II
+WITH placement_cte AS MATERIALIZED (SELECT * FROM placement)
+SELECT *
+FROM (SELECT DISTINCT g, v FROM placement_cte ORDER BY g, v) distinct_values
+WHERE v > 15
+ORDER BY ALL;
+----
+1	20
+2	30
+2	40
+
+# DISTINCT ON is a boundary because filtering its selected rows can change which row wins.
+query II
+SELECT *
+FROM (SELECT DISTINCT ON (g) g, v FROM placement ORDER BY g, v DESC) distinct_values
+WHERE v < 35
+ORDER BY ALL;
+----
+1	20
+
+# LIMIT is a boundary even when an ORDER BY below it is transparent.
+query II
+SELECT *
+FROM (SELECT * FROM placement ORDER BY v NULLS LAST LIMIT 2) limited
+WHERE v > 10
+ORDER BY ALL;
+----
+1	20
+
+# Window outputs remain above their window boundary.
+query III
+SELECT *
+FROM (SELECT g, v, row_number() OVER (ORDER BY g, v) AS row_id FROM placement) windowed
+WHERE g = 2
+ORDER BY ALL;
+----
+2	30	3
+2	40	4
+
+# Filters on generated UNNEST values remain above the UNNEST boundary.
+query II
+SELECT *
+FROM (SELECT g, unnest([v, v + 1]) AS item FROM placement) unnested
+WHERE item > 30
+ORDER BY ALL;
+----
+2	31
+2	40
+2	41
+
+# Grouping sets preserve filters that are not valid for every grouping set.
+query II
+SELECT *
+FROM (SELECT g, sum(v) AS total FROM placement GROUP BY GROUPING SETS ((g), ())) grouped
+WHERE g = 1
+ORDER BY ALL;
+----
+1	30
+
+# Set-operation handlers still rewrite bindings independently for every child.
+query I
+SELECT g
+FROM (SELECT g FROM placement UNION ALL SELECT g FROM placement) combined
+WHERE g = 2
+ORDER BY ALL;
+----
+2
+2
+2
+2
+
+# A no-binding volatile predicate makes the batch use the established fallback path.
+query II
+SELECT *
+FROM (SELECT DISTINCT g, v FROM placement ORDER BY g, v) distinct_values
+WHERE v > 15 AND random() >= 0
+ORDER BY ALL;
+----
+1	20
+2	30
+2	40

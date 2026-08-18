@@ -30,11 +30,12 @@ namespace duckdb {
 
 using Filter = FilterPushdown::Filter;
 
+template <class IS_RIGHT_BINDING>
 static unique_ptr<Expression> ReplaceColRefWithNull(unique_ptr<Expression> root_expr,
-                                                    unordered_set<TableIndex> &right_bindings) {
+                                                    IS_RIGHT_BINDING &&is_right_binding) {
 	ExpressionIterator::VisitExpressionMutable<BoundColumnRefExpression>(
 	    root_expr, [&](BoundColumnRefExpression &bound_colref, unique_ptr<Expression> &expr) {
-		    if (right_bindings.find(bound_colref.Binding().table_index) != right_bindings.end()) {
+		    if (is_right_binding(bound_colref)) {
 			    // bound colref belongs to RHS
 			    // replace it with a constant NULL
 			    expr = make_uniq<BoundConstantExpression>(Value(expr->GetReturnType()));
@@ -74,12 +75,13 @@ static unique_ptr<LogicalOperator> CreateDummyRHS(Optimizer &optimizer, unique_p
 	return rhs;
 }
 
-static bool FilterRemovesNull(ClientContext &context, ExpressionRewriter &rewriter, Expression *expr,
-                              unordered_set<TableIndex> &right_bindings) {
+template <class IS_RIGHT_BINDING>
+static bool FilterRemovesNull(ClientContext &context, ExpressionRewriter &rewriter, Expression &expr,
+                              IS_RIGHT_BINDING &&is_right_binding) {
 	// make a copy of the expression
-	auto copy = expr->Copy();
+	auto copy = expr.Copy();
 	// replace all BoundColumnRef expressions from the RHS with NULL constants in the copied expression
-	copy = ReplaceColRefWithNull(std::move(copy), right_bindings);
+	copy = ReplaceColRefWithNull(std::move(copy), std::forward<IS_RIGHT_BINDING>(is_right_binding));
 
 	// attempt to flatten the expression by running the expression rewriter on it
 	auto filter = make_uniq<LogicalFilter>();
@@ -104,9 +106,8 @@ static bool FilterRemovesNull(ClientContext &context, ExpressionRewriter &rewrit
 	return false;
 }
 
-unique_ptr<LogicalOperator> FilterPushdown::PushdownLeftJoin(unique_ptr<LogicalOperator> op,
-                                                             unordered_set<TableIndex> &left_bindings,
-                                                             unordered_set<TableIndex> &right_bindings) {
+void FilterPushdown::PushdownLeftJoin(unique_ptr<LogicalOperator> &op, JoinBindingState &binding_state,
+                                      RewriteContext &context) {
 	auto &join = op->Cast<LogicalJoin>();
 	FilterPushdown left_pushdown(optimizer, convert_mark_joins, projection_mode);
 	FilterPushdown right_pushdown(optimizer, convert_mark_joins, projection_mode);
@@ -129,8 +130,10 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownLeftJoin(unique_ptr<LogicalO
 	}
 	// now check the set of filters
 	vector<unique_ptr<Filter>> remaining_filters;
+	const auto decision_policy = op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN ? JoinDecisionPolicy::ASOF_JOIN
+	                                                                                : JoinDecisionPolicy::LEFT_JOIN;
 	for (idx_t i = 0; i < filters.size(); i++) {
-		auto side = JoinSide::GetJoinSide(filters[i]->bindings, left_bindings, right_bindings);
+		auto side = GetJoinSide(*filters[i], decision_policy, binding_state);
 		if (side == JoinSide::LEFT) {
 			// bindings match left side
 			// we can push the filter into the left side
@@ -150,9 +153,13 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownLeftJoin(unique_ptr<LogicalO
 			// Edit: This is only possible if the bindings match BOTH sides, so the filter can be pushed down to both
 			// children. If the filter can only be applied to the right side, and the filter filters
 			// all tuples, then the inner join cannot be converted.
-			if (FilterRemovesNull(optimizer.context, optimizer.rewriter, filters[i]->filter.get(), right_bindings)) {
+			if (FilterRemovesNull(optimizer.context, optimizer.rewriter, *filters[i]->filter,
+			                      [&](const BoundColumnRefExpression &column_ref) {
+				                      return GetJoinSide(column_ref, decision_policy, binding_state) == JoinSide::RIGHT;
+			                      })) {
 				// the filter removes NULL values, turn it into an inner join
 				join.join_type = JoinType::INNER;
+				context.mutator.RefreshOperator(join);
 				// now we can do more pushdown
 				// move all filters we added to the left_pushdown back into the filter list
 				for (auto &left_filter : left_pushdown.filters) {
@@ -162,7 +169,7 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownLeftJoin(unique_ptr<LogicalO
 					filters.push_back(std::move(filter));
 				}
 				// now push down the inner join
-				return PushdownInnerJoin(std::move(op), left_bindings, right_bindings);
+				return PushdownInnerJoin(op, context);
 			}
 			// we should keep the filters which do not remove NULL values
 			remaining_filters.push_back(std::move(filters[i]));
@@ -177,12 +184,13 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownLeftJoin(unique_ptr<LogicalO
 	// this happens if, e.g. a join condition is (i=a) and there is a filter (i=500), we can then push the filter
 	// (a=500) into the RHS
 	filter_combiner.GenerateFilters([&](unique_ptr<Expression> filter) {
-		if (JoinSide::GetJoinSide(*filter, left_bindings, right_bindings) == JoinSide::RIGHT) {
+		auto side = GetJoinSide(*filter, JoinDecisionPolicy::GENERATED_RIGHT_FILTER, binding_state);
+		if (side == JoinSide::RIGHT) {
 			right_pushdown.AddFilter(std::move(filter));
 		}
 	});
 	right_pushdown.GenerateFilters();
-	op->children[0] = left_pushdown.Rewrite(std::move(op->children[0]));
+	left_pushdown.Rewrite(op->children[0], context);
 
 	bool rewrite_right = true;
 	bool has_unsatisfiable_condition = false;
@@ -207,19 +215,20 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownLeftJoin(unique_ptr<LogicalO
 	// if unsatisfiable and LEFT JOIN - replace RHS with dummy scan
 	if (has_unsatisfiable_condition && join.join_type == JoinType::LEFT) {
 		auto dummy_rhs = CreateDummyRHS(optimizer, op->children[1]);
-		op = LogicalCrossProduct::Create(std::move(op->children[0]), std::move(dummy_rhs));
+		context.mutator.ReplaceOperator(op, make_uniq<LogicalCrossProduct>());
+		context.mutator.ReplaceSubtree(op->children[1], std::move(dummy_rhs));
 		rewrite_right = false;
 	}
 
 	if (rewrite_right) {
-		op->children[1] = right_pushdown.Rewrite(std::move(op->children[1]));
+		right_pushdown.Rewrite(op->children[1], context);
 	}
 
 	for (auto &filter : remaining_filters) {
 		filters.push_back(std::move(filter));
 	}
 
-	return PushFinalFilters(std::move(op));
+	PushFinalFilters(op, context);
 }
 
 } // namespace duckdb

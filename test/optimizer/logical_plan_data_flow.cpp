@@ -9,11 +9,14 @@
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_dependent_join.hpp"
+#include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_dummy_scan.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
+#include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/planner/operator/logical_unconditional_join.hpp"
 
 #include <random>
@@ -92,6 +95,16 @@ static void RequireEquivalentDataFlow(LogicalOperator &root, LogicalPlanDataFlow
 			auto rebuilt_path = rebuilt.GetPathSummary(left, right);
 			REQUIRE(live_path.status == rebuilt_path.status);
 			REQUIRE(live_path.summary == rebuilt_path.summary);
+			for (auto property :
+			     {LogicalPlanPathProperty::OPAQUE_BOUNDARY, LogicalPlanPathProperty::FILTER_PUSHDOWN_BOUNDARY,
+			      LogicalPlanPathProperty::BINDING_AVAILABILITY_BOUNDARY}) {
+				LogicalPlanPathSummary properties;
+				properties.Add(property);
+				auto live_first = live.FindFirstPathOperator(left, right, properties);
+				auto rebuilt_first = rebuilt.FindFirstPathOperator(left, right, properties);
+				REQUIRE(live_first.status == rebuilt_first.status);
+				REQUIRE(live_first.op == rebuilt_first.op);
+			}
 		}
 	}
 }
@@ -170,6 +183,61 @@ TEST_CASE("Logical plan data flow validates source binding layouts", "[optimizer
 	REQUIRE(missing_column.status == LogicalPlanDataFlowStatus::BINDING_NOT_AVAILABLE);
 }
 
+TEST_CASE("Logical plan data flow respects unary projection maps", "[optimizer][logical_plan_data_flow]") {
+	for (auto operator_type : {LogicalOperatorType::LOGICAL_FILTER, LogicalOperatorType::LOGICAL_ORDER_BY}) {
+		CAPTURE(operator_type);
+		unique_ptr<LogicalOperator> mapped;
+		if (operator_type == LogicalOperatorType::LOGICAL_FILTER) {
+			auto filter = make_uniq<LogicalFilter>();
+			filter->projection_map = {ProjectionIndex(1)};
+			mapped = std::move(filter);
+		} else {
+			auto order = make_uniq<LogicalOrder>(vector<BoundOrderByNode> {});
+			order->projection_map = {ProjectionIndex(1)};
+			mapped = std::move(order);
+		}
+		mapped->children.push_back(CreateTwoColumnProjection(TableIndex(1), TableIndex(10)));
+		auto &mapped_ref = *mapped;
+		auto consumer = make_uniq<LogicalFilter>();
+		consumer->children.push_back(std::move(mapped));
+
+		LogicalPlanDataFlow data_flow(*consumer);
+		REQUIRE(data_flow.ResolveSource(ColumnBinding(TableIndex(10), ProjectionIndex(0)), 0, *consumer).status ==
+		        LogicalPlanDataFlowStatus::BINDING_NOT_AVAILABLE);
+		REQUIRE(data_flow.ResolveSource(ColumnBinding(TableIndex(10), ProjectionIndex(1)), 0, *consumer).status ==
+		        LogicalPlanDataFlowStatus::SUCCESS);
+
+		LogicalPlanPathSummary boundary;
+		boundary.Add(LogicalPlanPathProperty::BINDING_AVAILABILITY_BOUNDARY);
+		REQUIRE(data_flow.FindFirstPathOperator(*consumer, *mapped_ref.children[0], boundary).op.get() == &mapped_ref);
+		REQUIRE(data_flow.Verify());
+	}
+}
+
+TEST_CASE("Logical plan data flow skips ordinary joins during source resolution",
+          "[optimizer][logical_plan_data_flow]") {
+	constexpr idx_t JOIN_COUNT = 1000;
+	unique_ptr<LogicalOperator> plan = make_uniq<LogicalDummyScan>(TableIndex(0));
+	for (idx_t join_idx = 1; join_idx <= JOIN_COUNT; join_idx++) {
+		auto join = make_uniq<LogicalComparisonJoin>(JoinType::INNER);
+		join->children.push_back(std::move(plan));
+		join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(join_idx)));
+		plan = std::move(join);
+	}
+	auto source = optional_ptr<LogicalOperator>(*plan);
+	while (!source->children.empty()) {
+		source = *source->children[0];
+	}
+
+	LogicalPlanDataFlow data_flow(*plan);
+	REQUIRE(data_flow.ResolveSource(ColumnBinding(TableIndex(0), ProjectionIndex(0)), 0, *plan).status ==
+	        LogicalPlanDataFlowStatus::SUCCESS);
+	auto path = data_flow.GetPathSummary(*plan, *source);
+	REQUIRE(path.status == LogicalPlanDataFlowStatus::SUCCESS);
+	REQUIRE_FALSE(path.summary.Has(LogicalPlanPathProperty::BINDING_AVAILABILITY_BOUNDARY));
+	REQUIRE(data_flow.Verify());
+}
+
 TEST_CASE("Logical plan data flow finds join convergence", "[optimizer][logical_plan_data_flow]") {
 	auto join = make_uniq<LogicalComparisonJoin>(JoinType::INNER);
 	join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(10)));
@@ -184,6 +252,54 @@ TEST_CASE("Logical plan data flow finds join convergence", "[optimizer][logical_
 	REQUIRE(lca.op.get() == join.get());
 	REQUIRE(data_flow.IsFlowAncestor(*join, left).value);
 	REQUIRE_FALSE(data_flow.IsFlowAncestor(left, *join).value);
+	auto left_source = data_flow.ResolveSource(ColumnBinding(TableIndex(10), ProjectionIndex(0)), 0, *join);
+	REQUIRE(left_source.status == LogicalPlanDataFlowStatus::SUCCESS);
+	REQUIRE(left_source.source_child_index == 0);
+	auto right_source = data_flow.ResolveSource(ColumnBinding(TableIndex(20), ProjectionIndex(0)), 0, *join);
+	REQUIRE(right_source.status == LogicalPlanDataFlowStatus::SUCCESS);
+	REQUIRE(right_source.source_child_index == 1);
+}
+
+TEST_CASE("Logical plan data flow finds the first matching path operator", "[optimizer][logical_plan_data_flow]") {
+	auto scan = make_uniq<LogicalDummyScan>(TableIndex(10));
+	auto &scan_ref = *scan;
+	auto projection = make_uniq<LogicalProjection>(TableIndex(20), vector<unique_ptr<Expression>> {});
+	auto &projection_ref = *projection;
+	projection->children.push_back(std::move(scan));
+	auto distinct = make_uniq<LogicalDistinct>(DistinctType::DISTINCT);
+	auto &distinct_ref = *distinct;
+	distinct->children.push_back(std::move(projection));
+	auto order = make_uniq<LogicalOrder>(vector<BoundOrderByNode> {});
+	auto &order_ref = *order;
+	order->children.push_back(std::move(distinct));
+
+	LogicalPlanDataFlow data_flow(*order);
+	LogicalPlanPathSummary filter_boundary;
+	filter_boundary.Add(LogicalPlanPathProperty::FILTER_PUSHDOWN_BOUNDARY);
+	auto first = data_flow.FindFirstPathOperator(order_ref, scan_ref, filter_boundary);
+	REQUIRE(first.status == LogicalPlanDataFlowStatus::SUCCESS);
+	REQUIRE(first.op.get() == &projection_ref);
+	REQUIRE(data_flow.FindFirstPathOperator(projection_ref, scan_ref, filter_boundary).op.get() == &projection_ref);
+	REQUIRE(data_flow.FindFirstPathOperator(scan_ref, scan_ref, filter_boundary).op.get() == &scan_ref);
+
+	LogicalPlanPathSummary projection_boundary;
+	projection_boundary.Add(LogicalPlanPathProperty::PROJECTION_BOUNDARY);
+	REQUIRE(data_flow.FindFirstPathOperator(order_ref, scan_ref, projection_boundary).op.get() == &projection_ref);
+	LogicalPlanPathSummary opaque_boundary;
+	opaque_boundary.Add(LogicalPlanPathProperty::OPAQUE_BOUNDARY);
+	REQUIRE(data_flow.FindFirstPathOperator(order_ref, scan_ref, opaque_boundary).status ==
+	        LogicalPlanDataFlowStatus::PATH_PROPERTY_NOT_FOUND);
+	REQUIRE(data_flow.FindFirstPathOperator(scan_ref, order_ref, filter_boundary).status ==
+	        LogicalPlanDataFlowStatus::NOT_ANCESTOR);
+	auto unindexed = make_uniq<LogicalDummyScan>(TableIndex(30));
+	REQUIRE(data_flow.FindFirstPathOperator(order_ref, *unindexed, filter_boundary).status ==
+	        LogicalPlanDataFlowStatus::OPERATOR_NOT_INDEXED);
+
+	LogicalPlanDataFlowMutator mutator(data_flow);
+	distinct_ref.order_by = make_uniq<BoundOrderModifier>();
+	mutator.RefreshOperator(distinct_ref);
+	REQUIRE(data_flow.FindFirstPathOperator(order_ref, scan_ref, filter_boundary).op.get() == &distinct_ref);
+	REQUIRE(data_flow.Verify());
 }
 
 TEST_CASE("Logical plan data flow respects join output maps", "[optimizer][logical_plan_data_flow]") {
@@ -302,6 +418,10 @@ TEST_CASE("Logical plan data flow keeps materialized CTE components separate", "
 	REQUIRE_FALSE(connected.value);
 	auto lca = data_flow.LowestCommonAncestor(producer_ref, reader_ref);
 	REQUIRE(lca.status == LogicalPlanDataFlowStatus::CTE_BOUNDARY);
+	LogicalPlanPathSummary filter_boundary;
+	filter_boundary.Add(LogicalPlanPathProperty::FILTER_PUSHDOWN_BOUNDARY);
+	REQUIRE(data_flow.FindFirstPathOperator(producer_ref, reader_ref, filter_boundary).status ==
+	        LogicalPlanDataFlowStatus::CTE_BOUNDARY);
 }
 
 TEST_CASE("Logical plan data flow treats extension operators as opaque", "[optimizer][logical_plan_data_flow]") {
@@ -339,6 +459,45 @@ TEST_CASE("Logical plan data flow treats extension operators as opaque", "[optim
 	auto fresh_source = data_flow.ResolveSource(ColumnBinding(TableIndex(50), ProjectionIndex(0)), 0, *projection);
 	REQUIRE(fresh_source.status == LogicalPlanDataFlowStatus::SUCCESS);
 	REQUIRE(fresh_source.op.get() == &extension_ref);
+}
+
+TEST_CASE("Logical plan data flow resolves bindings exposed by opaque inputs", "[optimizer][logical_plan_data_flow]") {
+	auto extension = make_uniq<TestLogicalExtensionOperator>(TableIndex(), true);
+	extension->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(10)));
+	auto &source = *extension->children[0];
+	auto join = make_uniq<LogicalUnconditionalJoin>(LogicalOperatorType::LOGICAL_CROSS_PRODUCT);
+	join->children.push_back(std::move(extension));
+	join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(20)));
+	LogicalPlanDataFlow data_flow(*join);
+
+	auto binding = ColumnBinding(TableIndex(10), ProjectionIndex(0));
+	REQUIRE(data_flow.ResolveSource(binding, 0, *join).status == LogicalPlanDataFlowStatus::OPAQUE_BOUNDARY);
+	auto input_source = data_flow.ResolveInputSource(binding, 0, *join);
+	REQUIRE(input_source.status == LogicalPlanDataFlowStatus::SUCCESS);
+	REQUIRE(input_source.op.get() == &source);
+	REQUIRE(input_source.source_child_index == 0);
+
+	auto hidden_extension = make_uniq<TestLogicalExtensionOperator>(TableIndex(), false);
+	hidden_extension->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(30)));
+	auto hidden_join = make_uniq<LogicalUnconditionalJoin>(LogicalOperatorType::LOGICAL_CROSS_PRODUCT);
+	hidden_join->children.push_back(std::move(hidden_extension));
+	hidden_join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(40)));
+	LogicalPlanDataFlow hidden_data_flow(*hidden_join);
+	REQUIRE(hidden_data_flow.ResolveInputSource(ColumnBinding(TableIndex(30), ProjectionIndex(0)), 0, *hidden_join)
+	            .status == LogicalPlanDataFlowStatus::OPAQUE_BOUNDARY);
+}
+
+TEST_CASE("Logical plan data flow does not resolve hidden join inputs", "[optimizer][logical_plan_data_flow]") {
+	auto join = make_uniq<LogicalUnconditionalJoin>(LogicalOperatorType::LOGICAL_CROSS_PRODUCT);
+	join->children.push_back(CreateProjection(TableIndex(10), TableIndex(20)));
+	join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(30)));
+	LogicalPlanDataFlow data_flow(*join);
+
+	auto hidden = data_flow.ResolveInputSource(ColumnBinding(TableIndex(10), ProjectionIndex(0)), 0, *join);
+	REQUIRE(hidden.status == LogicalPlanDataFlowStatus::BINDING_NOT_AVAILABLE);
+	auto visible = data_flow.ResolveInputSource(ColumnBinding(TableIndex(20), ProjectionIndex(0)), 0, *join);
+	REQUIRE(visible.status == LogicalPlanDataFlowStatus::SUCCESS);
+	REQUIRE(visible.source_child_index == 0);
 }
 
 TEST_CASE("Logical plan data flow records correlated uses", "[optimizer][logical_plan_data_flow]") {
@@ -601,6 +760,46 @@ TEST_CASE("Indexed logical plan mutations promote a selected child", "[optimizer
 	REQUIRE(data_flow.GetOwnershipParent(*old_operator).status == LogicalPlanDataFlowStatus::OPERATOR_NOT_INDEXED);
 	REQUIRE(data_flow.ResolveSource(ColumnBinding(TableIndex(10), ProjectionIndex(0)), 0, *plan).status ==
 	        LogicalPlanDataFlowStatus::BINDING_NOT_FOUND);
+	RequireEquivalentDataFlow(*plan, data_flow);
+}
+
+TEST_CASE("Indexed logical plan mutations refresh a promoted child", "[optimizer][logical_plan_data_flow]") {
+	vector<unique_ptr<LogicalOperator>> children;
+	children.push_back(CreateProjection(TableIndex(1), TableIndex(10)));
+	children.push_back(CreateProjection(TableIndex(2), TableIndex(20)));
+	unique_ptr<LogicalOperator> plan = make_uniq<LogicalSetOperation>(TableIndex(30), 1, std::move(children),
+	                                                                  LogicalOperatorType::LOGICAL_EXCEPT, true);
+	LogicalPlanDataFlow data_flow(*plan);
+	LogicalPlanDataFlowMutator mutator(data_flow);
+
+	auto &projection = plan->children[0]->Cast<LogicalProjection>();
+	projection.table_index = TableIndex(30);
+	mutator.PromoteChild(plan, 0);
+	REQUIRE(plan->type == LogicalOperatorType::LOGICAL_PROJECTION);
+	REQUIRE(data_flow.ResolveSource(ColumnBinding(TableIndex(30), ProjectionIndex(0)), 0, *plan).op.get() ==
+	        plan.get());
+	REQUIRE(data_flow.ResolveSource(ColumnBinding(TableIndex(20), ProjectionIndex(0)), 0, *plan).status ==
+	        LogicalPlanDataFlowStatus::BINDING_NOT_FOUND);
+	RequireEquivalentDataFlow(*plan, data_flow);
+}
+
+TEST_CASE("Indexed unary insertion refreshes a changed owner", "[optimizer][logical_plan_data_flow]") {
+	unique_ptr<LogicalOperator> plan = CreateProjection(TableIndex(10), TableIndex(20));
+	auto &upper_projection = plan->Cast<LogicalProjection>();
+	LogicalPlanDataFlow data_flow(*plan);
+	LogicalPlanDataFlowMutator mutator(data_flow);
+
+	upper_projection.expressions[0] =
+	    make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, ColumnBinding(TableIndex(30), ProjectionIndex(0)));
+	vector<unique_ptr<Expression>> lower_expressions;
+	lower_expressions.push_back(
+	    make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, ColumnBinding(TableIndex(10), ProjectionIndex(0))));
+	mutator.InsertUnary(plan->children[0], make_uniq<LogicalProjection>(TableIndex(30), std::move(lower_expressions)),
+	                    upper_projection);
+
+	REQUIRE(plan->children[0]->type == LogicalOperatorType::LOGICAL_PROJECTION);
+	REQUIRE(data_flow.ResolveSource(ColumnBinding(TableIndex(30), ProjectionIndex(0)), 0, upper_projection).op.get() ==
+	        plan->children[0].get());
 	RequireEquivalentDataFlow(*plan, data_flow);
 }
 

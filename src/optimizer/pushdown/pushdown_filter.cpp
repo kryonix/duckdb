@@ -6,21 +6,23 @@ namespace duckdb {
 
 using Filter = FilterPushdown::Filter;
 
-unique_ptr<LogicalOperator> FilterPushdown::PushdownFilter(unique_ptr<LogicalOperator> op) {
+void FilterPushdown::PushdownFilter(unique_ptr<LogicalOperator> &op, RewriteContext &context) {
 	D_ASSERT(op->type == LogicalOperatorType::LOGICAL_FILTER);
 	auto &filter = op->Cast<LogicalFilter>();
 	if (filter.HasProjectionMap()) {
-		return FinishPushdown(std::move(op));
+		return FinishPushdown(op, context);
 	}
 	// filter: gather the filters and remove the filter from the set of operations
 	for (auto &expression : filter.expressions) {
 		if (AddFilter(std::move(expression)) == FilterResult::UNSATISFIABLE) {
 			// filter statically evaluates to false, strip tree
-			return make_uniq<LogicalEmptyResult>(std::move(op));
+			ReplaceWithEmptyResult(op, context);
+			return;
 		}
 	}
 	GenerateFilters();
-	return Rewrite(std::move(filter.children[0]));
+	context.mutator.RemoveUnary(op);
+	Rewrite(op, context);
 }
 
 } // namespace duckdb

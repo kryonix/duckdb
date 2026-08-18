@@ -30,7 +30,7 @@ bool CanPushdownFilter(vector<column_binding_set_t> window_exprs_partition_bindi
 	return filter_on_all_partitions;
 }
 
-unique_ptr<LogicalOperator> FilterPushdown::PushdownWindow(unique_ptr<LogicalOperator> op) {
+void FilterPushdown::PushdownWindow(unique_ptr<LogicalOperator> &op, RewriteContext &context) {
 	D_ASSERT(op->type == LogicalOperatorType::LOGICAL_WINDOW);
 	auto &window = op->Cast<LogicalWindow>();
 	FilterPushdown pushdown(optimizer, convert_mark_joins, projection_mode);
@@ -49,7 +49,7 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownWindow(unique_ptr<LogicalOpe
 			// If any window expression does not have partitions, we cannot push any filters.
 			// all window expressions need to be partitioned by the same column
 			// in order to push down the window.
-			return FinishPushdown(std::move(op));
+			return FinishPushdown(op, context);
 		}
 		column_binding_set_t partition_bindings;
 		// 2. Get the binding information of the partitions of the window expression
@@ -69,7 +69,7 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownWindow(unique_ptr<LogicalOpe
 	}
 
 	if (window_exprs_partition_bindings.empty()) {
-		return FinishPushdown(std::move(op));
+		return FinishPushdown(op, context);
 	}
 
 	vector<unique_ptr<Filter>> leftover_filters;
@@ -85,8 +85,8 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownWindow(unique_ptr<LogicalOpe
 			leftover_filters.push_back(std::move(filters.at(i)));
 		}
 	}
-	op->children[0] = pushdown.Rewrite(std::move(op->children[0]));
+	pushdown.Rewrite(op->children[0], context);
 	filters = std::move(leftover_filters);
-	return FinishPushdown(std::move(op));
+	FinishPushdown(op, context);
 }
 } // namespace duckdb

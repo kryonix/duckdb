@@ -6,7 +6,7 @@ namespace duckdb {
 
 using Filter = FilterPushdown::Filter;
 
-unique_ptr<LogicalOperator> FilterPushdown::PushdownCrossProduct(unique_ptr<LogicalOperator> op) {
+void FilterPushdown::PushdownCrossProduct(unique_ptr<LogicalOperator> &op, RewriteContext &context) {
 	D_ASSERT(op->children.size() > 1);
 	FilterPushdown left_pushdown(optimizer, convert_mark_joins, projection_mode);
 	FilterPushdown right_pushdown(optimizer, convert_mark_joins, projection_mode);
@@ -18,15 +18,11 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownCrossProduct(unique_ptr<Logi
 	default:
 		throw InternalException("Unsupported join type for cross product push down");
 	}
-	unordered_set<TableIndex> left_bindings, right_bindings;
+	JoinBindingState binding_state(*op, context.data_flow);
 	if (!filters.empty()) {
-		// check to see into which side we should push the filters
-		// first get the LHS and RHS bindings
-		LogicalJoin::GetTableReferences(*op->children[0], left_bindings);
-		LogicalJoin::GetTableReferences(*op->children[1], right_bindings);
 		// now check the set of filters
 		for (auto &f : filters) {
-			auto side = JoinSide::GetJoinSide(f->bindings, left_bindings, right_bindings);
+			auto side = GetJoinSide(*f, JoinDecisionPolicy::CROSS_PRODUCT, binding_state);
 			if (side == JoinSide::LEFT) {
 				// bindings match left side: push into left
 				left_pushdown.filters.push_back(std::move(f));
@@ -39,37 +35,38 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownCrossProduct(unique_ptr<Logi
 			}
 		}
 	}
-
-	op->children[0] = left_pushdown.Rewrite(std::move(op->children[0]));
-	op->children[1] = right_pushdown.Rewrite(std::move(op->children[1]));
-
-	if (!join_expressions.empty()) {
+	vector<JoinCondition> conditions;
+	const bool create_join = !join_expressions.empty();
+	if (create_join) {
 		// join conditions found: turn into inner join
 		// extract join conditions
-		vector<JoinCondition> conditions;
 		const auto join_type = JoinType::INNER;
-		LogicalComparisonJoin::ExtractJoinConditions(GetContext(), join_type, join_ref_type, op->children[0],
-		                                             op->children[1], left_bindings, right_bindings, join_expressions,
-		                                             conditions);
+		LogicalComparisonJoin::ExtractJoinConditionsWithoutPushdown(
+		    GetContext(), join_type, join_ref_type,
+		    [&](const Expression &expression) {
+			    return GetJoinSide(expression, JoinDecisionPolicy::CROSS_PRODUCT, binding_state);
+		    },
+		    join_expressions, conditions);
+	}
+
+	left_pushdown.Rewrite(op->children[0], context);
+	right_pushdown.Rewrite(op->children[1], context);
+
+	if (create_join) {
+		const auto join_type = JoinType::INNER;
 		// create the join from the join conditions
-		auto new_op = LogicalComparisonJoin::CreateJoin(join_type, join_ref_type, std::move(op->children[0]),
-		                                                std::move(op->children[1]), std::move(conditions));
+		auto new_op = LogicalComparisonJoin::CreateJoin(join_type, join_ref_type, std::move(conditions));
 
 		// possible cases are: AnyJoin, ComparisonJoin, or Filter + ComparisonJoin
 		if (op->has_estimated_cardinality) {
 			// set the estimated cardinality of the new operator
 			new_op->SetEstimatedCardinality(op->estimated_cardinality);
-			if (new_op->type == LogicalOperatorType::LOGICAL_FILTER) {
-				// if the new operators are Filter + ComparisonJoin, also set the estimated cardinality for the join
-				D_ASSERT(new_op->children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN);
-				new_op->children[0]->SetEstimatedCardinality(op->estimated_cardinality);
-			}
 		}
-		return new_op;
+		context.mutator.ReplaceOperator(op, std::move(new_op));
 	} else {
 		// no join conditions found: keep as cross product
 		D_ASSERT(op->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT);
-		return op;
+		return;
 	}
 }
 

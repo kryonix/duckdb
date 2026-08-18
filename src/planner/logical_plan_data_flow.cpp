@@ -11,6 +11,7 @@
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
+#include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
@@ -314,6 +315,51 @@ public:
 		}
 	}
 
+	bool ChangesBindingAvailability(const LogicalOperator &op) const {
+		switch (op.type) {
+		case LogicalOperatorType::LOGICAL_PROJECTION:
+		case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+		case LogicalOperatorType::LOGICAL_PIVOT:
+		case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
+		case LogicalOperatorType::LOGICAL_UNION:
+		case LogicalOperatorType::LOGICAL_EXCEPT:
+		case LogicalOperatorType::LOGICAL_INTERSECT:
+		case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR:
+		case LogicalOperatorType::LOGICAL_RECURSIVE_CTE:
+		case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+			return true;
+		case LogicalOperatorType::LOGICAL_FILTER:
+			return !op.Cast<LogicalFilter>().projection_map.empty();
+		case LogicalOperatorType::LOGICAL_ORDER_BY:
+			return !op.Cast<LogicalOrder>().projection_map.empty();
+		case LogicalOperatorType::LOGICAL_GET:
+			return !op.children.empty();
+		case LogicalOperatorType::LOGICAL_JOIN:
+		case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+		case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+		case LogicalOperatorType::LOGICAL_ANY_JOIN:
+		case LogicalOperatorType::LOGICAL_ASOF_JOIN:
+		case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN: {
+			auto &join = op.Cast<LogicalJoin>();
+			if (join.HasProjectionMap()) {
+				return true;
+			}
+			switch (join.join_type) {
+			case JoinType::SEMI:
+			case JoinType::ANTI:
+			case JoinType::MARK:
+			case JoinType::RIGHT_SEMI:
+			case JoinType::RIGHT_ANTI:
+				return true;
+			default:
+				return false;
+			}
+		}
+		default:
+			return false;
+		}
+	}
+
 	LogicalPlanPathSummary GetNodeValue(const LogicalOperator &op) const {
 		LogicalPlanPathSummary result;
 		if (IsOpaque(op)) {
@@ -354,6 +400,13 @@ public:
 		    op.type == LogicalOperatorType::LOGICAL_DELETE || op.type == LogicalOperatorType::LOGICAL_MERGE_INTO ||
 		    op.type == LogicalOperatorType::LOGICAL_COPY_TO_FILE) {
 			result.Add(LogicalPlanPathProperty::SIDE_EFFECT_BOUNDARY);
+		}
+		if (op.type != LogicalOperatorType::LOGICAL_ORDER_BY &&
+		    (op.type != LogicalOperatorType::LOGICAL_DISTINCT || op.Cast<LogicalDistinct>().order_by)) {
+			result.Add(LogicalPlanPathProperty::FILTER_PUSHDOWN_BOUNDARY);
+		}
+		if (ChangesBindingAvailability(op)) {
+			result.Add(LogicalPlanPathProperty::BINDING_AVAILABILITY_BOUNDARY);
 		}
 		return result;
 	}
@@ -766,23 +819,7 @@ public:
 			throw InternalException("Cannot refresh an operator that is not indexed");
 		}
 		LogicalPlanDataFlowMetadata metadata;
-		if (!GetMetadata(op, metadata)) {
-			throw InternalException("Cannot refresh invalid logical plan operator metadata");
-		}
-		for (auto table_index : metadata.produced_table_indexes) {
-			auto source = binding_sources.find(table_index);
-			if (source != binding_sources.end() && &source->second.get() != &op) {
-				throw InternalException("Cannot refresh duplicate logical plan table index %llu", table_index.index);
-			}
-		}
-		if (metadata.cte_producer_index.IsValid()) {
-			auto lineage = cte_lineage.find(metadata.cte_producer_index);
-			if (lineage != cte_lineage.end() && lineage->second.producer_owner &&
-			    lineage->second.producer_owner.get() != &op) {
-				throw InternalException("Cannot refresh duplicate logical plan CTE producer %llu",
-				                        metadata.cte_producer_index.index);
-			}
-		}
+		ValidateRefreshOperator(op, metadata);
 		RemoveContributions(*entry);
 		const bool added = AddContributions(*entry, std::move(metadata));
 		D_ASSERT(added);
@@ -790,6 +827,32 @@ public:
 		entry->node_value = GetNodeValue(op);
 		forest.SetNodeValue(entry->forest_node, ToForestValue(entry->node_value));
 		RefreshFlowChildren(op);
+	}
+
+	void ValidateRefreshOperator(
+	    LogicalOperator &op, LogicalPlanDataFlowMetadata &metadata,
+	    optional_ptr<const reference_set_t<const LogicalOperator>> ignored_operators = nullptr) const {
+		if (!GetMetadata(op, metadata)) {
+			throw InternalException("Cannot refresh invalid logical plan operator metadata");
+		}
+		for (auto table_index : metadata.produced_table_indexes) {
+			auto source = binding_sources.find(table_index);
+			if (source != binding_sources.end() && &source->second.get() != &op &&
+			    (!ignored_operators || ignored_operators->find(reference<const LogicalOperator>(source->second)) ==
+			                               ignored_operators->end())) {
+				throw InternalException("Cannot refresh duplicate logical plan table index %llu", table_index.index);
+			}
+		}
+		if (metadata.cte_producer_index.IsValid()) {
+			auto lineage = cte_lineage.find(metadata.cte_producer_index);
+			if (lineage != cte_lineage.end() && lineage->second.producer_owner &&
+			    lineage->second.producer_owner.get() != &op &&
+			    (!ignored_operators || ignored_operators->find(reference<const LogicalOperator>(
+			                               *lineage->second.producer_owner)) == ignored_operators->end())) {
+				throw InternalException("Cannot refresh duplicate logical plan CTE producer %llu",
+				                        metadata.cte_producer_index.index);
+			}
+		}
 	}
 
 	void ValidateChildren(LogicalOperator &parent) const {
@@ -999,6 +1062,45 @@ public:
 		return false;
 	}
 
+	optional_ptr<LogicalPlanDataFlowEntry> ParentFirstPathOperator(LogicalPlanDataFlowEntry &ancestor,
+	                                                               LogicalPlanDataFlowEntry &descendant,
+	                                                               const LogicalPlanPathSummary &properties) const {
+		if (properties.properties == 0 || !ParentIsAncestor(ancestor, descendant)) {
+			return nullptr;
+		}
+		optional_ptr<LogicalPlanDataFlowEntry> result;
+		auto current = optional_ptr<LogicalPlanDataFlowEntry>(descendant);
+		while (current) {
+			if ((current->node_value.properties & properties.properties) != 0) {
+				result = current;
+			}
+			if (&current->op.get() == &ancestor.op.get()) {
+				return result;
+			}
+			current = current->flow_parent ? GetEntry(*current->flow_parent) : nullptr;
+		}
+		return nullptr;
+	}
+
+	optional_ptr<LogicalPlanDataFlowEntry> ParentLastPathOperator(LogicalPlanDataFlowEntry &ancestor,
+	                                                              LogicalPlanDataFlowEntry &descendant,
+	                                                              const LogicalPlanPathSummary &properties) const {
+		if (properties.properties == 0 || !ParentIsAncestor(ancestor, descendant)) {
+			return nullptr;
+		}
+		auto current = optional_ptr<LogicalPlanDataFlowEntry>(descendant);
+		while (current) {
+			if ((current->node_value.properties & properties.properties) != 0) {
+				return current;
+			}
+			if (&current->op.get() == &ancestor.op.get()) {
+				return nullptr;
+			}
+			current = current->flow_parent ? GetEntry(*current->flow_parent) : nullptr;
+		}
+		return nullptr;
+	}
+
 	LogicalPlanDataFlowStatus BoundaryBetween(LogicalPlanDataFlowEntry &left, LogicalPlanDataFlowEntry &right) const {
 		reference_set_t<LogicalOperator> left_path;
 		auto current = optional_ptr<LogicalPlanDataFlowEntry>(left);
@@ -1055,24 +1157,23 @@ public:
 		return false;
 	}
 
-	idx_t ChildOnPath(LogicalPlanDataFlowEntry &source, LogicalPlanDataFlowEntry &parent) const {
-		auto current = optional_ptr<LogicalPlanDataFlowEntry>(source);
-		while (current && current->flow_parent && current->flow_parent.get() != &parent.op.get()) {
-			current = GetEntry(*current->flow_parent);
+	idx_t ChildContainingSource(LogicalPlanDataFlowEntry &source, LogicalPlanDataFlowEntry &parent) {
+		for (idx_t child_idx = 0; child_idx < 2 && child_idx < parent.op.get().children.size(); child_idx++) {
+			auto child_entry = GetEntry(*parent.op.get().children[child_idx]);
+			if (child_entry && forest.IsAncestor(child_entry->forest_node, source.forest_node)) {
+				return child_idx;
+			}
 		}
-		if (!current || !current->flow_parent) {
-			return DConstants::INVALID_INDEX;
-		}
-		return current->flow_child_index;
+		return DConstants::INVALID_INDEX;
 	}
 
 	bool JoinOutputContains(LogicalPlanDataFlowEntry &join_entry, LogicalPlanDataFlowEntry &source,
-	                        const ColumnBinding &binding) const {
+	                        const ColumnBinding &binding) {
 		auto &join = join_entry.op.get().Cast<LogicalJoin>();
 		if (join.join_type == JoinType::MARK && binding.table_index == join.mark_index) {
 			return true;
 		}
-		auto child_index = ChildOnPath(source, join_entry);
+		auto child_index = ChildContainingSource(source, join_entry);
 		if (child_index > 1) {
 			return false;
 		}
@@ -1098,7 +1199,7 @@ public:
 	}
 
 	bool OutputContainsBinding(LogicalPlanDataFlowEntry &entry, LogicalPlanDataFlowEntry &source,
-	                           const ColumnBinding &binding) const {
+	                           const ColumnBinding &binding) {
 		if (&entry.op.get() == &source.op.get()) {
 			return ContainsBinding(entry.op.get().GetColumnBindings(), binding);
 		}
@@ -1169,26 +1270,84 @@ LogicalPlanDataFlowOperatorResult LogicalPlanDataFlow::ResolveSource(const Colum
 	if (!source_entry) {
 		return {LogicalPlanDataFlowStatus::OPERATOR_NOT_INDEXED, nullptr};
 	}
-	if (!state->forest.Connected(source_entry->forest_node, consumer_entry->forest_node)) {
-		return {state->BoundaryBetween(*source_entry, *consumer_entry), nullptr};
+	if (&source_entry->op.get() == &consumer) {
+		if (!state->OutputContainsBinding(*source_entry, *source_entry, binding)) {
+			return {LogicalPlanDataFlowStatus::BINDING_NOT_AVAILABLE, nullptr};
+		}
+		return {LogicalPlanDataFlowStatus::SUCCESS, source->second.get()};
 	}
-	if (!state->forest.IsAncestor(consumer_entry->forest_node, source_entry->forest_node)) {
+	LogicalPlanPathSummary boundary;
+	boundary.Add(LogicalPlanPathProperty::BINDING_AVAILABILITY_BOUNDARY);
+	optional_ptr<RootedDynamicForestNode> boundary_node;
+	optional_ptr<RootedDynamicForestNode> path_child_node;
+	if (!state->forest.FindLastNodeOnPath(consumer_entry->forest_node, source_entry->forest_node,
+	                                      ToForestValue(boundary), boundary_node, path_child_node)) {
+		if (!state->forest.Connected(source_entry->forest_node, consumer_entry->forest_node)) {
+			return {state->BoundaryBetween(*source_entry, *consumer_entry), nullptr};
+		}
 		return {LogicalPlanDataFlowStatus::NOT_ANCESTOR, nullptr};
 	}
 	if (!state->OutputContainsBinding(*source_entry, *source_entry, binding)) {
 		return {LogicalPlanDataFlowStatus::BINDING_NOT_AVAILABLE, nullptr};
 	}
-	auto current = source_entry;
-	while (&current->op.get() != &consumer) {
-		current = current->flow_parent ? state->GetEntry(*current->flow_parent) : nullptr;
+	while (boundary_node) {
+		auto boundary_op = state->GetForestOperator(*boundary_node);
+		auto boundary_entry = boundary_op ? state->GetEntry(*boundary_op) : nullptr;
+		if (!boundary_entry) {
+			return {LogicalPlanDataFlowStatus::UNSUPPORTED, nullptr};
+		}
+		if (&boundary_entry->op.get() == &consumer) {
+			break;
+		}
+		if (!state->OutputContainsBinding(*boundary_entry, *source_entry, binding)) {
+			return {LogicalPlanDataFlowStatus::BINDING_NOT_AVAILABLE, nullptr};
+		}
+		auto current = boundary_entry->flow_parent ? state->GetEntry(*boundary_entry->flow_parent) : nullptr;
 		if (!current) {
 			return {LogicalPlanDataFlowStatus::DISCONNECTED, nullptr};
 		}
-		if (&current->op.get() != &consumer && !state->OutputContainsBinding(*current, *source_entry, binding)) {
-			return {LogicalPlanDataFlowStatus::BINDING_NOT_AVAILABLE, nullptr};
+		if (&current->op.get() == &consumer) {
+			break;
 		}
+		const bool has_path = state->forest.FindLastNodeOnPath(consumer_entry->forest_node, current->forest_node,
+		                                                       ToForestValue(boundary), boundary_node);
+		D_ASSERT(has_path);
 	}
-	return {LogicalPlanDataFlowStatus::SUCCESS, source->second.get()};
+	auto path_child_op = path_child_node ? state->GetForestOperator(*path_child_node) : nullptr;
+	auto path_child_entry = path_child_op ? state->GetEntry(*path_child_op) : nullptr;
+	if (!path_child_entry || path_child_entry->flow_parent.get() != &consumer) {
+		return {LogicalPlanDataFlowStatus::UNSUPPORTED, nullptr};
+	}
+	return {LogicalPlanDataFlowStatus::SUCCESS, source->second.get(), path_child_entry->flow_child_index};
+}
+
+LogicalPlanDataFlowOperatorResult LogicalPlanDataFlow::ResolveInputSource(const ColumnBinding &binding, idx_t depth,
+                                                                          LogicalOperator &consumer) const {
+	auto result = ResolveSource(binding, depth, consumer);
+	if (result.status == LogicalPlanDataFlowStatus::SUCCESS || depth != 0) {
+		return result;
+	}
+	auto source = state->binding_sources.find(binding.table_index);
+	if (source == state->binding_sources.end()) {
+		return result;
+	}
+	auto source_entry = state->GetEntry(source->second.get());
+	if (!source_entry || &source_entry->op.get() == &consumer) {
+		return result;
+	}
+	auto current = source_entry;
+	while (current && current->owner_parent && current->owner_parent.get() != &consumer) {
+		current = state->GetEntry(*current->owner_parent);
+	}
+	if (!current || current->owner_parent.get() != &consumer ||
+	    current->owner_child_index >= consumer.children.size()) {
+		return result;
+	}
+	auto &input = *consumer.children[current->owner_child_index];
+	if (!state->ContainsBinding(input.GetColumnBindings(), binding)) {
+		return result;
+	}
+	return {LogicalPlanDataFlowStatus::SUCCESS, source->second.get(), current->owner_child_index};
 }
 
 LogicalPlanDataFlowParentResult LogicalPlanDataFlow::GetOwnershipParent(LogicalOperator &op) const {
@@ -1279,6 +1438,32 @@ LogicalPlanDataFlowPathResult LogicalPlanDataFlow::GetPathSummary(LogicalOperato
 		return {LogicalPlanDataFlowStatus::NOT_ANCESTOR, {}};
 	}
 	return {LogicalPlanDataFlowStatus::SUCCESS, FromForestValue(result)};
+}
+
+LogicalPlanDataFlowOperatorResult
+LogicalPlanDataFlow::FindFirstPathOperator(LogicalOperator &ancestor, LogicalOperator &descendant,
+                                           const LogicalPlanPathSummary &properties) const {
+	auto ancestor_entry = state->GetEntry(ancestor);
+	auto descendant_entry = state->GetEntry(descendant);
+	if (!ancestor_entry || !descendant_entry) {
+		return {LogicalPlanDataFlowStatus::OPERATOR_NOT_INDEXED, nullptr};
+	}
+	if (!state->forest.Connected(ancestor_entry->forest_node, descendant_entry->forest_node)) {
+		return {state->BoundaryBetween(*ancestor_entry, *descendant_entry), nullptr};
+	}
+	if (!state->forest.IsAncestor(ancestor_entry->forest_node, descendant_entry->forest_node)) {
+		return {LogicalPlanDataFlowStatus::NOT_ANCESTOR, nullptr};
+	}
+	auto first = state->forest.FindFirstNodeOnPath(ancestor_entry->forest_node, descendant_entry->forest_node,
+	                                               ToForestValue(properties));
+	if (!first) {
+		return {LogicalPlanDataFlowStatus::PATH_PROPERTY_NOT_FOUND, nullptr};
+	}
+	auto first_operator = state->GetForestOperator(*first);
+	if (!first_operator) {
+		return {LogicalPlanDataFlowStatus::UNSUPPORTED, nullptr};
+	}
+	return {LogicalPlanDataFlowStatus::SUCCESS, first_operator};
 }
 
 LogicalPlanDataFlowOperatorResult LogicalPlanDataFlow::GetCTEProducer(TableIndex cte_index) const {
@@ -1466,6 +1651,36 @@ bool LogicalPlanDataFlow::Verify() const {
 					LogicalPlanPathSummary expected_path;
 					if (!state->ParentPathSummary(*left, *right, expected_path) ||
 					    FromForestValue(forest_path) != expected_path) {
+						return false;
+					}
+				}
+				const LogicalPlanPathProperty guided_properties[] {
+				    LogicalPlanPathProperty::OPAQUE_BOUNDARY,
+				    LogicalPlanPathProperty::CTE_BOUNDARY,
+				    LogicalPlanPathProperty::PROJECTION_BOUNDARY,
+				    LogicalPlanPathProperty::AGGREGATE_BOUNDARY,
+				    LogicalPlanPathProperty::SET_OPERATION_BOUNDARY,
+				    LogicalPlanPathProperty::WINDOW_BOUNDARY,
+				    LogicalPlanPathProperty::UNNEST_BOUNDARY,
+				    LogicalPlanPathProperty::LIMIT_BOUNDARY,
+				    LogicalPlanPathProperty::SIDE_EFFECT_BOUNDARY,
+				    LogicalPlanPathProperty::FILTER_PUSHDOWN_BOUNDARY,
+				    LogicalPlanPathProperty::BINDING_AVAILABILITY_BOUNDARY};
+				for (auto property : guided_properties) {
+					LogicalPlanPathSummary properties;
+					properties.Add(property);
+					auto expected_first = state->ParentFirstPathOperator(*left, *right, properties);
+					auto forest_first = state->forest.FindFirstNodeOnPath(left->forest_node, right->forest_node,
+					                                                      ToForestValue(properties));
+					auto actual_first = forest_first ? state->GetForestOperator(*forest_first) : nullptr;
+					if ((expected_first ? &expected_first->op.get() : nullptr) != actual_first.get()) {
+						return false;
+					}
+					auto expected_last = state->ParentLastPathOperator(*left, *right, properties);
+					auto forest_last = state->forest.FindLastNodeOnPath(left->forest_node, right->forest_node,
+					                                                    ToForestValue(properties));
+					auto actual_last = forest_last ? state->GetForestOperator(*forest_last) : nullptr;
+					if ((expected_last ? &expected_last->op.get() : nullptr) != actual_last.get()) {
 						return false;
 					}
 				}
@@ -1731,7 +1946,8 @@ unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::ReplaceOperator(unique_p
 		throw InternalException("Indexed operator replacement requires a childless replacement");
 	}
 	auto location = GetMutationSlot(*data_flow.state, slot);
-	data_flow.state->ValidateStructuralMutation(*slot, slot->children.size());
+	data_flow.state->ValidateChildren(*slot);
+	data_flow.state->ValidateFutureChildCount(*slot, slot->children.size());
 	data_flow.state->ValidateFutureChildCount(*replacement, slot->children.size());
 	if (!location.is_root) {
 		data_flow.state->ValidateSlotReplacement(*location.parent);
@@ -1779,6 +1995,24 @@ unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::PromoteChild(unique_ptr<
 	if (!location.is_root) {
 		data_flow.state->ValidateSlotReplacement(*location.parent);
 	}
+	reference_set_t<const LogicalOperator> removed_operators;
+	removed_operators.insert(reference<const LogicalOperator>(*slot));
+	for (idx_t current_child = 0; current_child < slot->children.size(); current_child++) {
+		if (current_child == child_index) {
+			continue;
+		}
+		vector<reference<LogicalOperator>> pending {*slot->children[current_child]};
+		while (!pending.empty()) {
+			auto current = pending.back();
+			pending.pop_back();
+			removed_operators.insert(reference<const LogicalOperator>(current));
+			for (auto &child : current.get().children) {
+				pending.push_back(*child);
+			}
+		}
+	}
+	LogicalPlanDataFlowMetadata promoted_metadata;
+	data_flow.state->ValidateRefreshOperator(*slot->children[child_index], promoted_metadata, removed_operators);
 
 	unique_ptr<LogicalOperator> old_operator;
 	if (location.is_root) {
@@ -1793,6 +2027,7 @@ unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::PromoteChild(unique_ptr<
 		data_flow.state->UnregisterSubtree(*discarded);
 	}
 	data_flow.state->UnregisterSubtree(*old_operator);
+	data_flow.state->RefreshOperator(*promoted);
 	if (location.is_root) {
 		slot = std::move(promoted);
 		data_flow.state->root = slot.get();
@@ -1911,13 +2146,40 @@ void LogicalPlanDataFlowMutator::RotateParentWithChild(unique_ptr<LogicalOperato
 	VerifyAfterMutation();
 }
 
+void LogicalPlanDataFlowMutator::InsertUnary(unique_ptr<LogicalOperator> &slot, unique_ptr<LogicalOperator> wrapper,
+                                             LogicalOperator &changed_parent) {
+	if (!wrapper || !wrapper->children.empty()) {
+		throw InternalException("Indexed unary insertion requires a childless wrapper");
+	}
+	auto location = GetMutationSlot(*data_flow.state, slot);
+	if (location.is_root || location.parent.get() != &changed_parent) {
+		throw InternalException("Changed operator must own the indexed unary insertion slot");
+	}
+	if (!data_flow.state->SupportsUnaryInsertion(*wrapper)) {
+		throw InternalException("Indexed unary insertion requires an operator with known child semantics");
+	}
+	data_flow.state->ValidateChildren(changed_parent);
+	data_flow.state->ValidateFutureChildCount(changed_parent, changed_parent.children.size());
+	LogicalPlanDataFlowMetadata parent_metadata;
+	data_flow.state->ValidateRefreshOperator(changed_parent, parent_metadata);
+	data_flow.state->RegisterSubtree(*wrapper);
+	data_flow.state->ValidateStructuralMutation(*wrapper, 1);
+	auto old_subtree = data_flow.state->DetachChild(changed_parent, location.child_index, false);
+	data_flow.state->AttachChild(*wrapper, 0, std::move(old_subtree), false);
+	data_flow.state->RefreshOperator(*wrapper);
+	data_flow.state->AttachChild(changed_parent, location.child_index, std::move(wrapper), false);
+	data_flow.state->RefreshOperator(changed_parent);
+	D_ASSERT(data_flow.Verify());
+}
+
 unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::RemoveUnary(unique_ptr<LogicalOperator> &slot) {
 	auto location = GetMutationSlot(*data_flow.state, slot);
 	if (slot->children.size() != 1) {
 		throw InternalException("Indexed unary removal requires exactly one child");
 	}
 	auto &wrapper = *slot;
-	data_flow.state->ValidateStructuralMutation(wrapper, 0);
+	data_flow.state->ValidateChildren(wrapper);
+	data_flow.state->ValidateFutureChildCount(wrapper, 0);
 	if (!location.is_root) {
 		data_flow.state->ValidateSlotReplacement(*location.parent);
 	}

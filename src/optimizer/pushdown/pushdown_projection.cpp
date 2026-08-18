@@ -95,8 +95,8 @@ static void AddPassThroughColumns(unique_ptr<Expression> &expr, TableIndex lower
 	    });
 }
 
-unique_ptr<LogicalOperator> FilterPushdown::SplitProjection(unique_ptr<LogicalOperator> op,
-                                                            vector<unique_ptr<Expression>> split_expressions) {
+void FilterPushdown::SplitProjection(unique_ptr<LogicalOperator> &op, vector<unique_ptr<Expression>> split_expressions,
+                                     RewriteContext &context) {
 	auto &proj = op->Cast<LogicalProjection>();
 	vector<bool> referenced_projections(proj.expressions.size(), false);
 	for (auto &expr : split_expressions) {
@@ -110,7 +110,8 @@ unique_ptr<LogicalOperator> FilterPushdown::SplitProjection(unique_ptr<LogicalOp
 		}
 	}
 	if (all_projections_referenced) {
-		return AddLogicalFilter(std::move(op), std::move(split_expressions));
+		AddLogicalFilter(op, std::move(split_expressions), context);
+		return;
 	}
 
 	const auto lower_table_index = optimizer.binder.GenerateTableIndex();
@@ -141,12 +142,11 @@ unique_ptr<LogicalOperator> FilterPushdown::SplitProjection(unique_ptr<LogicalOp
 	if (op->children[0]->has_estimated_cardinality) {
 		lower_projection->SetEstimatedCardinality(op->children[0]->estimated_cardinality);
 	}
-	lower_projection->children.push_back(std::move(op->children[0]));
-	op->children[0] = AddLogicalFilter(std::move(lower_projection), std::move(split_expressions));
-	return op;
+	context.mutator.InsertUnary(op->children[0], std::move(lower_projection), proj);
+	AddLogicalFilter(op->children[0], std::move(split_expressions), context);
 }
 
-unique_ptr<LogicalOperator> FilterPushdown::PushdownProjection(unique_ptr<LogicalOperator> op) {
+void FilterPushdown::PushdownProjection(unique_ptr<LogicalOperator> &op, RewriteContext &context) {
 	D_ASSERT(op->type == LogicalOperatorType::LOGICAL_PROJECTION);
 	auto &proj = op->Cast<LogicalProjection>();
 	// push filter through logical projection
@@ -175,21 +175,23 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownProjection(unique_ptr<Logica
 			// add the filter to the child pushdown
 			if (child_pushdown.AddFilter(std::move(f.filter)) == FilterResult::UNSATISFIABLE) {
 				// filter statically evaluates to false, strip tree
-				return make_uniq<LogicalEmptyResult>(std::move(op));
+				ReplaceWithEmptyResult(op, context);
+				return;
 			}
 		}
 	}
 	child_pushdown.GenerateFilters();
 	// now push into children
-	op->children[0] = child_pushdown.Rewrite(std::move(op->children[0]));
+	child_pushdown.Rewrite(op->children[0], context);
 	if (op->children[0]->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
 		// child returns an empty result: generate an empty result here too
-		return make_uniq<LogicalEmptyResult>(std::move(op));
+		ReplaceWithEmptyResult(op, context);
+		return;
 	}
 	if (!split_expressions.empty()) {
-		op = SplitProjection(std::move(op), std::move(split_expressions));
+		SplitProjection(op, std::move(split_expressions), context);
 	}
-	return AddLogicalFilter(std::move(op), std::move(remain_expressions));
+	AddLogicalFilter(op, std::move(remain_expressions), context);
 }
 
 } // namespace duckdb

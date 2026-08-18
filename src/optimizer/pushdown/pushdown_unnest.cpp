@@ -6,7 +6,7 @@
 
 namespace duckdb {
 
-unique_ptr<LogicalOperator> FilterPushdown::PushdownUnnest(unique_ptr<LogicalOperator> op) {
+void FilterPushdown::PushdownUnnest(unique_ptr<LogicalOperator> &op, RewriteContext &context) {
 	D_ASSERT(op->type == LogicalOperatorType::LOGICAL_UNNEST);
 	auto &unnest = op->Cast<LogicalUnnest>();
 	// push filter through logical projection
@@ -35,18 +35,20 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownUnnest(unique_ptr<LogicalOpe
 			// add the filter to the child pushdown
 			if (child_pushdown.AddFilter(std::move(f.filter)) == FilterResult::UNSATISFIABLE) {
 				// filter statically evaluates to false, strip tree
-				return make_uniq<LogicalEmptyResult>(std::move(op));
+				ReplaceWithEmptyResult(op, context);
+				return;
 			}
 		}
 	}
 	child_pushdown.GenerateFilters();
 	// now push into children
-	op->children[0] = child_pushdown.Rewrite(std::move(op->children[0]));
+	child_pushdown.Rewrite(op->children[0], context);
 	if (op->children[0]->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
 		// child returns an empty result: generate an empty result here too
-		return make_uniq<LogicalEmptyResult>(std::move(op));
+		ReplaceWithEmptyResult(op, context);
+		return;
 	}
-	return AddLogicalFilter(std::move(op), std::move(remain_expressions));
+	AddLogicalFilter(op, std::move(remain_expressions), context);
 }
 
 } // namespace duckdb

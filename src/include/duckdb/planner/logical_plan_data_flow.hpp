@@ -29,6 +29,7 @@ enum class LogicalPlanDataFlowStatus {
 	CTE_BOUNDARY,
 	DISCONNECTED,
 	NOT_ANCESTOR,
+	PATH_PROPERTY_NOT_FOUND,
 	UNSUPPORTED
 };
 
@@ -41,7 +42,9 @@ enum class LogicalPlanPathProperty {
 	WINDOW_BOUNDARY,
 	UNNEST_BOUNDARY,
 	LIMIT_BOUNDARY,
-	SIDE_EFFECT_BOUNDARY
+	SIDE_EFFECT_BOUNDARY,
+	FILTER_PUSHDOWN_BOUNDARY,
+	BINDING_AVAILABILITY_BOUNDARY
 };
 
 struct LogicalPlanPathSummary {
@@ -58,6 +61,8 @@ struct LogicalPlanPathSummary {
 struct LogicalPlanDataFlowOperatorResult {
 	LogicalPlanDataFlowStatus status = LogicalPlanDataFlowStatus::UNSUPPORTED;
 	optional_ptr<LogicalOperator> op;
+	//! The consumer's direct flow child containing op, when the result came from ResolveSource.
+	idx_t source_child_index = DConstants::INVALID_INDEX;
 };
 
 struct LogicalPlanDataFlowParentResult {
@@ -99,12 +104,17 @@ public:
 public:
 	LogicalPlanDataFlowOperatorResult ResolveSource(const ColumnBinding &binding, idx_t depth,
 	                                                LogicalOperator &consumer) const;
+	//! Resolve the source and direct ownership child that exposes a binding to a consumer.
+	LogicalPlanDataFlowOperatorResult ResolveInputSource(const ColumnBinding &binding, idx_t depth,
+	                                                     LogicalOperator &consumer) const;
 	LogicalPlanDataFlowParentResult GetOwnershipParent(LogicalOperator &op) const;
 	LogicalPlanDataFlowParentResult GetFlowParent(LogicalOperator &op) const;
 	LogicalPlanDataFlowBooleanResult SameFlowTree(LogicalOperator &left, LogicalOperator &right) const;
 	LogicalPlanDataFlowBooleanResult IsFlowAncestor(LogicalOperator &ancestor, LogicalOperator &descendant) const;
 	LogicalPlanDataFlowOperatorResult LowestCommonAncestor(LogicalOperator &left, LogicalOperator &right) const;
 	LogicalPlanDataFlowPathResult GetPathSummary(LogicalOperator &ancestor, LogicalOperator &descendant) const;
+	LogicalPlanDataFlowOperatorResult FindFirstPathOperator(LogicalOperator &ancestor, LogicalOperator &descendant,
+	                                                        const LogicalPlanPathSummary &properties) const;
 
 	LogicalPlanDataFlowOperatorResult GetCTEProducer(TableIndex cte_index) const;
 	LogicalPlanDataFlowReadersResult GetCTEReaders(TableIndex cte_index) const;
@@ -189,6 +199,8 @@ public:
 	                                            unique_ptr<LogicalOperator> replacement);
 	unique_ptr<LogicalOperator> PromoteChild(unique_ptr<LogicalOperator> &slot, idx_t child_index);
 	void InsertUnary(unique_ptr<LogicalOperator> &slot, unique_ptr<LogicalOperator> wrapper);
+	void InsertUnary(unique_ptr<LogicalOperator> &slot, unique_ptr<LogicalOperator> wrapper,
+	                 LogicalOperator &changed_parent);
 	void InsertParent(unique_ptr<LogicalOperator> &slot, unique_ptr<LogicalOperator> parent, idx_t child_index);
 	void RotateParentWithChild(unique_ptr<LogicalOperator> &slot, idx_t child_index, idx_t grandchild_index);
 	unique_ptr<LogicalOperator> RemoveUnary(unique_ptr<LogicalOperator> &slot);

@@ -7,19 +7,23 @@ namespace duckdb {
 class RootedDynamicForestRestoreGuard {
 public:
 	RootedDynamicForestRestoreGuard(RootedDynamicForest &forest_p, RootedDynamicForestNode &child_p,
-	                                RootedDynamicForestNode &parent_p, const RootedDynamicForestPathValue &edge_value_p)
+	                                optional_ptr<RootedDynamicForestNode> parent_p,
+	                                const RootedDynamicForestPathValue &edge_value_p)
 	    : forest(forest_p), child(child_p), parent(parent_p), edge_value(edge_value_p) {
 	}
 
 	~RootedDynamicForestRestoreGuard() noexcept {
-		const bool linked = forest.Link(child, parent, edge_value);
+		if (!parent) {
+			return;
+		}
+		const bool linked = forest.Link(child, *parent, edge_value);
 		D_ASSERT(linked);
 	}
 
 private:
 	RootedDynamicForest &forest;
 	RootedDynamicForestNode &child;
-	RootedDynamicForestNode &parent;
+	optional_ptr<RootedDynamicForestNode> parent;
 	RootedDynamicForestPathValue edge_value;
 };
 
@@ -48,15 +52,20 @@ bool RootedDynamicForest::IsAuxiliaryRoot(const RootedDynamicForestNode &node) c
 
 void RootedDynamicForest::Update(RootedDynamicForestNode &node) {
 	RootedDynamicForestPathValue result;
+	RootedDynamicForestPathValue node_result;
 	if (node.auxiliary_left) {
 		result.Merge(node.auxiliary_left->auxiliary_value);
+		node_result.Merge(node.auxiliary_left->auxiliary_node_value);
 	}
 	result.Merge(node.node_value);
+	node_result.Merge(node.node_value);
 	result.Merge(node.edge_to_parent);
 	if (node.auxiliary_right) {
 		result.Merge(node.auxiliary_right->auxiliary_value);
+		node_result.Merge(node.auxiliary_right->auxiliary_node_value);
 	}
 	node.auxiliary_value = result;
+	node.auxiliary_node_value = node_result;
 #ifdef DEBUG
 	VerifyLocal(node);
 #endif
@@ -167,8 +176,8 @@ optional_ptr<RootedDynamicForestNode> RootedDynamicForest::LowestCommonAncestor(
 }
 
 bool RootedDynamicForest::IsAncestor(RootedDynamicForestNode &ancestor, RootedDynamicForestNode &descendant) {
-	auto lca = LowestCommonAncestor(ancestor, descendant);
-	return lca.get() == &ancestor;
+	Expose(ancestor);
+	return Expose(descendant).get() == &ancestor;
 }
 
 bool RootedDynamicForest::Link(RootedDynamicForestNode &child, RootedDynamicForestNode &parent,
@@ -233,8 +242,101 @@ bool RootedDynamicForest::GetPathValue(RootedDynamicForestNode &ancestor, Rooted
 	}
 	const bool cut = CutFromParent(ancestor);
 	D_ASSERT(cut);
-	RootedDynamicForestRestoreGuard restore(*this, ancestor, *old_parent, old_edge);
+	RootedDynamicForestRestoreGuard restore(*this, ancestor, old_parent, old_edge);
 	result = GetRootPathValue(descendant);
+	return true;
+}
+
+optional_ptr<RootedDynamicForestNode>
+RootedDynamicForest::FindFirstNodeOnPath(RootedDynamicForestNode &ancestor, RootedDynamicForestNode &descendant,
+                                         const RootedDynamicForestPathValue &node_mask) {
+	if (node_mask.flags == 0 || !IsAncestor(ancestor, descendant)) {
+		return nullptr;
+	}
+	auto old_parent = ancestor.represented_parent;
+	auto old_edge = ancestor.edge_to_parent;
+	if (old_parent) {
+		const bool cut = CutFromParent(ancestor);
+		D_ASSERT(cut);
+	}
+	RootedDynamicForestRestoreGuard restore(*this, ancestor, old_parent, old_edge);
+	Expose(descendant);
+	if ((descendant.auxiliary_node_value.flags & node_mask.flags) == 0) {
+		return nullptr;
+	}
+	auto current = optional_ptr<RootedDynamicForestNode>(descendant);
+	while (current) {
+		if (current->auxiliary_left && (current->auxiliary_left->auxiliary_node_value.flags & node_mask.flags) != 0) {
+			current = current->auxiliary_left;
+			continue;
+		}
+		if ((current->node_value.flags & node_mask.flags) != 0) {
+			Splay(*current);
+			return current;
+		}
+		D_ASSERT(current->auxiliary_right &&
+		         (current->auxiliary_right->auxiliary_node_value.flags & node_mask.flags) != 0);
+		current = current->auxiliary_right;
+	}
+	return nullptr;
+}
+
+optional_ptr<RootedDynamicForestNode>
+RootedDynamicForest::FindLastNodeOnPath(RootedDynamicForestNode &ancestor, RootedDynamicForestNode &descendant,
+                                        const RootedDynamicForestPathValue &node_mask) {
+	optional_ptr<RootedDynamicForestNode> result;
+	if (!FindLastNodeOnPath(ancestor, descendant, node_mask, result)) {
+		return nullptr;
+	}
+	return result;
+}
+
+bool RootedDynamicForest::FindLastNodeOnPath(RootedDynamicForestNode &ancestor, RootedDynamicForestNode &descendant,
+                                             const RootedDynamicForestPathValue &node_mask,
+                                             optional_ptr<RootedDynamicForestNode> &result) {
+	optional_ptr<RootedDynamicForestNode> path_child;
+	return FindLastNodeOnPath(ancestor, descendant, node_mask, result, path_child);
+}
+
+bool RootedDynamicForest::FindLastNodeOnPath(RootedDynamicForestNode &ancestor, RootedDynamicForestNode &descendant,
+                                             const RootedDynamicForestPathValue &node_mask,
+                                             optional_ptr<RootedDynamicForestNode> &result,
+                                             optional_ptr<RootedDynamicForestNode> &path_child) {
+	result = nullptr;
+	path_child = nullptr;
+	Expose(ancestor);
+	if (Expose(descendant).get() != &ancestor) {
+		return false;
+	}
+	Splay(ancestor);
+	path_child = ancestor.auxiliary_right;
+	while (path_child && path_child->auxiliary_left) {
+		path_child = path_child->auxiliary_left;
+	}
+	if (node_mask.flags == 0) {
+		return true;
+	}
+	if ((!ancestor.auxiliary_right || (ancestor.auxiliary_right->auxiliary_node_value.flags & node_mask.flags) == 0)) {
+		if ((ancestor.node_value.flags & node_mask.flags) != 0) {
+			result = ancestor;
+		}
+		return true;
+	}
+	auto current = ancestor.auxiliary_right;
+	while (current) {
+		if (current->auxiliary_right && (current->auxiliary_right->auxiliary_node_value.flags & node_mask.flags) != 0) {
+			current = current->auxiliary_right;
+			continue;
+		}
+		if ((current->node_value.flags & node_mask.flags) != 0) {
+			Splay(*current);
+			result = current;
+			return true;
+		}
+		D_ASSERT(current->auxiliary_left &&
+		         (current->auxiliary_left->auxiliary_node_value.flags & node_mask.flags) != 0);
+		current = current->auxiliary_left;
+	}
 	return true;
 }
 
@@ -255,15 +357,20 @@ void RootedDynamicForest::VerifyLocal(const RootedDynamicForestNode &node) const
 		D_ASSERT(node.auxiliary_right->auxiliary_parent.get() == &node);
 	}
 	RootedDynamicForestPathValue expected;
+	RootedDynamicForestPathValue expected_nodes;
 	if (node.auxiliary_left) {
 		expected.Merge(node.auxiliary_left->auxiliary_value);
+		expected_nodes.Merge(node.auxiliary_left->auxiliary_node_value);
 	}
 	expected.Merge(node.node_value);
+	expected_nodes.Merge(node.node_value);
 	expected.Merge(node.edge_to_parent);
 	if (node.auxiliary_right) {
 		expected.Merge(node.auxiliary_right->auxiliary_value);
+		expected_nodes.Merge(node.auxiliary_right->auxiliary_node_value);
 	}
 	D_ASSERT(expected == node.auxiliary_value);
+	D_ASSERT(expected_nodes == node.auxiliary_node_value);
 }
 #endif
 

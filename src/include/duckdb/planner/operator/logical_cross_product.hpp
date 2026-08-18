@@ -14,12 +14,12 @@ namespace duckdb {
 
 //! LogicalCrossProduct represents a cross product between two relations
 class LogicalCrossProduct : public LogicalUnconditionalJoin {
-	LogicalCrossProduct() : LogicalUnconditionalJoin(LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {};
-
 public:
 	static constexpr const LogicalOperatorType TYPE = LogicalOperatorType::LOGICAL_CROSS_PRODUCT;
 
 public:
+	LogicalCrossProduct() : LogicalUnconditionalJoin(LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
+	}
 	LogicalCrossProduct(unique_ptr<LogicalOperator> left, unique_ptr<LogicalOperator> right);
 
 public:
