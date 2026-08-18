@@ -105,7 +105,7 @@ public:
 			return DConstants::INVALID_INDEX;
 		}
 		while (true) {
-			if ((node_values[descendant].flags & node_mask) != 0) {
+			if ((node_values[descendant] & node_mask) != 0) {
 				return descendant;
 			}
 			if (descendant == ancestor) {
