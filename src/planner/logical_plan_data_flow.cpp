@@ -6,6 +6,7 @@
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/detail/rooted_dynamic_forest.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
@@ -19,6 +20,14 @@
 #include "duckdb/planner/operator/logical_recursive_cte.hpp"
 
 namespace duckdb {
+
+static RootedDynamicForestPathValue ToForestValue(const LogicalPlanPathSummary &summary) {
+	return {summary.properties};
+}
+
+static LogicalPlanPathSummary FromForestValue(const RootedDynamicForestPathValue &value) {
+	return {value.flags};
+}
 
 static uint64_t PathPropertyMask(LogicalPlanPathProperty property) {
 	return uint64_t(1) << NumericCast<uint64_t>(property);
@@ -53,6 +62,7 @@ struct LogicalPlanDataFlowEntry {
 	idx_t owner_child_index = DConstants::INVALID_INDEX;
 	optional_ptr<LogicalOperator> flow_parent;
 	idx_t flow_child_index = DConstants::INVALID_INDEX;
+	RootedDynamicForestNode forest_node;
 	LogicalPlanPathSummary node_value;
 	LogicalPlanPathSummary edge_to_parent;
 	bool opaque = false;
@@ -81,6 +91,8 @@ public:
 	reference<LogicalOperator> root;
 	vector<unique_ptr<LogicalPlanDataFlowEntry>> entries;
 	reference_map_t<LogicalOperator, idx_t> entry_map;
+	RootedDynamicForest forest;
+	reference_map_t<RootedDynamicForestNode, LogicalOperator *> forest_operators;
 	unordered_map<TableIndex, LogicalOperator *> binding_sources;
 	unordered_map<TableIndex, LogicalPlanCTELineage> cte_lineage;
 	vector<LogicalPlanBindingUse> binding_uses;
@@ -319,7 +331,9 @@ public:
 			entry->owner_child_index = task.owner_child_index;
 			entry->opaque = IsOpaque(task.op.get());
 			entry->node_value = GetNodeValue(task.op.get());
+			forest.SetNodeValue(entry->forest_node, ToForestValue(entry->node_value));
 			entry_map.emplace(task.op, entries.size());
+			forest_operators.emplace(entry->forest_node, &task.op.get());
 			entries.push_back(std::move(entry));
 
 			for (idx_t child_idx = task.op.get().children.size(); child_idx > 0; child_idx--) {
@@ -348,8 +362,21 @@ public:
 				}
 				child_entry->flow_parent = parent;
 				child_entry->flow_child_index = child_idx;
+				auto parent_entry = GetEntry(parent);
+				if (!parent_entry || !forest.Link(child_entry->forest_node, parent_entry->forest_node,
+				                                  ToForestValue(child_entry->edge_to_parent))) {
+					valid = false;
+				}
 			}
 		}
+	}
+
+	optional_ptr<LogicalOperator> GetForestOperator(RootedDynamicForestNode &node) const {
+		auto entry = forest_operators.find(node);
+		if (entry == forest_operators.end()) {
+			return nullptr;
+		}
+		return entry->second;
 	}
 
 	void RegisterSource(TableIndex table_index, LogicalOperator &op) {
@@ -463,6 +490,23 @@ public:
 			current = current->flow_parent ? GetEntry(*current->flow_parent) : nullptr;
 		}
 		return nullptr;
+	}
+
+	bool ParentPathSummary(LogicalPlanDataFlowEntry &ancestor, LogicalPlanDataFlowEntry &descendant,
+	                       LogicalPlanPathSummary &result) const {
+		if (!ParentIsAncestor(ancestor, descendant)) {
+			return false;
+		}
+		auto current = optional_ptr<LogicalPlanDataFlowEntry>(descendant);
+		while (current) {
+			result.Merge(current->node_value);
+			if (&current->op.get() == &ancestor.op.get()) {
+				return true;
+			}
+			result.Merge(current->edge_to_parent);
+			current = current->flow_parent ? GetEntry(*current->flow_parent) : nullptr;
+		}
+		return false;
 	}
 
 	LogicalPlanDataFlowStatus BoundaryBetween(LogicalPlanDataFlowEntry &left, LogicalPlanDataFlowEntry &right) const {
@@ -633,10 +677,10 @@ LogicalPlanDataFlowOperatorResult LogicalPlanDataFlow::ResolveSource(const Colum
 	if (!source_entry) {
 		return {LogicalPlanDataFlowStatus::OPERATOR_NOT_INDEXED, nullptr};
 	}
-	if (state->FlowRoot(*source_entry) != state->FlowRoot(*consumer_entry)) {
+	if (!state->forest.Connected(source_entry->forest_node, consumer_entry->forest_node)) {
 		return {state->BoundaryBetween(*source_entry, *consumer_entry), nullptr};
 	}
-	if (!state->ParentIsAncestor(*consumer_entry, *source_entry)) {
+	if (!state->forest.IsAncestor(consumer_entry->forest_node, source_entry->forest_node)) {
 		return {LogicalPlanDataFlowStatus::NOT_ANCESTOR, nullptr};
 	}
 	if (!state->OutputContainsBinding(*source_entry, *source_entry, binding)) {
@@ -678,7 +722,7 @@ LogicalPlanDataFlowBooleanResult LogicalPlanDataFlow::SameFlowTree(LogicalOperat
 	if (!left_entry || !right_entry) {
 		return {LogicalPlanDataFlowStatus::OPERATOR_NOT_INDEXED, false};
 	}
-	if (state->FlowRoot(*left_entry) != state->FlowRoot(*right_entry)) {
+	if (!state->forest.Connected(left_entry->forest_node, right_entry->forest_node)) {
 		return {state->BoundaryBetween(*left_entry, *right_entry), false};
 	}
 	return {LogicalPlanDataFlowStatus::SUCCESS, true};
@@ -691,10 +735,11 @@ LogicalPlanDataFlowBooleanResult LogicalPlanDataFlow::IsFlowAncestor(LogicalOper
 	if (!ancestor_entry || !descendant_entry) {
 		return {LogicalPlanDataFlowStatus::OPERATOR_NOT_INDEXED, false};
 	}
-	if (state->FlowRoot(*ancestor_entry) != state->FlowRoot(*descendant_entry)) {
+	if (!state->forest.Connected(ancestor_entry->forest_node, descendant_entry->forest_node)) {
 		return {state->BoundaryBetween(*ancestor_entry, *descendant_entry), false};
 	}
-	return {LogicalPlanDataFlowStatus::SUCCESS, state->ParentIsAncestor(*ancestor_entry, *descendant_entry)};
+	return {LogicalPlanDataFlowStatus::SUCCESS,
+	        state->forest.IsAncestor(ancestor_entry->forest_node, descendant_entry->forest_node)};
 }
 
 LogicalPlanDataFlowOperatorResult LogicalPlanDataFlow::LowestCommonAncestor(LogicalOperator &left,
@@ -704,14 +749,18 @@ LogicalPlanDataFlowOperatorResult LogicalPlanDataFlow::LowestCommonAncestor(Logi
 	if (!left_entry || !right_entry) {
 		return {LogicalPlanDataFlowStatus::OPERATOR_NOT_INDEXED, nullptr};
 	}
-	if (state->FlowRoot(*left_entry) != state->FlowRoot(*right_entry)) {
+	if (!state->forest.Connected(left_entry->forest_node, right_entry->forest_node)) {
 		return {state->BoundaryBetween(*left_entry, *right_entry), nullptr};
 	}
-	auto lca = state->ParentLCA(*left_entry, *right_entry);
+	auto lca = state->forest.LowestCommonAncestor(left_entry->forest_node, right_entry->forest_node);
 	if (!lca) {
 		return {LogicalPlanDataFlowStatus::DISCONNECTED, nullptr};
 	}
-	return {LogicalPlanDataFlowStatus::SUCCESS, lca->op.get()};
+	auto lca_operator = state->GetForestOperator(*lca);
+	if (!lca_operator) {
+		return {LogicalPlanDataFlowStatus::UNSUPPORTED, nullptr};
+	}
+	return {LogicalPlanDataFlowStatus::SUCCESS, lca_operator};
 }
 
 LogicalPlanDataFlowPathResult LogicalPlanDataFlow::GetPathSummary(LogicalOperator &ancestor,
@@ -721,23 +770,17 @@ LogicalPlanDataFlowPathResult LogicalPlanDataFlow::GetPathSummary(LogicalOperato
 	if (!ancestor_entry || !descendant_entry) {
 		return {LogicalPlanDataFlowStatus::OPERATOR_NOT_INDEXED, {}};
 	}
-	if (state->FlowRoot(*ancestor_entry) != state->FlowRoot(*descendant_entry)) {
+	if (!state->forest.Connected(ancestor_entry->forest_node, descendant_entry->forest_node)) {
 		return {state->BoundaryBetween(*ancestor_entry, *descendant_entry), {}};
 	}
-	if (!state->ParentIsAncestor(*ancestor_entry, *descendant_entry)) {
+	if (!state->forest.IsAncestor(ancestor_entry->forest_node, descendant_entry->forest_node)) {
 		return {LogicalPlanDataFlowStatus::NOT_ANCESTOR, {}};
 	}
-	LogicalPlanPathSummary result;
-	auto current = descendant_entry;
-	while (current) {
-		result.Merge(current->node_value);
-		if (&current->op.get() == &ancestor) {
-			return {LogicalPlanDataFlowStatus::SUCCESS, result};
-		}
-		result.Merge(current->edge_to_parent);
-		current = current->flow_parent ? state->GetEntry(*current->flow_parent) : nullptr;
+	RootedDynamicForestPathValue result;
+	if (!state->forest.GetPathValue(ancestor_entry->forest_node, descendant_entry->forest_node, result)) {
+		return {LogicalPlanDataFlowStatus::NOT_ANCESTOR, {}};
 	}
-	return {LogicalPlanDataFlowStatus::DISCONNECTED, {}};
+	return {LogicalPlanDataFlowStatus::SUCCESS, FromForestValue(result)};
 }
 
 LogicalPlanDataFlowOperatorResult LogicalPlanDataFlow::GetCTEProducer(TableIndex cte_index) const {
@@ -796,6 +839,58 @@ bool LogicalPlanDataFlow::Verify() const {
 	}
 	if (ownership_count != state->entries.size()) {
 		return false;
+	}
+	for (auto &entry : state->entries) {
+		auto represented_parent = state->forest.GetRepresentedParent(entry->forest_node);
+		auto forest_parent = represented_parent ? state->GetForestOperator(*represented_parent) : nullptr;
+		if (forest_parent != entry->flow_parent) {
+			return false;
+		}
+		auto expected_root = state->FlowRoot(*entry);
+		auto forest_root = state->GetForestOperator(state->forest.FindRoot(entry->forest_node));
+		if (!expected_root || forest_root.get() != &expected_root->op.get()) {
+			return false;
+		}
+		LogicalPlanPathSummary expected_path;
+		if (!state->ParentPathSummary(*expected_root, *entry, expected_path)) {
+			return false;
+		}
+		if (FromForestValue(state->forest.GetRootPathValue(entry->forest_node)) != expected_path) {
+			return false;
+		}
+	}
+	constexpr idx_t ALL_PAIRS_LIMIT = 128;
+	if (state->entries.size() <= ALL_PAIRS_LIMIT) {
+		for (auto &left : state->entries) {
+			for (auto &right : state->entries) {
+				const bool expected_connected = state->FlowRoot(*left) == state->FlowRoot(*right);
+				if (state->forest.Connected(left->forest_node, right->forest_node) != expected_connected) {
+					return false;
+				}
+				auto expected_lca = state->ParentLCA(*left, *right);
+				auto forest_lca = state->forest.LowestCommonAncestor(left->forest_node, right->forest_node);
+				auto actual_lca = forest_lca ? state->GetForestOperator(*forest_lca) : nullptr;
+				if ((expected_lca ? &expected_lca->op.get() : nullptr) != actual_lca.get()) {
+					return false;
+				}
+				const bool expected_ancestor = state->ParentIsAncestor(*left, *right);
+				if (state->forest.IsAncestor(left->forest_node, right->forest_node) != expected_ancestor) {
+					return false;
+				}
+				RootedDynamicForestPathValue forest_path;
+				const bool has_path = state->forest.GetPathValue(left->forest_node, right->forest_node, forest_path);
+				if (has_path != expected_ancestor) {
+					return false;
+				}
+				if (has_path) {
+					LogicalPlanPathSummary expected_path;
+					if (!state->ParentPathSummary(*left, *right, expected_path) ||
+					    FromForestValue(forest_path) != expected_path) {
+						return false;
+					}
+				}
+			}
+		}
 	}
 	for (auto &use : state->binding_uses) {
 		auto result = ResolveSource(use.binding, use.depth, use.consumer);

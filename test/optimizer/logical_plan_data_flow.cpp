@@ -3,14 +3,18 @@
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/logical_plan_data_flow.hpp"
+#include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
+#include "duckdb/planner/operator/logical_dependent_join.hpp"
 #include "duckdb/planner/operator/logical_dummy_scan.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_unconditional_join.hpp"
 
 using namespace duckdb;
 
@@ -185,6 +189,30 @@ TEST_CASE("Logical plan data flow models every comparison join output", "[optimi
 	        LogicalPlanDataFlowStatus::SUCCESS);
 }
 
+TEST_CASE("Logical plan data flow connects specialized join inputs", "[optimizer][logical_plan_data_flow]") {
+	vector<unique_ptr<LogicalOperator>> joins;
+	joins.push_back(make_uniq<LogicalComparisonJoin>(JoinType::INNER, LogicalOperatorType::LOGICAL_DELIM_JOIN));
+	joins.push_back(make_uniq<LogicalComparisonJoin>(JoinType::INNER, LogicalOperatorType::LOGICAL_ASOF_JOIN));
+	auto any_join = make_uniq<LogicalAnyJoin>(JoinType::INNER);
+	any_join->condition = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
+	joins.push_back(std::move(any_join));
+	auto dependent_join = make_uniq<LogicalDependentJoin>(JoinType::INNER);
+	dependent_join->condition = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
+	joins.push_back(std::move(dependent_join));
+	joins.push_back(make_uniq<LogicalUnconditionalJoin>(LogicalOperatorType::LOGICAL_CROSS_PRODUCT));
+	joins.push_back(make_uniq<LogicalUnconditionalJoin>(LogicalOperatorType::LOGICAL_POSITIONAL_JOIN));
+	for (auto &join : joins) {
+		CAPTURE(join->type);
+		join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(10)));
+		join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(20)));
+		auto &left = *join->children[0];
+		auto &right = *join->children[1];
+		LogicalPlanDataFlow data_flow(*join);
+		REQUIRE(data_flow.Verify());
+		REQUIRE(data_flow.LowestCommonAncestor(left, right).op.get() == join.get());
+	}
+}
+
 TEST_CASE("Logical plan data flow keeps materialized CTE components separate", "[optimizer][logical_plan_data_flow]") {
 	auto producer = CreateProjection(TableIndex(10), TableIndex(20));
 	auto &producer_ref = *producer;
@@ -297,17 +325,40 @@ TEST_CASE("Logical plan data flow verifies representative SQL plans", "[optimize
 	    "SELECT i, row_number() OVER (ORDER BY i) FROM range(10) t(i)",
 	    "SELECT i, u FROM range(3) t(i), UNNEST([i, i + 1]) x(u)",
 	    "SELECT * FROM range(3) l(i) JOIN range(3) r(j) ON i = j",
+	    "SELECT * FROM range(3) l(i), range(3) r(j)",
 	    "SELECT * FROM range(3) l(i) LEFT JOIN range(3) r(j) ON i = j",
+	    "SELECT * FROM range(3) l(i) RIGHT JOIN range(3) r(j) ON i = j",
+	    "SELECT * FROM range(3) l(i) FULL JOIN range(3) r(j) ON i = j",
 	    "SELECT * FROM range(3) l(i) SEMI JOIN range(3) r(j) ON i = j",
 	    "SELECT * FROM range(3) l(i) ANTI JOIN range(3) r(j) ON i = j",
 	    "SELECT * FROM range(3) l(i) ASOF JOIN range(3) r(j) ON i >= j",
+	    "SELECT i, i IN (SELECT j FROM range(3) r(j)) FROM range(3) l(i)",
+	    "SELECT i, (SELECT j FROM range(1) r(j) WHERE j = i) FROM range(3) l(i)",
+	    "SELECT i FROM range(3) l(i) WHERE i = ANY (SELECT j FROM range(3) r(j))",
+	    "SELECT i FROM range(3) l(i) WHERE EXISTS (SELECT 1 FROM range(3) r(j) WHERE i = j)",
 	    "SELECT i FROM range(3) t(i) UNION SELECT i FROM range(3) u(i)",
 	    "SELECT i FROM range(3) t(i) INTERSECT SELECT i FROM range(3) u(i)",
 	    "SELECT i FROM range(3) t(i) EXCEPT SELECT i FROM range(3) u(i)",
 	    "WITH values AS MATERIALIZED (SELECT i FROM range(3) t(i)) SELECT * FROM values",
+	    "WITH values AS MATERIALIZED (SELECT i FROM range(3) t(i)) SELECT * FROM values a, values b",
+	    "WITH outer_values AS MATERIALIZED (WITH inner_values AS MATERIALIZED (SELECT i FROM range(3) t(i)) "
+	    "SELECT * FROM inner_values) SELECT * FROM outer_values",
 	    "WITH RECURSIVE values(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM values WHERE i < 3) SELECT * FROM values",
 	};
 	for (auto &query : queries) {
+		auto plan = connection.ExtractPlan(query);
+		INFO(query);
+		LogicalPlanDataFlow data_flow(*plan);
+		REQUIRE(data_flow.Verify());
+	}
+
+	REQUIRE_NO_FAIL(connection.Query("CREATE TABLE dml_values(i INTEGER)"));
+	const vector<string> statement_queries {
+	    "INSERT INTO dml_values VALUES (1)",     "UPDATE dml_values SET i = i + 1",
+	    "DELETE FROM dml_values WHERE i > 0",    "EXPLAIN SELECT * FROM dml_values",
+	    "CREATE TABLE another_table(i INTEGER)",
+	};
+	for (auto &query : statement_queries) {
 		auto plan = connection.ExtractPlan(query);
 		INFO(query);
 		LogicalPlanDataFlow data_flow(*plan);

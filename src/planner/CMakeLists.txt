@@ -23,6 +23,7 @@ add_library_unity(
   logical_plan_data_flow.cpp
   logical_operator.cpp
   logical_operator_repeatability.cpp
+  rooted_dynamic_forest.cpp
   binder.cpp
   bind_context.cpp
   planner.cpp

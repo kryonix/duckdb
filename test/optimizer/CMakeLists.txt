@@ -8,6 +8,7 @@ add_library_unity(
   join_order_conflict_detector.cpp
   logical_plan_data_flow.cpp
   relation_statistics.cpp
+  rooted_dynamic_forest.cpp
   union_alls.cpp)
 
 set(UNITTEST_OBJECT_FILES
