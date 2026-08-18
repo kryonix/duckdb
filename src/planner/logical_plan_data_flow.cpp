@@ -417,12 +417,12 @@ public:
 		    (op.type != LogicalOperatorType::LOGICAL_DISTINCT || op.Cast<LogicalDistinct>().order_by)) {
 			result.Add(LogicalPlanPathProperty::FILTER_PUSHDOWN_BOUNDARY);
 		}
-		if (ChangesBindingAvailability(op)) {
-			result.Add(LogicalPlanPathProperty::BINDING_AVAILABILITY_BOUNDARY);
-		}
 		if (op.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
 		    op.Cast<LogicalComparisonJoin>().join_type == JoinType::INVALID) {
 			result.Add(LogicalPlanPathProperty::NULLABILITY_BOUNDARY);
+		}
+		if (ChangesBindingAvailability(op)) {
+			result.Add(LogicalPlanPathProperty::BINDING_AVAILABILITY_BOUNDARY);
 		}
 		return result;
 	}
@@ -1559,6 +1559,7 @@ LogicalPlanDataFlowPathResult LogicalPlanDataFlow::GetPathSummary(LogicalOperato
 LogicalPlanDataFlowOperatorResult
 LogicalPlanDataFlow::FindFirstPathOperator(LogicalOperator &ancestor, LogicalOperator &descendant,
                                            const LogicalPlanPathSummary &properties) const {
+	state->EnsureQueryable();
 	auto ancestor_entry = state->GetEntry(ancestor);
 	auto descendant_entry = state->GetEntry(descendant);
 	if (!ancestor_entry || !descendant_entry) {
@@ -1655,6 +1656,7 @@ const vector<LogicalPlanBindingUse> &LogicalPlanDataFlow::GetBindingUses() const
 }
 
 vector<LogicalPlanCorrelatedUse> LogicalPlanDataFlow::GetCorrelatedUses() const {
+	state->EnsureQueryable();
 	vector<LogicalPlanCorrelatedUse> result;
 	for (auto &binding_use : GetBindingUses()) {
 		if (binding_use.depth == 0) {
@@ -2348,6 +2350,32 @@ void LogicalPlanDataFlowMutator::InsertUnary(unique_ptr<LogicalOperator> &slot, 
 	VerifyAfterMutation();
 }
 
+void LogicalPlanDataFlowMutator::InsertUnary(unique_ptr<LogicalOperator> &slot, unique_ptr<LogicalOperator> wrapper,
+                                             LogicalOperator &changed_parent) {
+	if (!wrapper || !wrapper->children.empty()) {
+		throw InternalException("Indexed unary insertion requires a childless wrapper");
+	}
+	auto location = GetMutationSlot(*data_flow.state, slot);
+	if (location.is_root || location.parent.get() != &changed_parent) {
+		throw InternalException("Changed operator must own the indexed unary insertion slot");
+	}
+	if (!data_flow.state->SupportsUnaryInsertion(*wrapper)) {
+		throw InternalException("Indexed unary insertion requires an operator with known child semantics");
+	}
+	data_flow.state->ValidateChildren(changed_parent);
+	data_flow.state->ValidateFutureChildCount(changed_parent, changed_parent.children.size());
+	LogicalPlanDataFlowMetadata parent_metadata;
+	data_flow.state->ValidateRefreshOperator(changed_parent, parent_metadata);
+	data_flow.state->RegisterSubtree(*wrapper);
+	data_flow.state->ValidateStructuralMutation(*wrapper, 1);
+	auto old_subtree = data_flow.state->DetachChild(changed_parent, location.child_index, false);
+	data_flow.state->AttachChild(*wrapper, 0, std::move(old_subtree), false);
+	data_flow.state->RefreshOperator(*wrapper);
+	data_flow.state->AttachChild(changed_parent, location.child_index, std::move(wrapper), false);
+	data_flow.state->RefreshOperator(changed_parent);
+	VerifyAfterMutation();
+}
+
 void LogicalPlanDataFlowMutator::InsertParent(unique_ptr<LogicalOperator> &slot, unique_ptr<LogicalOperator> parent,
                                               idx_t child_index) {
 	if (!parent || parent->children.size() != 1 || child_index > 1) {
@@ -2421,32 +2449,6 @@ void LogicalPlanDataFlowMutator::RotateParentWithChild(unique_ptr<LogicalOperato
 		data_flow.state->RefreshOperator(*location.parent);
 	}
 	VerifyAfterMutation();
-}
-
-void LogicalPlanDataFlowMutator::InsertUnary(unique_ptr<LogicalOperator> &slot, unique_ptr<LogicalOperator> wrapper,
-                                             LogicalOperator &changed_parent) {
-	if (!wrapper || !wrapper->children.empty()) {
-		throw InternalException("Indexed unary insertion requires a childless wrapper");
-	}
-	auto location = GetMutationSlot(*data_flow.state, slot);
-	if (location.is_root || location.parent.get() != &changed_parent) {
-		throw InternalException("Changed operator must own the indexed unary insertion slot");
-	}
-	if (!data_flow.state->SupportsUnaryInsertion(*wrapper)) {
-		throw InternalException("Indexed unary insertion requires an operator with known child semantics");
-	}
-	data_flow.state->ValidateChildren(changed_parent);
-	data_flow.state->ValidateFutureChildCount(changed_parent, changed_parent.children.size());
-	LogicalPlanDataFlowMetadata parent_metadata;
-	data_flow.state->ValidateRefreshOperator(changed_parent, parent_metadata);
-	data_flow.state->RegisterSubtree(*wrapper);
-	data_flow.state->ValidateStructuralMutation(*wrapper, 1);
-	auto old_subtree = data_flow.state->DetachChild(changed_parent, location.child_index, false);
-	data_flow.state->AttachChild(*wrapper, 0, std::move(old_subtree), false);
-	data_flow.state->RefreshOperator(*wrapper);
-	data_flow.state->AttachChild(changed_parent, location.child_index, std::move(wrapper), false);
-	data_flow.state->RefreshOperator(changed_parent);
-	D_ASSERT(data_flow.Verify());
 }
 
 unique_ptr<LogicalOperator> LogicalPlanDataFlowMutator::RemoveUnary(unique_ptr<LogicalOperator> &slot) {
