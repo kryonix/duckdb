@@ -413,6 +413,43 @@ public:
 		if (ChangesBindingAvailability(op)) {
 			result.Add(LogicalPlanPathProperty::BINDING_AVAILABILITY_BOUNDARY);
 		}
+		if (op.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+		    op.Cast<LogicalComparisonJoin>().join_type == JoinType::INVALID) {
+			result.Add(LogicalPlanPathProperty::NULLABILITY_BOUNDARY);
+		}
+		return result;
+	}
+
+	LogicalPlanPathSummary GetEdgeValue(const LogicalOperator &parent, idx_t child_idx) const {
+		LogicalPlanPathSummary result;
+		if (parent.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN || child_idx > 1) {
+			return result;
+		}
+		auto &join = parent.Cast<LogicalComparisonJoin>();
+		switch (join.join_type) {
+		case JoinType::LEFT:
+		case JoinType::SINGLE:
+			if (child_idx == 1) {
+				result.Add(LogicalPlanPathProperty::NULL_EXTENDING);
+			}
+			break;
+		case JoinType::RIGHT:
+			if (child_idx == 0) {
+				result.Add(LogicalPlanPathProperty::NULL_EXTENDING);
+			}
+			break;
+		case JoinType::OUTER:
+			result.Add(LogicalPlanPathProperty::NULL_EXTENDING);
+			break;
+		case JoinType::INNER:
+		case JoinType::SEMI:
+		case JoinType::ANTI:
+		case JoinType::MARK:
+		case JoinType::RIGHT_SEMI:
+		case JoinType::RIGHT_ANTI:
+		case JoinType::INVALID:
+			break;
+		}
 		return result;
 	}
 
@@ -459,6 +496,7 @@ public:
 					valid = false;
 					continue;
 				}
+				child_entry->edge_to_parent = GetEdgeValue(parent, child_idx);
 				child_entry->flow_parent = parent;
 				child_entry->flow_child_index = child_idx;
 				auto parent_entry = GetEntry(parent);
@@ -832,6 +870,7 @@ public:
 			}
 			const bool should_link = IsFlowChild(parent, child_idx);
 			const bool is_linked = child_entry->flow_parent.get() == &parent;
+			const auto edge_to_parent = should_link ? GetEdgeValue(parent, child_idx) : LogicalPlanPathSummary();
 			if (child_entry->flow_parent && !is_linked) {
 				throw InternalException("Logical plan flow child already has another parent");
 			}
@@ -840,7 +879,9 @@ public:
 				D_ASSERT(cut);
 				child_entry->flow_parent = nullptr;
 				child_entry->flow_child_index = DConstants::INVALID_INDEX;
+				child_entry->edge_to_parent = {};
 			} else if (!is_linked && should_link) {
+				child_entry->edge_to_parent = edge_to_parent;
 				child_entry->flow_parent = parent;
 				child_entry->flow_child_index = child_idx;
 				const bool linked = forest.Link(child_entry->forest_node, parent_entry->forest_node,
@@ -849,6 +890,7 @@ public:
 					throw InternalException("Cannot create a cyclic logical plan flow edge");
 				}
 			} else if (is_linked) {
+				child_entry->edge_to_parent = edge_to_parent;
 				child_entry->flow_child_index = child_idx;
 				const bool updated =
 				    forest.SetEdgeValue(child_entry->forest_node, ToForestValue(child_entry->edge_to_parent));
@@ -1680,7 +1722,12 @@ bool LogicalPlanDataFlow::Verify() const {
 				if (child_entry->flow_parent.get() != &op.get() || child_entry->flow_child_index != child_idx) {
 					return false;
 				}
+				if (child_entry->edge_to_parent != state->GetEdgeValue(op, child_idx)) {
+					return false;
+				}
 			} else if (child_entry->flow_parent.get() == &op.get()) {
+				return false;
+			} else if (child_entry->edge_to_parent.properties != 0) {
 				return false;
 			}
 			pending.push_back(*op.get().children[child_idx]);
@@ -1826,6 +1873,7 @@ bool LogicalPlanDataFlow::Verify() const {
 				    LogicalPlanPathProperty::LIMIT_BOUNDARY,
 				    LogicalPlanPathProperty::SIDE_EFFECT_BOUNDARY,
 				    LogicalPlanPathProperty::FILTER_PUSHDOWN_BOUNDARY,
+				    LogicalPlanPathProperty::NULLABILITY_BOUNDARY,
 				    LogicalPlanPathProperty::BINDING_AVAILABILITY_BOUNDARY};
 				for (auto property : guided_properties) {
 					LogicalPlanPathSummary properties;

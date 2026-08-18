@@ -6,6 +6,7 @@
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/expression_nullability.hpp"
+#include "duckdb/planner/logical_plan_data_flow.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_delim_get.hpp"
@@ -294,8 +295,6 @@ bool Deliminator::RemoveInequalityJoinWithDelimGet(LogicalComparisonJoin &delim_
 	    delim_conditions.size() != join_conditions.size()) {
 		return false;
 	}
-	NotNullExpressionAnalyzer nullability(context, root);
-
 	// TODO: we cannot perform the optimization here because our pure inequality joins don't implement
 	//  JoinType::SINGLE yet, and JoinType::MARK is a special case
 	if (delim_join.join_type == JoinType::SINGLE || delim_join.join_type == JoinType::MARK) {
@@ -339,6 +338,12 @@ bool Deliminator::RemoveInequalityJoinWithDelimGet(LogicalComparisonJoin &delim_
 		}
 		current_op = *current_op.get().children[0];
 	}
+	unique_ptr<LogicalPlanDataFlow> nullability_data_flow;
+	unique_ptr<NotNullExpressionAnalyzer> nullability;
+	if (delim_join.join_type == JoinType::MARK) {
+		nullability_data_flow = make_uniq<LogicalPlanDataFlow>(*root);
+		nullability = make_uniq<NotNullExpressionAnalyzer>(context, *nullability_data_flow);
+	}
 
 	// Get the index (left or right) of the DelimGet side of the join
 	const idx_t delim_idx = OperatorIsDelimGet(*join->children[0]) ? 0 : 1;
@@ -369,7 +374,7 @@ bool Deliminator::RemoveInequalityJoinWithDelimGet(LogicalComparisonJoin &delim_
 				auto original_join_comparison = join_condition.GetComparisonType(); // Save original for later check
 				if (delim_join.join_type == JoinType::MARK &&
 				    original_join_comparison == ExpressionType::COMPARE_NOTEQUAL) {
-					if (!nullability.IsNotNull(*delim_join.children[0], delim_condition.GetLHS())) {
+					if (!nullability->IsNotNull(*delim_join.children[0], delim_condition.GetLHS())) {
 						return false;
 					}
 				}

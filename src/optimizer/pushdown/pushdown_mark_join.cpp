@@ -7,17 +7,19 @@ namespace duckdb {
 
 using Filter = FilterPushdown::Filter;
 
-static void SimplifyNullSafeSemiJoinConditions(ClientContext &context, LogicalComparisonJoin &join) {
+static void SimplifyNullSafeSemiJoinConditions(ClientContext &context, LogicalComparisonJoin &join,
+                                               LogicalPlanDataFlow &data_flow) {
 	D_ASSERT(join.join_type == JoinType::SEMI);
-	NotNullExpressionAnalyzer analyzer(context);
+	NotNullExpressionAnalyzer analyzer(context, data_flow);
 	for (auto &cond : join.conditions) {
 		if (!cond.IsComparison() || cond.GetComparisonType() != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
 			continue;
 		}
 		// Once a MARK join is reduced to SEMI, a null-safe equality is equivalent to regular equality if either
 		// join key is known not to be NULL. Regular equality unlocks the existing runtime-filter infrastructure.
-		if (!analyzer.IsNotNull(*join.children[0], cond.GetLHS()) &&
-		    !analyzer.IsNotNull(*join.children[1], cond.GetRHS())) {
+		auto left_not_null = analyzer.IsNotNull(*join.children[0], cond.GetLHS());
+		auto right_not_null = analyzer.IsNotNull(*join.children[1], cond.GetRHS());
+		if (!left_not_null && !right_not_null) {
 			continue;
 		}
 		cond =
@@ -103,7 +105,7 @@ void FilterPushdown::PushdownMarkJoin(unique_ptr<LogicalOperator> &op, JoinBindi
 	left_pushdown.Rewrite(op->children[0], context);
 	right_pushdown.Rewrite(op->children[1], context);
 	if (join.join_type == JoinType::SEMI) {
-		SimplifyNullSafeSemiJoinConditions(GetContext(), comp_join);
+		SimplifyNullSafeSemiJoinConditions(GetContext(), comp_join, context.data_flow);
 		context.mutator.RefreshOperator(comp_join);
 	}
 	PushFinalFilters(op, context);

@@ -6,17 +6,13 @@
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/logical_plan_data_flow.hpp"
 #include "duckdb/planner/operator/list.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 
 #include <algorithm>
 
 namespace duckdb {
-
-NotNullExpressionAnalyzer::NotNullExpressionAnalyzer(ClientContext &context_p,
-                                                     optional_ptr<LogicalOperator> plan_root_p)
-    : context(context_p), plan_root(plan_root_p) {
-}
 
 static bool GetColumnRefBinding(const Expression &expr, ColumnBinding &binding) {
 	if (expr.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
@@ -66,65 +62,24 @@ static bool FilterRejectsNull(const Expression &filter, const Expression &expr) 
 	       Expression::Equals(BoundComparisonExpression::Right(comparison), expr);
 }
 
-static bool JoinOutputPreservesChildNonNullability(JoinType join_type, idx_t child_idx) {
-	switch (join_type) {
-	case JoinType::INNER:
-		return child_idx < 2;
-	case JoinType::LEFT:
-	case JoinType::SEMI:
-	case JoinType::ANTI:
-	case JoinType::MARK:
-	case JoinType::SINGLE:
-		return child_idx == 0;
-	case JoinType::RIGHT:
-	case JoinType::RIGHT_SEMI:
-	case JoinType::RIGHT_ANTI:
-		return child_idx == 1;
-	case JoinType::OUTER:
-	case JoinType::INVALID:
-		return false;
-	}
-	return false;
-}
-
-optional_ptr<LogicalCTE> NotNullExpressionAnalyzer::FindCTE(TableIndex cte_index) {
-	if (!plan_root) {
-		return nullptr;
-	}
-	vector<reference<LogicalOperator>> operators;
-	operators.push_back(*plan_root);
-	while (!operators.empty()) {
-		auto &op = operators.back().get();
-		operators.pop_back();
-		if (op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE &&
-		    op.Cast<LogicalCTE>().table_index == cte_index) {
-			return op.Cast<LogicalCTE>();
-		}
-		for (auto &child : op.children) {
-			operators.push_back(*child);
-		}
-	}
-	return nullptr;
+NotNullExpressionAnalyzer::NotNullExpressionAnalyzer(ClientContext &context_p, LogicalPlanDataFlow &data_flow_p)
+    : context(context_p), data_flow(data_flow_p) {
 }
 
 bool NotNullExpressionAnalyzer::IsNotNull(LogicalOperator &op, const Expression &expr, vector<TableIndex> &seen_ctes) {
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_PROJECTION: {
 		auto &projection = op.Cast<LogicalProjection>();
-		if (projection.children.size() != 1) {
-			return false;
-		}
 		ColumnBinding binding;
-		if (!GetColumnRefBinding(expr, binding)) {
+		if (projection.children.size() != 1 || !GetColumnRefBinding(expr, binding) ||
+		    binding.table_index != projection.table_index) {
 			return false;
 		}
-		auto projection_bindings = projection.GetColumnBindings();
-		for (idx_t idx = 0; idx < projection_bindings.size(); idx++) {
-			if (projection_bindings[idx] == binding) {
-				return IsNotNull(*projection.children[0], *projection.expressions[idx], seen_ctes);
-			}
+		auto column_index = binding.column_index.GetIndex();
+		if (column_index >= projection.expressions.size()) {
+			return false;
 		}
-		return false;
+		return IsNotNull(*projection.children[0], *projection.expressions[column_index], seen_ctes);
 	}
 	case LogicalOperatorType::LOGICAL_FILTER: {
 		auto &filter = op.Cast<LogicalFilter>();
@@ -136,34 +91,29 @@ bool NotNullExpressionAnalyzer::IsNotNull(LogicalOperator &op, const Expression 
 		return filter.children.size() == 1 && IsNotNull(*filter.children[0], expr, seen_ctes);
 	}
 	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN: {
-		auto &join = op.Cast<LogicalComparisonJoin>();
-		if (join.children.size() != 2) {
-			return false;
-		}
 		ColumnBinding binding;
 		if (!GetColumnRefBinding(expr, binding)) {
 			return false;
 		}
-		auto output_bindings = join.GetColumnBindings();
-		if (std::find(output_bindings.begin(), output_bindings.end(), binding) == output_bindings.end()) {
+		auto source = data_flow.ResolveSource(binding, 0, op);
+		if (source.status != LogicalPlanDataFlowStatus::SUCCESS) {
 			return false;
 		}
-		optional_idx binding_child;
-		for (idx_t child_idx = 0; child_idx < join.children.size(); child_idx++) {
-			auto child_bindings = join.children[child_idx]->GetColumnBindings();
-			if (std::find(child_bindings.begin(), child_bindings.end(), binding) == child_bindings.end()) {
-				continue;
-			}
-			if (binding_child.IsValid()) {
-				return false;
-			}
-			binding_child = child_idx;
-		}
-		if (!binding_child.IsValid() ||
-		    !JoinOutputPreservesChildNonNullability(join.join_type, binding_child.GetIndex())) {
+		LogicalPlanPathSummary boundary_property;
+		boundary_property.Add(LogicalPlanPathProperty::NULLABILITY_BOUNDARY);
+		auto boundary = data_flow.FindFirstPathOperator(op, *source.op, boundary_property);
+		if (boundary.status == LogicalPlanDataFlowStatus::PATH_PROPERTY_NOT_FOUND) {
 			return false;
 		}
-		return IsNotNull(*join.children[binding_child.GetIndex()], expr, seen_ctes);
+		if (boundary.status != LogicalPlanDataFlowStatus::SUCCESS || boundary.op.get() == &op) {
+			return false;
+		}
+		auto path = data_flow.GetPathSummary(op, *boundary.op);
+		if (path.status != LogicalPlanDataFlowStatus::SUCCESS ||
+		    path.summary.Has(LogicalPlanPathProperty::NULL_EXTENDING)) {
+			return false;
+		}
+		return IsNotNull(*boundary.op, expr, seen_ctes);
 	}
 	case LogicalOperatorType::LOGICAL_GET: {
 		ColumnBinding binding;
@@ -204,19 +154,19 @@ bool NotNullExpressionAnalyzer::IsNotNull(LogicalOperator &op, const Expression 
 		    std::find(seen_ctes.begin(), seen_ctes.end(), cte_ref.cte_index) != seen_ctes.end()) {
 			return false;
 		}
-		auto cte = FindCTE(cte_ref.cte_index);
-		if (!cte || cte->children.empty()) {
+		auto producer = data_flow.GetCTEProducer(cte_ref.cte_index);
+		if (producer.status != LogicalPlanDataFlowStatus::SUCCESS ||
+		    producer.op->type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE) {
 			return false;
 		}
 		auto column_index = binding.column_index.GetIndex();
-		auto &cte_source = *cte->children[0];
-		auto source_bindings = cte_source.GetColumnBindings();
-		if (column_index >= source_bindings.size() || column_index >= cte_source.types.size()) {
+		auto source_bindings = producer.op->GetColumnBindings();
+		if (column_index >= source_bindings.size() || column_index >= producer.op->types.size()) {
 			return false;
 		}
 		seen_ctes.push_back(cte_ref.cte_index);
-		auto source_expr = BoundColumnRefExpression(cte_source.types[column_index], source_bindings[column_index]);
-		auto result = IsNotNull(cte_source, source_expr, seen_ctes);
+		auto source_expr = BoundColumnRefExpression(producer.op->types[column_index], source_bindings[column_index]);
+		auto result = IsNotNull(*producer.op, source_expr, seen_ctes);
 		seen_ctes.pop_back();
 		return result;
 	}

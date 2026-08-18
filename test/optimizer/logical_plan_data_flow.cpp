@@ -132,6 +132,7 @@ static void RequireEquivalentDataFlow(LogicalOperator &root, LogicalPlanDataFlow
 			REQUIRE(live_path.summary == rebuilt_path.summary);
 			for (auto property :
 			     {LogicalPlanPathProperty::OPAQUE_BOUNDARY, LogicalPlanPathProperty::FILTER_PUSHDOWN_BOUNDARY,
+			      LogicalPlanPathProperty::NULLABILITY_BOUNDARY,
 			      LogicalPlanPathProperty::BINDING_AVAILABILITY_BOUNDARY}) {
 				LogicalPlanPathSummary properties;
 				properties.Add(property);
@@ -400,6 +401,96 @@ TEST_CASE("Logical plan data flow models every comparison join output", "[optimi
 	        LogicalPlanDataFlowStatus::BINDING_NOT_AVAILABLE);
 	REQUIRE(data_flow.ResolveSource(ColumnBinding(TableIndex(10), ProjectionIndex(1)), 0, *filter).status ==
 	        LogicalPlanDataFlowStatus::SUCCESS);
+}
+
+TEST_CASE("Logical plan data flow indexes null-extending comparison join edges",
+          "[optimizer][logical_plan_data_flow]") {
+	struct JoinNullExtension {
+		JoinType type;
+		bool left;
+		bool right;
+	};
+	const vector<JoinNullExtension> join_types {
+	    {JoinType::LEFT, false, true},        {JoinType::RIGHT, true, false},  {JoinType::OUTER, true, true},
+	    {JoinType::SINGLE, false, true},      {JoinType::INNER, false, false}, {JoinType::SEMI, false, false},
+	    {JoinType::ANTI, false, false},       {JoinType::MARK, false, false},  {JoinType::RIGHT_SEMI, false, false},
+	    {JoinType::RIGHT_ANTI, false, false},
+	};
+	for (auto expected : join_types) {
+		CAPTURE(expected.type);
+		auto join = make_uniq<LogicalComparisonJoin>(expected.type);
+		join->mark_index = TableIndex(30);
+		join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(10)));
+		join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(20)));
+		auto &left = *join->children[0];
+		auto &right = *join->children[1];
+
+		LogicalPlanDataFlow data_flow(*join);
+		REQUIRE(data_flow.Verify());
+		auto left_path = data_flow.GetPathSummary(*join, left);
+		auto right_path = data_flow.GetPathSummary(*join, right);
+		REQUIRE(left_path.status == LogicalPlanDataFlowStatus::SUCCESS);
+		REQUIRE(right_path.status == LogicalPlanDataFlowStatus::SUCCESS);
+		REQUIRE(left_path.summary.Has(LogicalPlanPathProperty::NULL_EXTENDING) == expected.left);
+		REQUIRE(right_path.summary.Has(LogicalPlanPathProperty::NULL_EXTENDING) == expected.right);
+
+		LogicalPlanPathSummary boundary;
+		boundary.Add(LogicalPlanPathProperty::NULLABILITY_BOUNDARY);
+		REQUIRE(data_flow.FindFirstPathOperator(*join, left, boundary).op.get() == &left);
+		REQUIRE(data_flow.FindFirstPathOperator(*join, right, boundary).op.get() == &right);
+	}
+}
+
+TEST_CASE("Indexed join mutations refresh null-extending edges", "[optimizer][logical_plan_data_flow]") {
+	auto join = make_uniq<LogicalComparisonJoin>(JoinType::LEFT);
+	join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(10)));
+	join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(20)));
+	auto &left = *join->children[0];
+	auto &right = *join->children[1];
+	LogicalPlanDataFlow data_flow(*join);
+	LogicalPlanDataFlowMutator mutator(data_flow);
+
+	REQUIRE_FALSE(data_flow.GetPathSummary(*join, left).summary.Has(LogicalPlanPathProperty::NULL_EXTENDING));
+	REQUIRE(data_flow.GetPathSummary(*join, right).summary.Has(LogicalPlanPathProperty::NULL_EXTENDING));
+
+	join->join_type = JoinType::RIGHT;
+	mutator.RefreshOperator(*join);
+	REQUIRE(data_flow.GetPathSummary(*join, left).summary.Has(LogicalPlanPathProperty::NULL_EXTENDING));
+	REQUIRE_FALSE(data_flow.GetPathSummary(*join, right).summary.Has(LogicalPlanPathProperty::NULL_EXTENDING));
+
+	mutator.SwapChildren(*join, 0, 1);
+	REQUIRE_FALSE(data_flow.GetPathSummary(*join, left).summary.Has(LogicalPlanPathProperty::NULL_EXTENDING));
+	REQUIRE(data_flow.GetPathSummary(*join, right).summary.Has(LogicalPlanPathProperty::NULL_EXTENDING));
+	REQUIRE(data_flow.Verify());
+}
+
+TEST_CASE("Specialized joins are indexed nullability boundaries", "[optimizer][logical_plan_data_flow]") {
+	vector<unique_ptr<LogicalOperator>> joins;
+	joins.push_back(make_uniq<LogicalComparisonJoin>(JoinType::LEFT, LogicalOperatorType::LOGICAL_DELIM_JOIN));
+	joins.push_back(make_uniq<LogicalComparisonJoin>(JoinType::LEFT, LogicalOperatorType::LOGICAL_ASOF_JOIN));
+	auto any_join = make_uniq<LogicalAnyJoin>(JoinType::LEFT);
+	any_join->condition = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
+	joins.push_back(std::move(any_join));
+	auto dependent_join = make_uniq<LogicalDependentJoin>(JoinType::LEFT);
+	dependent_join->condition = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
+	joins.push_back(std::move(dependent_join));
+	joins.push_back(make_uniq<LogicalUnconditionalJoin>(LogicalOperatorType::LOGICAL_POSITIONAL_JOIN));
+	for (auto &join : joins) {
+		CAPTURE(join->type);
+		join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(10)));
+		join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(20)));
+		LogicalPlanDataFlow data_flow(*join);
+		REQUIRE(data_flow.Verify());
+		LogicalPlanPathSummary boundary;
+		boundary.Add(LogicalPlanPathProperty::NULLABILITY_BOUNDARY);
+		auto first = data_flow.FindFirstPathOperator(*join, *join->children[0], boundary);
+		REQUIRE(first.status == LogicalPlanDataFlowStatus::SUCCESS);
+		REQUIRE(first.op.get() == join.get());
+		REQUIRE_FALSE(
+		    data_flow.GetPathSummary(*join, *join->children[0]).summary.Has(LogicalPlanPathProperty::NULL_EXTENDING));
+		REQUIRE_FALSE(
+		    data_flow.GetPathSummary(*join, *join->children[1]).summary.Has(LogicalPlanPathProperty::NULL_EXTENDING));
+	}
 }
 
 TEST_CASE("Logical plan data flow connects specialized join inputs", "[optimizer][logical_plan_data_flow]") {

@@ -20,6 +20,7 @@
 #include "duckdb/planner/expression_nullability.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/logical_plan_data_flow.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/list.hpp"
 
@@ -843,8 +844,6 @@ bool GeneratedDedupRefEliminator::RemoveInequalityJoinConditions(LogicalOperator
 			return false;
 		}
 	}
-	NotNullExpressionAnalyzer nullability(context, rewrite_root);
-
 	vector<ColumnBinding> traced_bindings;
 	for (const auto &cond : delim_conditions) {
 		if (!cond.IsComparison() || cond.GetRHS().GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
@@ -873,6 +872,12 @@ bool GeneratedDedupRefEliminator::RemoveInequalityJoinConditions(LogicalOperator
 			return false;
 		}
 		current_op = *current_op.get().children[0];
+	}
+	unique_ptr<LogicalPlanDataFlow> nullability_data_flow;
+	unique_ptr<NotNullExpressionAnalyzer> nullability;
+	if (delim_join.join_type == JoinType::MARK) {
+		nullability_data_flow = make_uniq<LogicalPlanDataFlow>(rewrite_root);
+		nullability = make_uniq<NotNullExpressionAnalyzer>(context, *nullability_data_flow);
 	}
 
 	vector<JoinCondition> rewritten_conditions;
@@ -905,7 +910,7 @@ bool GeneratedDedupRefEliminator::RemoveInequalityJoinConditions(LogicalOperator
 				// DISTINCT FROM changes regular inequality semantics when the MARK probe key can be NULL.
 				if (delim_join.join_type == JoinType::MARK &&
 				    original_join_comparison == ExpressionType::COMPARE_NOTEQUAL) {
-					if (!nullability.IsNotNull(*delim_join.children[0], delim_condition.GetLHS())) {
+					if (!nullability->IsNotNull(*delim_join.children[0], delim_condition.GetLHS())) {
 						return false;
 					}
 				}

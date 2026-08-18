@@ -12,6 +12,12 @@ statement ok
 INSERT INTO nn VALUES (1, 5), (3, 8);
 
 statement ok
+CREATE TABLE nullable_nn(k INTEGER, wh INTEGER);
+
+statement ok
+INSERT INTO nullable_nn VALUES (1, 5), (3, NULL);
+
+statement ok
 CREATE TABLE ids(id INTEGER NOT NULL);
 
 statement ok
@@ -101,12 +107,75 @@ ORDER BY ids.id;
 1	5	true
 2	NULL	false
 
+# Null rejection below the nullable edge does not make a LEFT join output non-NULL.
+query IIT
+SELECT ids.id, n.wh,
+       EXISTS (
+           SELECT 1
+           FROM ev
+           WHERE ev.id = ids.id
+             AND n.wh <> ev.wh
+       )
+FROM ids
+LEFT JOIN (
+    SELECT k, wh
+    FROM nullable_nn
+    WHERE wh IS NOT NULL
+) n ON ids.id = n.k
+ORDER BY ids.id;
+----
+1	5	true
+2	NULL	false
+
+# A nullable edge above a projection and INNER join still dominates the source column's constraint.
+query IIT
+SELECT ids.id, n.wh,
+       EXISTS (
+           SELECT 1
+           FROM ev
+           WHERE ev.id = ids.id
+             AND n.wh <> ev.wh
+       )
+FROM ids
+LEFT JOIN (
+    SELECT nn.k, nn.wh
+    FROM nn
+    JOIN ev matched ON nn.k = matched.id
+) n ON ids.id = n.k
+ORDER BY ids.id;
+----
+1	5	true
+2	NULL	false
+
 # Materialized CTE references must retain nullability introduced inside their definitions.
 query IIT
 WITH outer_rows AS MATERIALIZED (
     SELECT ids.id, nn.wh
     FROM ids
     LEFT JOIN nn ON ids.id = nn.k
+)
+SELECT id, wh,
+       EXISTS (
+           SELECT 1
+           FROM ev
+           WHERE ev.id = outer_rows.id
+             AND outer_rows.wh <> ev.wh
+       )
+FROM outer_rows
+ORDER BY id;
+----
+1	5	true
+2	NULL	false
+
+# Indexed CTE lineage follows nested materialized readers without losing null-extension metadata.
+query IIT
+WITH inner_rows AS MATERIALIZED (
+    SELECT ids.id, nn.wh
+    FROM ids
+    LEFT JOIN nn ON ids.id = nn.k
+), outer_rows AS MATERIALIZED (
+    SELECT id, wh
+    FROM inner_rows
 )
 SELECT id, wh,
        EXISTS (
@@ -173,6 +242,25 @@ SELECT ids.id, nn.wh,
        )
 FROM ids
 JOIN nn ON ids.id = nn.k;
+----
+logical_opt	<REGEX>:.*Join Type: MARK.*wh IS DISTINCT FROM wh.*
+
+# A projection between explicit null rejection and the consumer retains the positive proof.
+query II
+EXPLAIN
+SELECT filtered.id, filtered.wh,
+       EXISTS (
+           SELECT 1
+           FROM ev
+           WHERE ev.id = filtered.id
+             AND filtered.wh <> ev.wh
+       )
+FROM (
+    SELECT ids.id, nn.wh
+    FROM ids
+    LEFT JOIN nn ON ids.id = nn.k
+    WHERE nn.wh IS NOT NULL
+) filtered;
 ----
 logical_opt	<REGEX>:.*Join Type: MARK.*wh IS DISTINCT FROM wh.*
 
