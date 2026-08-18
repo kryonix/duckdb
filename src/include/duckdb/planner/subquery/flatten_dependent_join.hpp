@@ -22,6 +22,8 @@ class LogicalComparisonJoin;
 class LogicalCTERef;
 class LogicalExpressionGet;
 class LogicalJoin;
+class LogicalPlanDataFlow;
+class LogicalPlanDataFlowMutator;
 
 //! The FlattenDependentJoins class is responsible for pushing the dependent join down into the plan to create a
 //! flattened subquery
@@ -41,18 +43,14 @@ private:
 		vector<ColumnBinding> left_payload;
 		vector<ColumnBinding> right_payload;
 	};
-	struct SubtreeAccess {
-		bool correlated = false;
-		bool volatile_expression = false;
-
-		void Merge(const SubtreeAccess &other) {
-			correlated = correlated || other.correlated;
-			volatile_expression = volatile_expression || other.volatile_expression;
-		}
+	struct IndexedRewriteContext {
+		LogicalPlanDataFlow &data_flow;
+		LogicalPlanDataFlowMutator &mutator;
 	};
 
-	FlattenDependentJoins(Binder &binder, const CorrelatedColumns &correlated, bool perform_delim = true,
-	                      bool any_join = false, optional_ptr<FlattenDependentJoins> parent = nullptr);
+	FlattenDependentJoins(Binder &binder, const CorrelatedColumns &correlated, IndexedRewriteContext &indexed_rewrite,
+	                      bool perform_delim = true, bool any_join = false,
+	                      optional_ptr<FlattenDependentJoins> parent = nullptr);
 	UnnestingState DecorrelateIndependentSubtree(unique_ptr<LogicalOperator> &plan, bool propagate_null_values = true);
 	vector<ColumnBinding> CreateContiguousState(ColumnBinding base_binding) const;
 
@@ -65,10 +63,13 @@ private:
 	                                      const vector<ColumnBinding> &state, bool perform_delim);
 	column_binding_map_t<ColumnBinding> GetCurrentBindings(const vector<ColumnBinding> &state) const;
 	void RewriteCorrelatedBindings(LogicalOperator &op, const vector<ColumnBinding> &state);
-	void InvalidateAccessCache();
+	void RefreshSubtree(LogicalOperator &op);
+	void InvalidateVolatilityCache();
 	//! Checks whether a subtree must be evaluated in this flattener's active domain.
 	bool RequiresDomain(LogicalOperator &op) const;
-	SubtreeAccess GetSubtreeAccess(LogicalOperator &op) const;
+	bool RequiresCorrelatedDomain(LogicalOperator &op) const;
+	bool HasIndexedCorrelation(LogicalOperator &op) const;
+	bool HasVolatileExpression(LogicalOperator &op) const;
 	idx_t GetDelimKeyIndex(idx_t index) const;
 
 	UnnestingState PushDownCorrelatedNode(unique_ptr<LogicalOperator> &plan, bool propagate_null_values = true);
@@ -84,6 +85,7 @@ private:
 	void AddReplacementAliases(const BindingReplacementGraph &replacements);
 	Binder &binder;
 	column_binding_map_t<ColumnBinding> correlated_aliases;
+	column_binding_set_t correlated_bindings;
 	column_binding_map_t<idx_t> replacement_map;
 	const CorrelatedColumns &correlated_columns;
 	vector<LogicalType> delim_types;
@@ -91,7 +93,8 @@ private:
 	bool perform_delim;
 	bool any_join;
 	optional_ptr<FlattenDependentJoins> parent;
-	mutable reference_map_t<LogicalOperator, SubtreeAccess> access_cache;
+	IndexedRewriteContext &indexed_rewrite;
+	mutable reference_map_t<LogicalOperator, bool> volatility_cache;
 	void AppendCorrelatedColumns(vector<unique_ptr<Expression>> &expressions, const vector<ColumnBinding> &state,
 	                             bool include_names) const;
 	void AddDelimColumnsToGroup(LogicalAggregate &aggr, const vector<ColumnBinding> &state) const;

@@ -174,13 +174,14 @@ static bool CreateJoinCondition(Expression &expr, vector<JoinCondition> &conditi
 }
 
 //! Extract join conditions, pushing single-side filters to children when it's safe
-void LogicalComparisonJoin::ExtractJoinConditions(ClientContext &context, JoinType type, JoinRefType ref_type,
-                                                  unique_ptr<LogicalOperator> &left_child,
-                                                  unique_ptr<LogicalOperator> &right_child,
-                                                  const unordered_set<TableIndex> &left_bindings,
-                                                  const unordered_set<TableIndex> &right_bindings,
-                                                  vector<unique_ptr<Expression>> &expressions,
-                                                  vector<JoinCondition> &conditions) {
+template <class PUSH_FILTER>
+static void ExtractJoinConditionsInternal(ClientContext &context, JoinType type, JoinRefType ref_type,
+                                          unique_ptr<LogicalOperator> &left_child,
+                                          unique_ptr<LogicalOperator> &right_child,
+                                          const unordered_set<TableIndex> &left_bindings,
+                                          const unordered_set<TableIndex> &right_bindings,
+                                          vector<unique_ptr<Expression>> &expressions,
+                                          vector<JoinCondition> &conditions, PUSH_FILTER &&push_filter) {
 	for (auto &expr : expressions) {
 		auto side = JoinSide::GetJoinSide(*expr, left_bindings, right_bindings);
 
@@ -190,12 +191,12 @@ void LogicalComparisonJoin::ExtractJoinConditions(ClientContext &context, JoinTy
 			}
 		} else if (side == JoinSide::LEFT) {
 			if (CanPushToLeftChild(type, ref_type)) {
-				PushFilterToChild(left_child, expr);
+				push_filter(left_child, expr);
 				continue;
 			}
 		} else if (side == JoinSide::RIGHT) {
 			if (CanPushToRightChild(type, ref_type)) {
-				PushFilterToChild(right_child, expr);
+				push_filter(right_child, expr);
 				continue;
 			}
 		} else if (side == JoinSide::BOTH) {
@@ -209,6 +210,17 @@ void LogicalComparisonJoin::ExtractJoinConditions(ClientContext &context, JoinTy
 
 		conditions.emplace_back(std::move(expr));
 	}
+}
+
+void LogicalComparisonJoin::ExtractJoinConditions(ClientContext &context, JoinType type, JoinRefType ref_type,
+                                                  unique_ptr<LogicalOperator> &left_child,
+                                                  unique_ptr<LogicalOperator> &right_child,
+                                                  const unordered_set<TableIndex> &left_bindings,
+                                                  const unordered_set<TableIndex> &right_bindings,
+                                                  vector<unique_ptr<Expression>> &expressions,
+                                                  vector<JoinCondition> &conditions) {
+	ExtractJoinConditionsInternal(context, type, ref_type, left_child, right_child, left_bindings, right_bindings,
+	                              expressions, conditions, PushFilterToChild);
 }
 
 void LogicalComparisonJoin::ExtractJoinConditions(ClientContext &context, JoinType type, JoinRefType ref_type,
@@ -232,6 +244,21 @@ void LogicalComparisonJoin::ExtractJoinConditions(ClientContext &context, JoinTy
 	expressions.push_back(std::move(condition));
 	LogicalFilter::SplitPredicates(expressions);
 	return ExtractJoinConditions(context, type, ref_type, left_child, right_child, expressions, conditions);
+}
+
+void LogicalComparisonJoin::ExtractJoinConditions(ClientContext &context, JoinType type, JoinRefType ref_type,
+                                                  unique_ptr<LogicalOperator> &left_child,
+                                                  unique_ptr<LogicalOperator> &right_child,
+                                                  unique_ptr<Expression> condition, vector<JoinCondition> &conditions,
+                                                  const PushFilterCallback &push_filter) {
+	vector<unique_ptr<Expression>> expressions;
+	expressions.push_back(std::move(condition));
+	LogicalFilter::SplitPredicates(expressions);
+	unordered_set<TableIndex> left_bindings, right_bindings;
+	LogicalJoin::GetTableReferences(*left_child, left_bindings);
+	LogicalJoin::GetTableReferences(*right_child, right_bindings);
+	ExtractJoinConditionsInternal(context, type, ref_type, left_child, right_child, left_bindings, right_bindings,
+	                              expressions, conditions, push_filter);
 }
 
 void LogicalComparisonJoin::ExtractJoinConditionsWithoutPushdown(ClientContext &context, JoinType type,

@@ -22,7 +22,7 @@ public:
 	LogicalCTERef(TableIndex table_index, TableIndex cte_index, vector<LogicalType> types, vector<Identifier> colnames,
 	              bool is_recurring = false)
 	    : LogicalOperator(LogicalOperatorType::LOGICAL_CTE_REF), table_index(table_index), cte_index(cte_index),
-	      correlated_columns(0), is_recurring(is_recurring) {
+	      is_recurring(is_recurring) {
 		D_ASSERT(!types.empty());
 		chunk_types = std::move(types);
 		bound_columns = std::move(colnames);
@@ -35,8 +35,8 @@ public:
 	TableIndex cte_index;
 	//! The types of the chunk
 	vector<LogicalType> chunk_types;
-	//! Number of correlated columns
-	idx_t correlated_columns;
+	//! Correlated bindings appended to this reader during dependent-join flattening
+	vector<ColumnBinding> correlated_bindings;
 	//! Does this operator read the recurring CTE table
 	bool is_recurring = false;
 

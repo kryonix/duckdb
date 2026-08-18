@@ -11,10 +11,12 @@
 #include "duckdb/common/table_index.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/planner/column_binding.hpp"
+#include "duckdb/planner/column_binding_map.hpp"
 
 namespace duckdb {
 
 class LogicalOperator;
+class LogicalDependentJoin;
 class LogicalPlanDataFlowState;
 class LogicalPlanDataFlowMutator;
 class LogicalPlanDataFlowMutationScope;
@@ -92,6 +94,15 @@ struct LogicalPlanBindingUse {
 	reference<LogicalOperator> consumer;
 };
 
+struct LogicalPlanCorrelatedUse {
+	LogicalPlanDataFlowStatus status = LogicalPlanDataFlowStatus::UNSUPPORTED;
+	ColumnBinding binding;
+	idx_t depth;
+	reference<LogicalOperator> consumer;
+	optional_ptr<LogicalOperator> source;
+	optional_ptr<LogicalDependentJoin> owning_join;
+};
+
 //! A pass-scoped, non-owning index of ownership and data flow in one logical plan.
 class LogicalPlanDataFlow {
 public:
@@ -120,6 +131,7 @@ public:
 	LogicalPlanDataFlowReadersResult GetCTEReaders(TableIndex cte_index) const;
 	vector<reference<LogicalOperator>> GetMaterializedCTEs() const;
 	const vector<LogicalPlanBindingUse> &GetBindingUses() const;
+	vector<LogicalPlanCorrelatedUse> GetCorrelatedUses() const;
 	idx_t OperatorCount() const;
 
 	//! Performs an expensive verification against the ownership tree and parent-walk semantics.
@@ -207,6 +219,8 @@ public:
 	unique_ptr<LogicalOperator> RemoveUnary(unique_ptr<LogicalOperator> &slot);
 	void SwapChildren(LogicalOperator &parent, idx_t left_index, idx_t right_index);
 	void RefreshOperator(LogicalOperator &op);
+	LogicalPlanDataFlowBooleanResult HasCorrelatedBinding(LogicalOperator &subtree,
+	                                                      const column_binding_set_t &bindings) const;
 
 private:
 	friend class LogicalPlanDataFlowMutationScope;

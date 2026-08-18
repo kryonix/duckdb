@@ -12,6 +12,7 @@
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
+#include "duckdb/planner/operator/logical_dependent_join.hpp"
 #include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
@@ -73,6 +74,7 @@ struct LogicalPlanDataFlowEntry {
 	optional_ptr<LogicalOperator> cte_producer;
 	TableIndex cte_reader_index;
 	vector<LogicalPlanBindingUse> binding_uses;
+	vector<ColumnBinding> correlated_bindings;
 };
 
 struct LogicalPlanCTELineage {
@@ -93,6 +95,7 @@ struct LogicalPlanDataFlowMetadata {
 	optional_ptr<LogicalOperator> cte_producer;
 	TableIndex cte_reader_index;
 	vector<LogicalPlanBindingUse> binding_uses;
+	vector<ColumnBinding> correlated_bindings;
 };
 
 class LogicalPlanDataFlowState {
@@ -110,6 +113,7 @@ public:
 	reference_map_t<RootedDynamicForestNode, reference<LogicalOperator>> forest_operators;
 	unordered_map<TableIndex, reference<LogicalOperator>> binding_sources;
 	unordered_map<TableIndex, LogicalPlanCTELineage> cte_lineage;
+	column_binding_map_t<reference_set_t<LogicalOperator>> correlated_operators;
 	mutable vector<LogicalPlanBindingUse> binding_uses;
 	mutable bool binding_uses_dirty = false;
 	idx_t active_mutation_scopes = 0;
@@ -150,6 +154,8 @@ public:
 		case LogicalOperatorType::LOGICAL_GET:
 			// Table-in/table-out functions may expose selected input columns.
 			return child_index == 0 && parent.children.size() == 1;
+		case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
+			return child_index == 0 && parent.children.size() == 1;
 		case LogicalOperatorType::LOGICAL_JOIN:
 		case LogicalOperatorType::LOGICAL_DELIM_JOIN:
 		case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
@@ -170,7 +176,6 @@ public:
 		case LogicalOperatorType::LOGICAL_COPY_DATABASE:
 		case LogicalOperatorType::LOGICAL_CHUNK_GET:
 		case LogicalOperatorType::LOGICAL_DELIM_GET:
-		case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
 		case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
 		case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
 		case LogicalOperatorType::LOGICAL_CTE_REF:
@@ -499,6 +504,12 @@ public:
 
 	bool GetMetadata(LogicalOperator &op, LogicalPlanDataFlowMetadata &result) const {
 		unordered_set<TableIndex> produced_table_indexes;
+		column_binding_set_t correlated_bindings;
+		auto add_correlated_binding = [&](const ColumnBinding &binding) {
+			if (correlated_bindings.insert(binding).second) {
+				result.correlated_bindings.push_back(binding);
+			}
+		};
 		for (auto table_index : GetProducedTableIndexes(op)) {
 			if (!table_index.IsValid()) {
 				return false;
@@ -532,6 +543,15 @@ public:
 				return false;
 			}
 			result.cte_reader_index = cte_ref.cte_index;
+			for (auto &binding : cte_ref.correlated_bindings) {
+				add_correlated_binding(binding);
+			}
+			break;
+		}
+		case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN: {
+			for (auto &column : op.Cast<LogicalDependentJoin>().correlated_columns) {
+				add_correlated_binding(column.binding);
+			}
 			break;
 		}
 		default:
@@ -542,6 +562,9 @@ public:
 			    ExpressionIterator::VisitExpression<BoundColumnRefExpression>(
 			        **expression, [&](const BoundColumnRefExpression &column_ref) {
 				        result.binding_uses.push_back({column_ref.Binding(), column_ref.Depth(), op});
+				        if (column_ref.Depth() > 0) {
+					        add_correlated_binding(column_ref.Binding());
+				        }
 			        });
 		    });
 		return true;
@@ -561,11 +584,15 @@ public:
 		if (metadata.cte_reader_index.IsValid()) {
 			cte_lineage[metadata.cte_reader_index].readers.push_back(op);
 		}
+		for (auto &binding : metadata.correlated_bindings) {
+			correlated_operators[binding].insert(op);
+		}
 		entry.produced_table_indexes = std::move(metadata.produced_table_indexes);
 		entry.cte_producer_index = metadata.cte_producer_index;
 		entry.cte_producer = metadata.cte_producer;
 		entry.cte_reader_index = metadata.cte_reader_index;
 		entry.binding_uses = std::move(metadata.binding_uses);
+		entry.correlated_bindings = std::move(metadata.correlated_bindings);
 		binding_uses_dirty = true;
 		return true;
 	}
@@ -601,11 +628,22 @@ public:
 				}
 			}
 		}
+		for (auto &binding : entry.correlated_bindings) {
+			auto correlated = correlated_operators.find(binding);
+			if (correlated == correlated_operators.end()) {
+				continue;
+			}
+			correlated->second.erase(op);
+			if (correlated->second.empty()) {
+				correlated_operators.erase(correlated);
+			}
+		}
 		entry.produced_table_indexes.clear();
 		entry.cte_producer_index = TableIndex();
 		entry.cte_producer = nullptr;
 		entry.cte_reader_index = TableIndex();
 		entry.binding_uses.clear();
+		entry.correlated_bindings.clear();
 		binding_uses_dirty = true;
 	}
 
@@ -885,7 +923,8 @@ public:
 		if (!GetMetadata(parent, metadata) || metadata.produced_table_indexes != entry->produced_table_indexes ||
 		    metadata.cte_producer_index != entry->cte_producer_index || metadata.cte_producer != entry->cte_producer ||
 		    metadata.cte_reader_index != entry->cte_reader_index ||
-		    metadata.binding_uses.size() != entry->binding_uses.size()) {
+		    metadata.binding_uses.size() != entry->binding_uses.size() ||
+		    metadata.correlated_bindings != entry->correlated_bindings) {
 			throw InternalException("Logical plan operator metadata changed without RefreshOperator");
 		}
 		for (idx_t use_idx = 0; use_idx < metadata.binding_uses.size(); use_idx++) {
@@ -1214,6 +1253,7 @@ public:
 		case LogicalOperatorType::LOGICAL_PROJECTION:
 		case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
 		case LogicalOperatorType::LOGICAL_PIVOT:
+		case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
 		case LogicalOperatorType::LOGICAL_UNION:
 		case LogicalOperatorType::LOGICAL_EXCEPT:
 		case LogicalOperatorType::LOGICAL_INTERSECT:
@@ -1515,6 +1555,89 @@ const vector<LogicalPlanBindingUse> &LogicalPlanDataFlow::GetBindingUses() const
 	return state->binding_uses;
 }
 
+vector<LogicalPlanCorrelatedUse> LogicalPlanDataFlow::GetCorrelatedUses() const {
+	vector<LogicalPlanCorrelatedUse> result;
+	for (auto &binding_use : GetBindingUses()) {
+		if (binding_use.depth == 0) {
+			continue;
+		}
+		LogicalPlanCorrelatedUse correlated_use {LogicalPlanDataFlowStatus::CORRELATED_REFERENCE,
+		                                         binding_use.binding,
+		                                         binding_use.depth,
+		                                         binding_use.consumer,
+		                                         nullptr,
+		                                         nullptr};
+		auto current = state->GetEntry(binding_use.consumer);
+		if (!current) {
+			correlated_use.status = LogicalPlanDataFlowStatus::OPERATOR_NOT_INDEXED;
+			result.push_back(correlated_use);
+			continue;
+		}
+		if (current->opaque) {
+			correlated_use.status = LogicalPlanDataFlowStatus::OPAQUE_BOUNDARY;
+			result.push_back(correlated_use);
+			continue;
+		}
+		if (current->node_value.Has(LogicalPlanPathProperty::CTE_BOUNDARY)) {
+			correlated_use.status = LogicalPlanDataFlowStatus::CTE_BOUNDARY;
+			result.push_back(correlated_use);
+			continue;
+		}
+		while (current->owner_parent) {
+			auto parent = state->GetEntry(*current->owner_parent);
+			if (!parent) {
+				correlated_use.status = LogicalPlanDataFlowStatus::OPERATOR_NOT_INDEXED;
+				break;
+			}
+			if (parent->opaque) {
+				correlated_use.status = LogicalPlanDataFlowStatus::OPAQUE_BOUNDARY;
+				break;
+			}
+			if (parent->node_value.Has(LogicalPlanPathProperty::CTE_BOUNDARY)) {
+				correlated_use.status = LogicalPlanDataFlowStatus::CTE_BOUNDARY;
+				break;
+			}
+			if (parent->op.get().type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN &&
+			    current->owner_child_index == 1) {
+				auto &dependent_join = parent->op.get().Cast<LogicalDependentJoin>();
+				bool binding_matches = false;
+				for (auto &column : dependent_join.correlated_columns) {
+					if (column.binding == binding_use.binding) {
+						binding_matches = true;
+						break;
+					}
+				}
+				if (binding_matches && dependent_join.children.size() != 2) {
+					correlated_use.status = LogicalPlanDataFlowStatus::UNSUPPORTED;
+					break;
+				}
+				if (binding_matches) {
+					auto source = ResolveSource(binding_use.binding, 0, *dependent_join.children[0]);
+					if (source.status == LogicalPlanDataFlowStatus::SUCCESS) {
+						correlated_use.status = source.status;
+						correlated_use.source = source.op;
+						correlated_use.owning_join = dependent_join;
+						break;
+					}
+					if (source.status == LogicalPlanDataFlowStatus::OPAQUE_BOUNDARY ||
+					    source.status == LogicalPlanDataFlowStatus::CTE_BOUNDARY) {
+						correlated_use.status = source.status;
+					} else if (source.status != LogicalPlanDataFlowStatus::BINDING_NOT_FOUND &&
+					           source.status != LogicalPlanDataFlowStatus::BINDING_NOT_AVAILABLE &&
+					           source.status != LogicalPlanDataFlowStatus::DISCONNECTED &&
+					           source.status != LogicalPlanDataFlowStatus::NOT_ANCESTOR) {
+						correlated_use.status = source.status;
+						break;
+					}
+				}
+			}
+			current = parent;
+		}
+		result.push_back(correlated_use);
+	}
+	return result;
+}
+
 idx_t LogicalPlanDataFlow::OperatorCount() const {
 	state->EnsureQueryable();
 	return state->entries.size();
@@ -1570,6 +1693,7 @@ bool LogicalPlanDataFlow::Verify() const {
 	idx_t cte_producer_count = 0;
 	idx_t cte_reader_count = 0;
 	idx_t binding_use_count = 0;
+	idx_t correlated_binding_count = 0;
 	for (auto &entry_pair : state->entries) {
 		auto &entry = *entry_pair.second;
 		LogicalPlanDataFlowMetadata metadata;
@@ -1577,7 +1701,8 @@ bool LogicalPlanDataFlow::Verify() const {
 		    metadata.produced_table_indexes != entry.produced_table_indexes ||
 		    metadata.cte_producer_index != entry.cte_producer_index || metadata.cte_producer != entry.cte_producer ||
 		    metadata.cte_reader_index != entry.cte_reader_index ||
-		    metadata.binding_uses.size() != entry.binding_uses.size()) {
+		    metadata.binding_uses.size() != entry.binding_uses.size() ||
+		    metadata.correlated_bindings != entry.correlated_bindings) {
 			return false;
 		}
 		for (idx_t use_idx = 0; use_idx < metadata.binding_uses.size(); use_idx++) {
@@ -1613,16 +1738,29 @@ bool LogicalPlanDataFlow::Verify() const {
 			}
 			cte_reader_count++;
 		}
+		for (auto &binding : entry.correlated_bindings) {
+			auto correlated = state->correlated_operators.find(binding);
+			if (correlated == state->correlated_operators.end() ||
+			    correlated->second.find(entry.op) == correlated->second.end()) {
+				return false;
+			}
+			correlated_binding_count++;
+		}
 		binding_use_count += entry.binding_uses.size();
 	}
 	idx_t actual_cte_producers = 0;
 	idx_t actual_cte_readers = 0;
+	idx_t actual_correlated_bindings = 0;
 	for (auto &lineage : state->cte_lineage) {
 		actual_cte_producers += lineage.second.producer ? 1 : 0;
 		actual_cte_readers += lineage.second.readers.size();
 	}
+	for (auto &correlated : state->correlated_operators) {
+		actual_correlated_bindings += correlated.second.size();
+	}
 	if (produced_index_count != state->binding_sources.size() || cte_producer_count != actual_cte_producers ||
-	    cte_reader_count != actual_cte_readers || binding_use_count != state->binding_uses.size()) {
+	    cte_reader_count != actual_cte_readers || binding_use_count != state->binding_uses.size() ||
+	    correlated_binding_count != actual_correlated_bindings) {
 		return false;
 	}
 	for (auto &entry_pair : state->entries) {
@@ -2244,6 +2382,42 @@ void LogicalPlanDataFlowMutator::SwapChildren(LogicalOperator &parent, idx_t lef
 void LogicalPlanDataFlowMutator::RefreshOperator(LogicalOperator &op) {
 	data_flow.state->RefreshOperator(op);
 	VerifyAfterMutation();
+}
+
+LogicalPlanDataFlowBooleanResult
+LogicalPlanDataFlowMutator::HasCorrelatedBinding(LogicalOperator &subtree, const column_binding_set_t &bindings) const {
+	auto subtree_entry = data_flow.state->GetEntry(subtree);
+	if (!subtree_entry) {
+		return {LogicalPlanDataFlowStatus::OPERATOR_NOT_INDEXED, false};
+	}
+	for (auto &binding : bindings) {
+		auto correlated = data_flow.state->correlated_operators.find(binding);
+		if (correlated == data_flow.state->correlated_operators.end()) {
+			continue;
+		}
+		for (auto &correlated_op : correlated->second) {
+			auto correlated_entry = data_flow.state->GetEntry(correlated_op);
+			if (!correlated_entry) {
+				return {LogicalPlanDataFlowStatus::OPERATOR_NOT_INDEXED, false};
+			}
+			if (&subtree == &correlated_op.get()) {
+				return {LogicalPlanDataFlowStatus::SUCCESS, true};
+			}
+			if (data_flow.state->forest.Connected(subtree_entry->forest_node, correlated_entry->forest_node)) {
+				if (data_flow.state->forest.IsAncestor(subtree_entry->forest_node, correlated_entry->forest_node)) {
+					return {LogicalPlanDataFlowStatus::SUCCESS, true};
+				}
+				continue;
+			}
+			for (auto current = correlated_entry; current && current->owner_parent;
+			     current = data_flow.state->GetEntry(*current->owner_parent)) {
+				if (current->owner_parent.get() == &subtree) {
+					return {LogicalPlanDataFlowStatus::SUCCESS, true};
+				}
+			}
+		}
+	}
+	return {LogicalPlanDataFlowStatus::SUCCESS, false};
 }
 
 } // namespace duckdb

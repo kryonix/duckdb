@@ -12,6 +12,7 @@
 #include "duckdb/planner/operator/logical_dependent_join.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_dummy_scan.hpp"
+#include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
@@ -58,12 +59,41 @@ static vector<reference<LogicalOperator>> CollectOperators(LogicalOperator &root
 	return result;
 }
 
+static LogicalPlanCorrelatedUse &FindCorrelatedUse(vector<LogicalPlanCorrelatedUse> &uses, const ColumnBinding &binding,
+                                                   idx_t depth) {
+	for (auto &use : uses) {
+		if (use.binding == binding && use.depth == depth) {
+			return use;
+		}
+	}
+	throw InternalException("Correlated use not found");
+}
+
 static void RequireEquivalentDataFlow(LogicalOperator &root, LogicalPlanDataFlow &live) {
 	LogicalPlanDataFlow rebuilt(root);
 	REQUIRE(live.Verify());
 	REQUIRE(rebuilt.Verify());
 	REQUIRE(live.OperatorCount() == rebuilt.OperatorCount());
 	auto operators = CollectOperators(root);
+	column_binding_set_t correlated_bindings;
+	for (auto &use : live.GetBindingUses()) {
+		if (use.depth > 0) {
+			correlated_bindings.insert(use.binding);
+		}
+	}
+	for (auto op : operators) {
+		if (op.get().type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
+			for (auto &column : op.get().Cast<LogicalDependentJoin>().correlated_columns) {
+				correlated_bindings.insert(column.binding);
+			}
+		} else if (op.get().type == LogicalOperatorType::LOGICAL_CTE_REF) {
+			for (auto &binding : op.get().Cast<LogicalCTERef>().correlated_bindings) {
+				correlated_bindings.insert(binding);
+			}
+		}
+	}
+	LogicalPlanDataFlowMutator live_mutator(live);
+	LogicalPlanDataFlowMutator rebuilt_mutator(rebuilt);
 	for (auto op : operators) {
 		auto live_owner = live.GetOwnershipParent(op);
 		auto rebuilt_owner = rebuilt.GetOwnershipParent(op);
@@ -81,6 +111,10 @@ static void RequireEquivalentDataFlow(LogicalOperator &root, LogicalPlanDataFlow
 			REQUIRE(live_source.status == rebuilt_source.status);
 			REQUIRE(live_source.op == rebuilt_source.op);
 		}
+		auto live_correlated = live_mutator.HasCorrelatedBinding(op, correlated_bindings);
+		auto rebuilt_correlated = rebuilt_mutator.HasCorrelatedBinding(op, correlated_bindings);
+		REQUIRE(live_correlated.status == rebuilt_correlated.status);
+		REQUIRE(live_correlated.value == rebuilt_correlated.value);
 	}
 	for (auto left : operators) {
 		for (auto right : operators) {
@@ -114,6 +148,10 @@ class TestLogicalExtensionOperator : public LogicalExtensionOperator {
 public:
 	TestLogicalExtensionOperator(TableIndex table_index_p, bool pass_through_p)
 	    : table_index(table_index_p), pass_through(pass_through_p) {
+	}
+	TestLogicalExtensionOperator(TableIndex table_index_p, bool pass_through_p,
+	                             vector<unique_ptr<Expression>> expressions)
+	    : LogicalExtensionOperator(std::move(expressions)), table_index(table_index_p), pass_through(pass_through_p) {
 	}
 
 	TableIndex table_index;
@@ -562,6 +600,324 @@ TEST_CASE("Logical plan data flow records correlated uses", "[optimizer][logical
 	REQUIRE(data_flow.GetBindingUses()[0].depth == 1);
 	auto source = data_flow.ResolveSource(data_flow.GetBindingUses()[0].binding, 1, *filter);
 	REQUIRE(source.status == LogicalPlanDataFlowStatus::CORRELATED_REFERENCE);
+	REQUIRE(data_flow.Verify());
+}
+
+TEST_CASE("Indexed correlation domains follow ownership and flow boundaries", "[optimizer][logical_plan_data_flow]") {
+	auto correlated_binding = ColumnBinding(TableIndex(10), ProjectionIndex(0));
+	column_binding_set_t bindings {correlated_binding};
+	auto dependent_join = make_uniq<LogicalDependentJoin>(JoinType::INNER);
+	dependent_join->correlated_columns.AddColumnToBack(
+	    CorrelatedColumnInfo(correlated_binding, LogicalType::INTEGER, Identifier("outer"), 1));
+	dependent_join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(10)));
+	auto &left = *dependent_join->children[0];
+	auto filter = make_uniq<LogicalFilter>(
+	    make_uniq<BoundColumnRefExpression>(Identifier("outer"), LogicalType::INTEGER, correlated_binding, 1));
+	filter->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(20)));
+	auto &right = *filter;
+	dependent_join->children.push_back(std::move(filter));
+	LogicalPlanDataFlow data_flow(*dependent_join);
+	LogicalPlanDataFlowMutator mutator(data_flow);
+
+	REQUIRE(mutator.HasCorrelatedBinding(*dependent_join, bindings).value);
+	REQUIRE_FALSE(mutator.HasCorrelatedBinding(left, bindings).value);
+	REQUIRE(mutator.HasCorrelatedBinding(right, bindings).value);
+	RequireEquivalentDataFlow(*dependent_join, data_flow);
+
+	auto cte_ref = make_uniq<LogicalCTERef>(TableIndex(40), TableIndex(30), vector<LogicalType> {LogicalType::INTEGER},
+	                                        vector<Identifier> {Identifier("i")});
+	cte_ref->correlated_bindings.push_back(correlated_binding);
+	auto &cte_ref_op = *cte_ref;
+	auto cte = make_uniq<LogicalMaterializedCTE>(Identifier("values"), TableIndex(30), 1,
+	                                             make_uniq<LogicalDummyScan>(TableIndex(50)), std::move(cte_ref),
+	                                             CTEMaterialize::CTE_MATERIALIZE_ALWAYS);
+	auto &producer = *cte->children[0];
+	LogicalPlanDataFlow cte_data_flow(*cte);
+	LogicalPlanDataFlowMutator cte_mutator(cte_data_flow);
+	REQUIRE(cte_mutator.HasCorrelatedBinding(*cte, bindings).value);
+	REQUIRE_FALSE(cte_mutator.HasCorrelatedBinding(producer, bindings).value);
+	REQUIRE(cte_mutator.HasCorrelatedBinding(cte_ref_op, bindings).value);
+	RequireEquivalentDataFlow(*cte, cte_data_flow);
+
+	auto opaque_filter = make_uniq<LogicalFilter>(
+	    make_uniq<BoundColumnRefExpression>(Identifier("outer"), LogicalType::INTEGER, correlated_binding, 1));
+	opaque_filter->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(60)));
+	auto extension = make_uniq<TestLogicalExtensionOperator>(TableIndex(), true);
+	extension->children.push_back(std::move(opaque_filter));
+	LogicalPlanDataFlow opaque_data_flow(*extension);
+	LogicalPlanDataFlowMutator opaque_mutator(opaque_data_flow);
+	REQUIRE(opaque_mutator.HasCorrelatedBinding(*extension, bindings).value);
+	RequireEquivalentDataFlow(*extension, opaque_data_flow);
+}
+
+TEST_CASE("Indexed correlation domains refresh during coordinated mutations", "[optimizer][logical_plan_data_flow]") {
+	auto first_binding = ColumnBinding(TableIndex(10), ProjectionIndex(0));
+	auto second_binding = ColumnBinding(TableIndex(20), ProjectionIndex(0));
+	column_binding_set_t first {first_binding};
+	column_binding_set_t second {second_binding};
+	unique_ptr<LogicalOperator> plan = make_uniq<LogicalDummyScan>(TableIndex(30));
+	LogicalPlanDataFlow data_flow(*plan);
+	LogicalPlanDataFlowMutator mutator(data_flow);
+
+	auto filter = make_uniq<LogicalFilter>(
+	    make_uniq<BoundColumnRefExpression>(Identifier("first"), LogicalType::INTEGER, first_binding, 1));
+	mutator.InsertUnary(plan, std::move(filter));
+	REQUIRE(mutator.HasCorrelatedBinding(*plan, first).value);
+	REQUIRE_FALSE(mutator.HasCorrelatedBinding(*plan, second).value);
+	RequireEquivalentDataFlow(*plan, data_flow);
+
+	{
+		auto mutation = mutator.BeginMutation();
+		plan->expressions[0] =
+		    make_uniq<BoundColumnRefExpression>(Identifier("second"), LogicalType::INTEGER, second_binding, 1);
+		mutator.RefreshOperator(*plan);
+		REQUIRE_FALSE(mutator.HasCorrelatedBinding(*plan, first).value);
+		REQUIRE(mutator.HasCorrelatedBinding(*plan, second).value);
+	}
+	RequireEquivalentDataFlow(*plan, data_flow);
+
+	auto removed = mutator.RemoveUnary(plan);
+	REQUIRE_FALSE(mutator.HasCorrelatedBinding(*plan, second).value);
+	REQUIRE(removed->type == LogicalOperatorType::LOGICAL_FILTER);
+	REQUIRE(data_flow.Verify());
+
+	auto dependent_join = make_uniq<LogicalDependentJoin>(JoinType::INNER);
+	dependent_join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(40)));
+	dependent_join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(50)));
+	unique_ptr<LogicalOperator> dependent_plan = std::move(dependent_join);
+	LogicalPlanDataFlow dependent_data_flow(*dependent_plan);
+	LogicalPlanDataFlowMutator dependent_mutator(dependent_data_flow);
+	REQUIRE_FALSE(dependent_mutator.HasCorrelatedBinding(*dependent_plan, first).value);
+	{
+		auto mutation = dependent_mutator.BeginMutation();
+		dependent_plan->Cast<LogicalDependentJoin>().correlated_columns.AddColumnToBack(
+		    CorrelatedColumnInfo(first_binding, LogicalType::INTEGER, Identifier("first"), 1));
+		dependent_mutator.RefreshOperator(*dependent_plan);
+		REQUIRE(dependent_mutator.HasCorrelatedBinding(*dependent_plan, first).value);
+		dependent_plan->Cast<LogicalDependentJoin>().correlated_columns.clear();
+		dependent_mutator.RefreshOperator(*dependent_plan);
+		REQUIRE_FALSE(dependent_mutator.HasCorrelatedBinding(*dependent_plan, first).value);
+	}
+	RequireEquivalentDataFlow(*dependent_plan, dependent_data_flow);
+
+	auto cte_ref = make_uniq<LogicalCTERef>(TableIndex(70), TableIndex(60), vector<LogicalType> {LogicalType::INTEGER},
+	                                        vector<Identifier> {Identifier("i")});
+	unique_ptr<LogicalOperator> cte_plan = std::move(cte_ref);
+	LogicalPlanDataFlow cte_data_flow(*cte_plan);
+	LogicalPlanDataFlowMutator cte_mutator(cte_data_flow);
+	REQUIRE_FALSE(cte_mutator.HasCorrelatedBinding(*cte_plan, second).value);
+	{
+		auto mutation = cte_mutator.BeginMutation();
+		cte_plan->Cast<LogicalCTERef>().correlated_bindings.push_back(second_binding);
+		cte_mutator.RefreshOperator(*cte_plan);
+		REQUIRE(cte_mutator.HasCorrelatedBinding(*cte_plan, second).value);
+		cte_plan->Cast<LogicalCTERef>().correlated_bindings.clear();
+		cte_mutator.RefreshOperator(*cte_plan);
+		REQUIRE_FALSE(cte_mutator.HasCorrelatedBinding(*cte_plan, second).value);
+	}
+	RequireEquivalentDataFlow(*cte_plan, cte_data_flow);
+}
+
+TEST_CASE("Logical plan data flow models expression get input consumption", "[optimizer][logical_plan_data_flow]") {
+	auto input_binding = ColumnBinding(TableIndex(10), ProjectionIndex(0));
+	auto output_binding = ColumnBinding(TableIndex(20), ProjectionIndex(0));
+	vector<vector<unique_ptr<Expression>>> rows;
+	vector<unique_ptr<Expression>> row;
+	row.push_back(make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, input_binding));
+	rows.push_back(std::move(row));
+	auto expression_get =
+	    make_uniq<LogicalExpressionGet>(TableIndex(20), vector<LogicalType> {LogicalType::INTEGER}, std::move(rows));
+	auto &expression_get_ref = *expression_get;
+	expression_get->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(10)));
+	auto &input = *expression_get->children[0];
+
+	vector<unique_ptr<Expression>> expressions;
+	expressions.push_back(make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, output_binding));
+	auto projection = make_uniq<LogicalProjection>(TableIndex(30), std::move(expressions));
+	projection->children.push_back(std::move(expression_get));
+
+	LogicalPlanDataFlow data_flow(*projection);
+	REQUIRE(data_flow.Verify());
+	auto consumed_source = data_flow.ResolveSource(input_binding, 0, expression_get_ref);
+	REQUIRE(consumed_source.status == LogicalPlanDataFlowStatus::SUCCESS);
+	REQUIRE(consumed_source.op.get() == &input);
+	auto lca = data_flow.LowestCommonAncestor(*consumed_source.op, expression_get_ref);
+	REQUIRE(lca.status == LogicalPlanDataFlowStatus::SUCCESS);
+	REQUIRE(lca.op.get() == &expression_get_ref);
+	auto hidden_source = data_flow.ResolveSource(input_binding, 0, *projection);
+	REQUIRE(hidden_source.status == LogicalPlanDataFlowStatus::BINDING_NOT_AVAILABLE);
+	REQUIRE_FALSE(hidden_source.op);
+	auto output_source = data_flow.ResolveSource(output_binding, 0, *projection);
+	REQUIRE(output_source.status == LogicalPlanDataFlowStatus::SUCCESS);
+	REQUIRE(output_source.op.get() == &expression_get_ref);
+}
+
+TEST_CASE("Logical plan data flow resolves dependent join correlated uses", "[optimizer][logical_plan_data_flow]") {
+	auto correlated_binding = ColumnBinding(TableIndex(10), ProjectionIndex(0));
+	auto dependent_join = make_uniq<LogicalDependentJoin>(JoinType::INNER);
+	auto &dependent_join_ref = *dependent_join;
+	dependent_join->correlated_columns.AddColumnToBack(
+	    CorrelatedColumnInfo(correlated_binding, LogicalType::INTEGER, Identifier("outer"), 1));
+	dependent_join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(10)));
+	auto &source = *dependent_join->children[0];
+	auto filter = make_uniq<LogicalFilter>(
+	    make_uniq<BoundColumnRefExpression>(Identifier("outer"), LogicalType::INTEGER, correlated_binding, 1));
+	auto &consumer = *filter;
+	filter->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(20)));
+	dependent_join->children.push_back(std::move(filter));
+
+	LogicalPlanDataFlow data_flow(*dependent_join);
+	auto uses = data_flow.GetCorrelatedUses();
+	REQUIRE(uses.size() == 1);
+	REQUIRE(uses[0].status == LogicalPlanDataFlowStatus::SUCCESS);
+	REQUIRE(uses[0].source.get() == &source);
+	REQUIRE(uses[0].owning_join.get() == &dependent_join_ref);
+	auto lca = data_flow.LowestCommonAncestor(*uses[0].source, consumer);
+	REQUIRE(lca.status == LogicalPlanDataFlowStatus::SUCCESS);
+	REQUIRE(lca.op.get() == &dependent_join_ref);
+	REQUIRE(data_flow.Verify());
+}
+
+TEST_CASE("Logical plan data flow resolves nested dependent join scopes", "[optimizer][logical_plan_data_flow]") {
+	auto outer_binding = ColumnBinding(TableIndex(10), ProjectionIndex(0));
+	auto inner_binding = ColumnBinding(TableIndex(20), ProjectionIndex(0));
+	auto local_binding = ColumnBinding(TableIndex(30), ProjectionIndex(0));
+
+	auto outer_join = make_uniq<LogicalDependentJoin>(JoinType::INNER);
+	auto &outer_join_ref = *outer_join;
+	outer_join->correlated_columns.AddColumnToBack(
+	    CorrelatedColumnInfo(outer_binding, LogicalType::INTEGER, Identifier("outer"), 1));
+	outer_join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(10)));
+	auto &outer_source = *outer_join->children[0];
+
+	auto inner_join = make_uniq<LogicalDependentJoin>(JoinType::INNER);
+	auto &inner_join_ref = *inner_join;
+	inner_join->correlated_columns.AddColumnToBack(
+	    CorrelatedColumnInfo(inner_binding, LogicalType::INTEGER, Identifier("inner"), 1));
+	inner_join->correlated_columns.AddColumnToBack(
+	    CorrelatedColumnInfo(outer_binding, LogicalType::INTEGER, Identifier("outer"), 2));
+	inner_join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(20)));
+	auto &inner_source = *inner_join->children[0];
+
+	vector<unique_ptr<Expression>> expressions;
+	expressions.push_back(
+	    make_uniq<BoundColumnRefExpression>(Identifier("inner"), LogicalType::INTEGER, inner_binding, 1));
+	expressions.push_back(
+	    make_uniq<BoundColumnRefExpression>(Identifier("outer"), LogicalType::INTEGER, outer_binding, 2));
+	expressions.push_back(make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, local_binding));
+	auto projection = make_uniq<LogicalProjection>(TableIndex(40), std::move(expressions));
+	auto &consumer = *projection;
+	projection->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(30)));
+	inner_join->children.push_back(std::move(projection));
+	outer_join->children.push_back(std::move(inner_join));
+
+	LogicalPlanDataFlow data_flow(*outer_join);
+	REQUIRE(data_flow.GetBindingUses().size() == 3);
+	auto uses = data_flow.GetCorrelatedUses();
+	REQUIRE(uses.size() == 2);
+	auto &inner_use = FindCorrelatedUse(uses, inner_binding, 1);
+	REQUIRE(inner_use.status == LogicalPlanDataFlowStatus::SUCCESS);
+	REQUIRE(inner_use.source.get() == &inner_source);
+	REQUIRE(inner_use.owning_join.get() == &inner_join_ref);
+	REQUIRE(data_flow.LowestCommonAncestor(*inner_use.source, consumer).op.get() == &inner_join_ref);
+	auto &outer_use = FindCorrelatedUse(uses, outer_binding, 2);
+	REQUIRE(outer_use.status == LogicalPlanDataFlowStatus::SUCCESS);
+	REQUIRE(outer_use.source.get() == &outer_source);
+	REQUIRE(outer_use.owning_join.get() == &outer_join_ref);
+	REQUIRE(data_flow.LowestCommonAncestor(*outer_use.source, consumer).op.get() == &outer_join_ref);
+	REQUIRE(data_flow.Verify());
+}
+
+TEST_CASE("Logical plan data flow resolves rebased dependent join scopes", "[optimizer][logical_plan_data_flow]") {
+	auto outer_binding = ColumnBinding(TableIndex(10), ProjectionIndex(0));
+	auto inner_binding = ColumnBinding(TableIndex(20), ProjectionIndex(0));
+
+	auto outer_join = make_uniq<LogicalDependentJoin>(JoinType::LEFT);
+	auto &outer_join_ref = *outer_join;
+	outer_join->correlated_columns.AddColumnToBack(
+	    CorrelatedColumnInfo(outer_binding, LogicalType::INTEGER, Identifier("outer"), 2));
+	outer_join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(10)));
+	auto &outer_source = *outer_join->children[0];
+
+	auto inner_join = make_uniq<LogicalDependentJoin>(JoinType::INNER);
+	inner_join->correlated_columns.AddColumnToBack(
+	    CorrelatedColumnInfo(inner_binding, LogicalType::INTEGER, Identifier("inner"), 1));
+	inner_join->correlated_columns.AddColumnToBack(
+	    CorrelatedColumnInfo(outer_binding, LogicalType::INTEGER, Identifier("outer"), 2));
+	inner_join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(20)));
+	auto filter = make_uniq<LogicalFilter>(
+	    make_uniq<BoundColumnRefExpression>(Identifier("outer"), LogicalType::INTEGER, outer_binding, 2));
+	auto &consumer = *filter;
+	filter->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(30)));
+	inner_join->children.push_back(std::move(filter));
+	outer_join->children.push_back(std::move(inner_join));
+
+	LogicalPlanDataFlow data_flow(*outer_join);
+	auto uses = data_flow.GetCorrelatedUses();
+	REQUIRE(uses.size() == 1);
+	REQUIRE(uses[0].status == LogicalPlanDataFlowStatus::SUCCESS);
+	REQUIRE(uses[0].source.get() == &outer_source);
+	REQUIRE(uses[0].owning_join.get() == &outer_join_ref);
+	REQUIRE(data_flow.LowestCommonAncestor(*uses[0].source, consumer).op.get() == &outer_join_ref);
+	REQUIRE(data_flow.Verify());
+}
+
+TEST_CASE("Logical plan data flow reports unresolved correlated ownership", "[optimizer][logical_plan_data_flow]") {
+	auto filter = make_uniq<LogicalFilter>(make_uniq<BoundColumnRefExpression>(
+	    Identifier("correlated"), LogicalType::INTEGER, ColumnBinding(TableIndex(10), ProjectionIndex(0)), 1));
+	filter->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(20)));
+	LogicalPlanDataFlow data_flow(*filter);
+	auto uses = data_flow.GetCorrelatedUses();
+	REQUIRE(uses.size() == 1);
+	REQUIRE(uses[0].status == LogicalPlanDataFlowStatus::CORRELATED_REFERENCE);
+	REQUIRE_FALSE(uses[0].source);
+	REQUIRE_FALSE(uses[0].owning_join);
+	REQUIRE(data_flow.Verify());
+}
+
+TEST_CASE("Logical plan data flow preserves correlated CTE boundaries", "[optimizer][logical_plan_data_flow]") {
+	auto correlated_binding = ColumnBinding(TableIndex(10), ProjectionIndex(0));
+	auto producer_filter = make_uniq<LogicalFilter>(
+	    make_uniq<BoundColumnRefExpression>(Identifier("outer"), LogicalType::INTEGER, correlated_binding, 1));
+	producer_filter->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(20)));
+	auto cte_ref = make_uniq<LogicalCTERef>(TableIndex(40), TableIndex(30), vector<LogicalType> {LogicalType::INTEGER},
+	                                        vector<Identifier> {Identifier("i")});
+	auto cte = make_uniq<LogicalMaterializedCTE>(Identifier("values"), TableIndex(30), 1, std::move(producer_filter),
+	                                             std::move(cte_ref), CTEMaterialize::CTE_MATERIALIZE_ALWAYS);
+	auto dependent_join = make_uniq<LogicalDependentJoin>(JoinType::INNER);
+	dependent_join->correlated_columns.AddColumnToBack(
+	    CorrelatedColumnInfo(correlated_binding, LogicalType::INTEGER, Identifier("outer"), 1));
+	dependent_join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(10)));
+	dependent_join->children.push_back(std::move(cte));
+
+	LogicalPlanDataFlow data_flow(*dependent_join);
+	auto uses = data_flow.GetCorrelatedUses();
+	REQUIRE(uses.size() == 1);
+	REQUIRE(uses[0].status == LogicalPlanDataFlowStatus::CTE_BOUNDARY);
+	REQUIRE_FALSE(uses[0].source);
+	REQUIRE_FALSE(uses[0].owning_join);
+	REQUIRE(data_flow.Verify());
+}
+
+TEST_CASE("Logical plan data flow preserves correlated opaque boundaries", "[optimizer][logical_plan_data_flow]") {
+	auto correlated_binding = ColumnBinding(TableIndex(10), ProjectionIndex(0));
+	vector<unique_ptr<Expression>> expressions;
+	expressions.push_back(
+	    make_uniq<BoundColumnRefExpression>(Identifier("outer"), LogicalType::INTEGER, correlated_binding, 1));
+	auto extension = make_uniq<TestLogicalExtensionOperator>(TableIndex(), true, std::move(expressions));
+	extension->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(20)));
+	auto dependent_join = make_uniq<LogicalDependentJoin>(JoinType::INNER);
+	dependent_join->correlated_columns.AddColumnToBack(
+	    CorrelatedColumnInfo(correlated_binding, LogicalType::INTEGER, Identifier("outer"), 1));
+	dependent_join->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(10)));
+	dependent_join->children.push_back(std::move(extension));
+
+	LogicalPlanDataFlow data_flow(*dependent_join);
+	auto uses = data_flow.GetCorrelatedUses();
+	REQUIRE(uses.size() == 1);
+	REQUIRE(uses[0].status == LogicalPlanDataFlowStatus::OPAQUE_BOUNDARY);
+	REQUIRE_FALSE(uses[0].source);
+	REQUIRE_FALSE(uses[0].owning_join);
 	REQUIRE(data_flow.Verify());
 }
 

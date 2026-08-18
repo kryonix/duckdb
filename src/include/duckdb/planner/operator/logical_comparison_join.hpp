@@ -71,6 +71,10 @@ public:
 	static void ExtractJoinConditions(ClientContext &context, JoinType type, JoinRefType ref_type,
 	                                  unique_ptr<LogicalOperator> &left_child, unique_ptr<LogicalOperator> &right_child,
 	                                  unique_ptr<Expression> condition, vector<JoinCondition> &conditions);
+	static void ExtractJoinConditions(ClientContext &context, JoinType type, JoinRefType ref_type,
+	                                  unique_ptr<LogicalOperator> &left_child, unique_ptr<LogicalOperator> &right_child,
+	                                  unique_ptr<Expression> condition, vector<JoinCondition> &conditions,
+	                                  const PushFilterCallback &push_filter);
 	static void ExtractJoinConditionsWithoutPushdown(ClientContext &context, JoinType type, JoinRefType ref_type,
 	                                                 const unordered_set<TableIndex> &left_bindings,
 	                                                 const unordered_set<TableIndex> &right_bindings,

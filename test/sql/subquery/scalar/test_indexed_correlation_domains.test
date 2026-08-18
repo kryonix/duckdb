@@ -1,0 +1,106 @@
+# name: test/sql/subquery/scalar/test_indexed_correlation_domains.test
+# description: Protect indexed correlation-domain decisions during dependent-join decorrelation
+# group: [scalar]
+
+statement ok
+CREATE TABLE domain_outer(id INTEGER, k INTEGER);
+
+statement ok
+INSERT INTO domain_outer VALUES (1, 1), (2, 1), (3, 2), (4, NULL);
+
+statement ok
+CREATE TABLE domain_inner(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO domain_inner VALUES (1, 10), (1, 20), (2, 5), (NULL, 99);
+
+statement ok
+PRAGMA explain_output='optimized_only';
+
+foreach cte_mode true false
+
+statement ok
+SET delim_join_as_cte={cte_mode};
+
+# Duplicate and NULL-valued correlation keys remain part of the active domain.
+query II
+SELECT o.id, (SELECT sum(i.v) FROM domain_inner i WHERE i.k IS NOT DISTINCT FROM o.k)
+FROM domain_outer o
+ORDER BY o.id;
+----
+1	30
+2	30
+3	5
+4	99
+
+# Aliases, nesting, ORDER BY, and LIMIT preserve the binding used to identify the domain.
+query II
+SELECT o.id, (
+	SELECT picked.v
+	FROM (
+		SELECT i.v
+		FROM domain_inner i
+		WHERE i.k IS NOT DISTINCT FROM o.k
+		ORDER BY i.v DESC
+		LIMIT 1
+	) picked
+)
+FROM domain_outer o
+ORDER BY o.id;
+----
+1	20
+2	20
+3	5
+4	99
+
+# A materialized CTE reader carries its correlated bindings across the CTE flow boundary.
+query II
+SELECT o.id, (
+	WITH matching AS MATERIALIZED (
+		SELECT i.v
+		FROM domain_inner i
+		WHERE i.k IS NOT DISTINCT FROM o.k
+	)
+	SELECT sum(v) FROM matching
+)
+FROM domain_outer o
+ORDER BY o.id;
+----
+1	30
+2	30
+3	5
+4	99
+
+# A FULL join can synthesize a NULL correlated value on either side of the join.
+query II
+SELECT coalesce(o.id, extra.id), (
+	SELECT count(*)
+	FROM domain_inner i
+	WHERE i.k IS NOT DISTINCT FROM o.k
+)
+FROM domain_outer o
+FULL JOIN (VALUES (3), (5)) extra(id) ON o.id = extra.id
+ORDER BY 1;
+----
+1	2
+2	2
+3	1
+4	1
+5	1
+
+# The nested correlated query is fully decorrelated in either delimiter representation.
+query II
+EXPLAIN (FORMAT JSON)
+SELECT o.id, (
+	SELECT (
+		SELECT count(*)
+		FROM domain_inner i
+		WHERE i.k IS NOT DISTINCT FROM middle.k
+	)
+	FROM (SELECT o.k AS k) middle
+)
+FROM domain_outer o;
+----
+logical_opt	<REGEX>:(.*DELIM_JOIN.*)|(.*CTE Name.*__duckdb_delim.*)
+
+endloop
