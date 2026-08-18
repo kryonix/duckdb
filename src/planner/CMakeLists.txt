@@ -20,6 +20,7 @@ add_library_unity(
   expression_binder.cpp
   expression_nullability.cpp
   joinside.cpp
+  logical_plan_data_flow.cpp
   logical_operator.cpp
   logical_operator_repeatability.cpp
   binder.cpp
