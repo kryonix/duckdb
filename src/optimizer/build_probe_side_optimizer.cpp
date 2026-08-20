@@ -500,10 +500,6 @@ void BuildProbeSideOptimizer::VisitOperator(LogicalOperator &op) {
 		case JoinType::ANTI:
 			break; // RIGHT_SEMI/RIGHT_ANTI not supported yet for ANY/ASOF
 		default:
-			// We cannot flip projection maps are set (YET), but not flipping is worse than just clearing them
-			// They will be set in the 2nd round of ColumnLifetimeAnalyzer
-			join.left_projection_map.clear();
-			join.right_projection_map.clear();
 			TryFlipJoinChildren(op);
 		}
 		break;

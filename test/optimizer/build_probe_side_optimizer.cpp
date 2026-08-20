@@ -5,6 +5,8 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_cross_product.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_recursive_cte.hpp"
@@ -122,4 +124,65 @@ TEST_CASE("Build/probe optimization preserves correlated recursive domain build 
 	REQUIRE(ordinary_cross->children[1].get() == ordinary_left);
 
 	connection.Rollback();
+}
+
+static unique_ptr<LogicalAnyJoin> CreateProjectionMappedAnyJoin(idx_t left_cardinality, idx_t right_cardinality) {
+	vector<unique_ptr<Expression>> left_expressions;
+	left_expressions.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(10)));
+	left_expressions.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(11)));
+	auto left = make_uniq<LogicalProjection>(TableIndex(1000), std::move(left_expressions));
+	left->SetEstimatedCardinality(left_cardinality);
+
+	vector<unique_ptr<Expression>> right_expressions;
+	right_expressions.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(20)));
+	right_expressions.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(21)));
+	auto right = make_uniq<LogicalProjection>(TableIndex(1001), std::move(right_expressions));
+	right->SetEstimatedCardinality(right_cardinality);
+
+	auto join = make_uniq<LogicalAnyJoin>(JoinType::INNER);
+	join->condition = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
+	join->left_projection_map.emplace_back(1);
+	join->right_projection_map.emplace_back(0);
+	join->children.push_back(std::move(left));
+	join->children.push_back(std::move(right));
+	return join;
+}
+
+TEST_CASE("Build/probe optimization preserves ANY join projection maps", "[optimizer][build_probe_side]") {
+	DuckDB db;
+	Connection connection(db);
+
+	SECTION("Flip children and projection maps") {
+		auto join = CreateProjectionMappedAnyJoin(1, 1000);
+		auto left_bindings = join->children[0]->GetColumnBindings();
+		auto right_bindings = join->children[1]->GetColumnBindings();
+
+		BuildProbeSideOptimizer optimizer(*connection.context, *join);
+		optimizer.VisitOperator(*join);
+
+		REQUIRE(join->children[0]->GetColumnBindings() == right_bindings);
+		REQUIRE(join->children[1]->GetColumnBindings() == left_bindings);
+		REQUIRE(join->left_projection_map == vector<ProjectionIndex> {ProjectionIndex(0)});
+		REQUIRE(join->right_projection_map == vector<ProjectionIndex> {ProjectionIndex(1)});
+		REQUIRE(join->GetColumnBindings() ==
+		        vector<ColumnBinding> {ColumnBinding(TableIndex(1001), ProjectionIndex(0)),
+		                               ColumnBinding(TableIndex(1000), ProjectionIndex(1))});
+	}
+
+	SECTION("Keep children and projection maps") {
+		auto join = CreateProjectionMappedAnyJoin(1000, 1);
+		auto left_bindings = join->children[0]->GetColumnBindings();
+		auto right_bindings = join->children[1]->GetColumnBindings();
+
+		BuildProbeSideOptimizer optimizer(*connection.context, *join);
+		optimizer.VisitOperator(*join);
+
+		REQUIRE(join->children[0]->GetColumnBindings() == left_bindings);
+		REQUIRE(join->children[1]->GetColumnBindings() == right_bindings);
+		REQUIRE(join->left_projection_map == vector<ProjectionIndex> {ProjectionIndex(1)});
+		REQUIRE(join->right_projection_map == vector<ProjectionIndex> {ProjectionIndex(0)});
+		REQUIRE(join->GetColumnBindings() ==
+		        vector<ColumnBinding> {ColumnBinding(TableIndex(1000), ProjectionIndex(1)),
+		                               ColumnBinding(TableIndex(1001), ProjectionIndex(0))});
+	}
 }
