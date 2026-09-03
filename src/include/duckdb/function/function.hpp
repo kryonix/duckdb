@@ -68,6 +68,23 @@ enum class FunctionCollationHandling : uint8_t {
 enum class FunctionDataKind : uint8_t { GENERIC = 0, BOUND_CAST, BOUND_BETWEEN };
 
 struct FunctionData {
+protected:
+	FunctionData() = default;
+	FunctionData(const FunctionData &) {
+		// Trusted data kinds are not inherited through arbitrary derived copies
+	}
+	FunctionData(FunctionData &&) noexcept {
+		// Trusted data kinds are not inherited through arbitrary derived moves
+	}
+	FunctionData &operator=(const FunctionData &) {
+		kind = FunctionDataKind::GENERIC;
+		return *this;
+	}
+	FunctionData &operator=(FunctionData &&) noexcept {
+		kind = FunctionDataKind::GENERIC;
+		return *this;
+	}
+
 public:
 	DUCKDB_API virtual ~FunctionData();
 
@@ -93,12 +110,19 @@ public:
 	}
 
 private:
-	virtual FunctionDataKind GetKind() const {
-		return FunctionDataKind::GENERIC;
+	explicit FunctionData(FunctionDataKind kind_p) : kind(kind_p) {
 	}
+	FunctionDataKind GetKind() const {
+		return kind;
+	}
+
+private:
+	FunctionDataKind kind = FunctionDataKind::GENERIC;
 
 	friend struct BoundBetweenExpression;
 	friend struct BoundCastExpression;
+	friend struct BetweenFunctionData;
+	friend struct CastFunctionData;
 };
 
 struct TableFunctionData : public FunctionData {
