@@ -11,6 +11,7 @@
 #include "duckdb/common/common.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/logical_plan_sql_exporter.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
 
 namespace duckdb {
@@ -39,6 +40,16 @@ public:
 	virtual std::string GetName() = 0;
 	virtual unique_ptr<LogicalExtensionOperator> Deserialize(Deserializer &deserializer) = 0;
 
+	bool HasSQLExportCallback() const {
+		return static_cast<bool>(sql_export);
+	}
+	const logical_plan_sql_export_t &GetSQLExportCallback() const {
+		return sql_export;
+	}
+	void SetSQLExportCallback(logical_plan_sql_export_t callback) {
+		sql_export = std::move(callback);
+	}
+
 	virtual ~OperatorExtension() {
 	}
 
@@ -46,6 +57,9 @@ public:
 	static ExtensionCallbackIteratorHelper<shared_ptr<OperatorExtension>> Iterate(ClientContext &context) {
 		return ExtensionCallbackManager::Get(context).OperatorExtensions();
 	}
+
+private:
+	logical_plan_sql_export_t sql_export;
 };
 
 } // namespace duckdb

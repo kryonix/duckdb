@@ -17,6 +17,7 @@ add_library_unity(
   column_binding.cpp
   logical_plan_verification_result.cpp
   logical_plan_verifier.cpp
+  logical_plan_sql_exporter.cpp
   column_qualifier.cpp
   expression_iterator.cpp
   expression.cpp
