@@ -750,10 +750,7 @@ private:
 			if (registered_extension->GetName() != extension_identifier) {
 				continue;
 			}
-			if (!registered_extension->HasSQLExportCallback()) {
-				break;
-			}
-			auto result = registered_extension->GetSQLExportCallback()(input);
+			auto result = registered_extension->ExportLogicalPlanSQL(input);
 			auto handled = HandleExtensionResult(extension, path, extension_identifier, extension_identifier,
 			                                     std::move(result), fields.GetValue());
 			if (handled) {

@@ -40,26 +40,17 @@ public:
 	virtual std::string GetName() = 0;
 	virtual unique_ptr<LogicalExtensionOperator> Deserialize(Deserializer &deserializer) = 0;
 
-	bool HasSQLExportCallback() const {
-		return static_cast<bool>(sql_export);
-	}
-	const logical_plan_sql_export_t &GetSQLExportCallback() const {
-		return sql_export;
-	}
-	void SetSQLExportCallback(logical_plan_sql_export_t callback) {
-		sql_export = std::move(callback);
+	virtual ~OperatorExtension() {
 	}
 
-	virtual ~OperatorExtension() {
+	virtual LogicalPlanSQLExportExtensionResult ExportLogicalPlanSQL(const LogicalPlanSQLExportExtensionInput &) {
+		return LogicalPlanSQLExportExtensionResult::NotHandled();
 	}
 
 	static void Register(DBConfig &config, shared_ptr<OperatorExtension> extension);
 	static ExtensionCallbackIteratorHelper<shared_ptr<OperatorExtension>> Iterate(ClientContext &context) {
 		return ExtensionCallbackManager::Get(context).OperatorExtensions();
 	}
-
-private:
-	logical_plan_sql_export_t sql_export;
 };
 
 } // namespace duckdb

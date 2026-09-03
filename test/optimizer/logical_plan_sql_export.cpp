@@ -187,7 +187,8 @@ private:
 
 class SQLExportOperatorExtension : public OperatorExtension {
 public:
-	explicit SQLExportOperatorExtension(string name_p) : name(std::move(name_p)) {
+	SQLExportOperatorExtension(string name_p, logical_plan_sql_export_t callback_p)
+	    : name(std::move(name_p)), callback(std::move(callback_p)) {
 		Bind = nullptr;
 	}
 
@@ -199,8 +200,13 @@ public:
 		return nullptr;
 	}
 
+	LogicalPlanSQLExportExtensionResult ExportLogicalPlanSQL(const LogicalPlanSQLExportExtensionInput &input) override {
+		return callback(input);
+	}
+
 private:
 	string name;
+	logical_plan_sql_export_t callback;
 };
 
 class LegacyOperatorExtension : public OperatorExtension {
@@ -675,12 +681,12 @@ TEST_CASE("Logical plan SQL export supports ordered invocation-local extension r
 TEST_CASE("Logical plan SQL export gives invocation resolvers precedence over registration",
           "[logical_plan_sql_export]") {
 	DuckDB db(nullptr);
-	auto registered = make_shared_ptr<SQLExportOperatorExtension>("precedence_extension");
 	idx_t registered_calls = 0;
-	registered->SetSQLExportCallback([&](const LogicalPlanSQLExportExtensionInput &input) {
-		registered_calls++;
-		return LogicalPlanSQLExportExtensionResult::Exported(PlanConstantRelation(input, 99));
-	});
+	auto registered = make_shared_ptr<SQLExportOperatorExtension>(
+	    "precedence_extension", [&](const LogicalPlanSQLExportExtensionInput &input) {
+		    registered_calls++;
+		    return LogicalPlanSQLExportExtensionResult::Exported(PlanConstantRelation(input, 99));
+	    });
 	OperatorExtension::Register(DBConfig::GetConfig(*db.instance), registered);
 	Connection connection(db);
 	auto options = PlanResolverOptions("local", [&](const LogicalPlanSQLExportExtensionInput &input) {
@@ -696,10 +702,10 @@ TEST_CASE("Logical plan SQL export gives invocation resolvers precedence over re
 
 TEST_CASE("Logical plan SQL export uses the matching registered extension callback", "[logical_plan_sql_export]") {
 	DuckDB db(nullptr);
-	auto registered = make_shared_ptr<SQLExportOperatorExtension>("registered_extension");
-	registered->SetSQLExportCallback([&](const LogicalPlanSQLExportExtensionInput &input) {
-		return LogicalPlanSQLExportExtensionResult::Exported(PlanConstantRelation(input, 84));
-	});
+	auto registered = make_shared_ptr<SQLExportOperatorExtension>(
+	    "registered_extension", [&](const LogicalPlanSQLExportExtensionInput &input) {
+		    return LogicalPlanSQLExportExtensionResult::Exported(PlanConstantRelation(input, 84));
+	    });
 	OperatorExtension::Register(DBConfig::GetConfig(*db.instance), registered);
 	Connection connection(db);
 	auto plan = LeafExtension("registered_extension", TableIndex(91));
@@ -708,8 +714,6 @@ TEST_CASE("Logical plan SQL export uses the matching registered extension callba
 	REQUIRE(result.IsSuccess());
 	REQUIRE(connection.Query(result.GetValue().query->ToString())->GetValue(0, 0) == Value::INTEGER(84));
 
-	LegacyOperatorExtension legacy;
-	REQUIRE_FALSE(legacy.HasSQLExportCallback());
 	OperatorExtension::Register(DBConfig::GetConfig(*db.instance), make_shared_ptr<LegacyOperatorExtension>());
 	auto legacy_plan = LeafExtension("legacy_sql_export_test", TableIndex(92));
 	auto legacy_result = LogicalPlanSQLExporter::Export(*connection.context, *legacy_plan);
