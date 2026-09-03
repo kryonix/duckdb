@@ -6,7 +6,9 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
 
 namespace duckdb {
 
@@ -20,6 +22,7 @@ struct LogicalPlanVerificationState {
 	reference_map_t<Expression, LogicalPlanVerificationPath> expression_paths;
 	reference_set_t<LogicalOperator> resolved_inputs;
 	reference_set_t<LogicalOperator> resolved_outputs;
+	reference_set_t<LogicalOperator> unsafe_operators;
 	vector<LogicalPlanVerificationIssue> issues;
 
 	const LogicalPlanVerificationPath &GetPath(LogicalOperator &op) const {
@@ -186,12 +189,98 @@ struct LogicalPlanVerificationState {
 		issues.push_back(std::move(issue));
 	}
 
+	void AddNullOperatorChild(LogicalOperator &op, const LogicalPlanVerificationPath &path, idx_t child_index) {
+		LogicalPlanVerificationIssue issue;
+		issue.code = LogicalPlanVerificationIssueCode::INTERNAL_INVARIANT;
+		issue.path = path;
+		issue.construct = GetOperatorConstruct(op);
+		issue.facts.emplace_back("invariant", Value("null_operator_child"));
+		issue.facts.emplace_back("child_index", Value::UBIGINT(child_index));
+		issue.message = StringUtil::Format("Logical operator child %llu is null", child_index);
+		issues.push_back(std::move(issue));
+		unsafe_operators.insert(reference<LogicalOperator>(op));
+	}
+
+	void AddNullOperatorExpression(LogicalOperator &op, const LogicalPlanVerificationPath &path,
+	                               idx_t expression_index) {
+		LogicalPlanVerificationIssue issue;
+		issue.code = LogicalPlanVerificationIssueCode::INTERNAL_INVARIANT;
+		issue.path = path;
+		issue.construct = GetOperatorConstruct(op);
+		issue.facts.emplace_back("invariant", Value("null_operator_expression"));
+		issue.facts.emplace_back("expression_index", Value::UBIGINT(expression_index));
+		issue.message = StringUtil::Format("Logical operator expression %llu is null", expression_index);
+		issues.push_back(std::move(issue));
+		unsafe_operators.insert(reference<LogicalOperator>(op));
+	}
+
+	void AddChildCountMismatch(LogicalOperator &op, idx_t expected_count) {
+		LogicalPlanVerificationIssue issue;
+		issue.code = LogicalPlanVerificationIssueCode::INTERNAL_INVARIANT;
+		issue.path = GetPath(op);
+		issue.construct = GetOperatorConstruct(op);
+		issue.facts.emplace_back("invariant", Value("operator_child_count"));
+		issue.facts.emplace_back("expected_child_count", Value::UBIGINT(expected_count));
+		issue.facts.emplace_back("actual_child_count", Value::UBIGINT(op.children.size()));
+		issue.message = StringUtil::Format("Logical operator expected %llu children but found %llu", expected_count,
+		                                   op.children.size());
+		issues.push_back(std::move(issue));
+		unsafe_operators.insert(reference<LogicalOperator>(op));
+	}
+
+	void AddExpressionCountMismatch(LogicalOperator &op, idx_t expected_count) {
+		LogicalPlanVerificationIssue issue;
+		issue.code = LogicalPlanVerificationIssueCode::INTERNAL_INVARIANT;
+		issue.path = GetPath(op);
+		issue.construct = GetOperatorConstruct(op);
+		issue.facts.emplace_back("invariant", Value("operator_expression_count"));
+		issue.facts.emplace_back("expected_expression_count", Value::UBIGINT(expected_count));
+		issue.facts.emplace_back("actual_expression_count", Value::UBIGINT(op.expressions.size()));
+		issue.message = StringUtil::Format("Logical operator expected %llu expressions but found %llu", expected_count,
+		                                   op.expressions.size());
+		issues.push_back(std::move(issue));
+		unsafe_operators.insert(reference<LogicalOperator>(op));
+	}
+
+	void AddExpressionGetChildType(LogicalOperator &op, LogicalOperatorType actual_type) {
+		LogicalPlanVerificationIssue issue;
+		issue.code = LogicalPlanVerificationIssueCode::INTERNAL_INVARIANT;
+		issue.path = GetPath(op);
+		issue.construct = GetOperatorConstruct(op);
+		issue.facts.emplace_back("invariant", Value("expression_get_dummy_child"));
+		issue.facts.emplace_back("actual_child_type", Value::UBIGINT(static_cast<uint64_t>(actual_type)));
+		issue.message = "Logical expression get requires a logical dummy scan child";
+		issues.push_back(std::move(issue));
+		unsafe_operators.insert(reference<LogicalOperator>(op));
+	}
+
+	void AddInvalidProjectionIndex(LogicalOperator &op, idx_t projection_ordinal, ProjectionIndex projection_index,
+	                               idx_t child_column_count) {
+		LogicalPlanVerificationIssue issue;
+		issue.code = LogicalPlanVerificationIssueCode::INTERNAL_INVARIANT;
+		issue.path = GetPath(op);
+		issue.construct = GetOperatorConstruct(op);
+		issue.facts.emplace_back("invariant", Value("projection_index_out_of_range"));
+		issue.facts.emplace_back("projection_ordinal", Value::UBIGINT(projection_ordinal));
+		issue.facts.emplace_back("projection_index", Value::UBIGINT(projection_index.GetIndexUnsafe()));
+		issue.facts.emplace_back("projection_index_valid", Value::BOOLEAN(projection_index.IsValid()));
+		issue.facts.emplace_back("child_column_count", Value::UBIGINT(child_column_count));
+		issue.message = StringUtil::Format("Projection index %llu at ordinal %llu is invalid for %llu child columns",
+		                                   projection_index.GetIndexUnsafe(), projection_ordinal, child_column_count);
+		issues.push_back(std::move(issue));
+		unsafe_operators.insert(reference<LogicalOperator>(op));
+	}
+
 	bool HasResolvedInputs(LogicalOperator &op) const {
 		return resolved_inputs.find(reference<LogicalOperator>(op)) != resolved_inputs.end();
 	}
 
 	bool HasResolvedOutputs(LogicalOperator &op) const {
 		return resolved_outputs.find(reference<LogicalOperator>(op)) != resolved_outputs.end();
+	}
+
+	bool IsUnsafe(LogicalOperator &op) const {
+		return unsafe_operators.find(reference<LogicalOperator>(op)) != unsafe_operators.end();
 	}
 
 private:
@@ -230,12 +319,50 @@ private:
 			auto expression_path = path;
 			expression_path.components.push_back(
 			    {LogicalPlanVerificationPathComponentType::OPERATOR_EXPRESSION, expression_index++});
+			if (!expression || !*expression) {
+				AddNullOperatorExpression(op, expression_path, expression_index - 1);
+				return;
+			}
 			IndexExpression(**expression, expression_path);
 		});
 		for (idx_t child_index = 0; child_index < op.children.size(); child_index++) {
 			auto child_path = path;
 			child_path.components.push_back({LogicalPlanVerificationPathComponentType::OPERATOR_CHILD, child_index});
+			if (!op.children[child_index]) {
+				AddNullOperatorChild(op, child_path, child_index);
+				continue;
+			}
 			IndexOperator(*op.children[child_index], child_path);
+		}
+		ValidateOperatorShape(op);
+	}
+
+	void ValidateOperatorShape(LogicalOperator &op) {
+		switch (op.type) {
+		case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
+			if (op.children.size() != 1) {
+				AddChildCountMismatch(op, 1);
+			} else if (op.children[0] && op.children[0]->type != LogicalOperatorType::LOGICAL_DUMMY_SCAN) {
+				AddExpressionGetChildType(op, op.children[0]->type);
+			}
+			break;
+		case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
+			if (!op.children.empty()) {
+				AddChildCountMismatch(op, 0);
+			}
+			if (!op.expressions.empty()) {
+				AddExpressionCountMismatch(op, 0);
+			}
+			break;
+		case LogicalOperatorType::LOGICAL_FILTER:
+		case LogicalOperatorType::LOGICAL_PROJECTION:
+		case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+			if (op.children.size() != 1) {
+				AddChildCountMismatch(op, 1);
+			}
+			break;
+		default:
+			break;
 		}
 	}
 };
@@ -286,14 +413,32 @@ bool LogicalPlanVerifier::ResolveOperatorTypes(LogicalOperator &op, LogicalPlanV
 	op.types.clear();
 	bool children_resolved = true;
 	for (auto &child : op.children) {
+		if (!child) {
+			children_resolved = false;
+			continue;
+		}
 		if (!ResolveOperatorTypes(*child, verification_state)) {
 			children_resolved = false;
 		}
 	}
-	if (!children_resolved) {
+	if (!children_resolved || verification_state.IsUnsafe(op)) {
 		return false;
 	}
 	verification_state.resolved_inputs.insert(reference<LogicalOperator>(op));
+	if (op.type == LogicalOperatorType::LOGICAL_FILTER) {
+		auto &filter = op.Cast<LogicalFilter>();
+		auto child_column_count = op.children[0]->types.size();
+		for (idx_t projection_ordinal = 0; projection_ordinal < filter.projection_map.size(); projection_ordinal++) {
+			auto projection_index = filter.projection_map[projection_ordinal];
+			if (!projection_index.IsValid() || projection_index.GetIndexUnsafe() >= child_column_count) {
+				verification_state.AddInvalidProjectionIndex(op, projection_ordinal, projection_index,
+				                                             child_column_count);
+			}
+		}
+		if (verification_state.IsUnsafe(op)) {
+			return false;
+		}
+	}
 	op.ResolveTypes();
 	auto bindings = op.GetColumnBindings();
 	if (op.type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
@@ -357,14 +502,21 @@ void LogicalPlanVerifier::VerifyColumnBindings(LogicalOperator &op, LogicalPlanV
 		return;
 	}
 	for (auto &child : op.children) {
-		VerifyColumnBindings(*child, verification_state);
+		if (child) {
+			VerifyColumnBindings(*child, verification_state);
+		}
 	}
 }
 
 static void VerifyTableIndexes(LogicalOperator &op, LogicalPlanVerificationState &verification_state,
                                unordered_map<TableIndex, LogicalPlanVerificationPath> &seen_indexes) {
 	for (auto &child : op.children) {
-		VerifyTableIndexes(*child, verification_state, seen_indexes);
+		if (child) {
+			VerifyTableIndexes(*child, verification_state, seen_indexes);
+		}
+	}
+	if (verification_state.IsUnsafe(op)) {
+		return;
 	}
 	auto table_indexes = op.GetTableIndex();
 	for (idx_t table_index_ordinal = 0; table_index_ordinal < table_indexes.size(); table_index_ordinal++) {

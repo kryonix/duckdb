@@ -7,9 +7,12 @@
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_cross_product.hpp"
 #include "duckdb/planner/operator/logical_dummy_scan.hpp"
+#include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 
 using namespace duckdb;
@@ -181,6 +184,194 @@ static const Value &GetFact(const LogicalPlanVerificationIssue &issue, const str
 		}
 	}
 	throw InternalException("Missing logical plan verification issue fact");
+}
+
+static void RequireInvariant(const LogicalPlanVerificationIssue &issue, const string &invariant,
+                             const LogicalPlanVerificationPath &path) {
+	REQUIRE(issue.code == LogicalPlanVerificationIssueCode::INTERNAL_INVARIANT);
+	REQUIRE(issue.phase == LogicalPlanVerificationPhase::VERIFY);
+	REQUIRE(issue.path == path);
+	REQUIRE(GetFact(issue, "invariant") == Value(invariant));
+}
+
+static unique_ptr<LogicalExpressionGet> IntegerExpressionGet(TableIndex table_index) {
+	vector<vector<unique_ptr<Expression>>> rows;
+	vector<unique_ptr<Expression>> row;
+	row.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(42)));
+	rows.push_back(std::move(row));
+	return make_uniq<LogicalExpressionGet>(table_index, vector<LogicalType> {LogicalType::INTEGER}, std::move(rows));
+}
+
+TEST_CASE("Logical plan verification rejects unsafe logical operator slots", "[logical_plan_verification]") {
+	SECTION("null child slot") {
+		vector<unique_ptr<Expression>> expressions;
+		expressions.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(42)));
+		auto plan = make_uniq<LogicalProjection>(TableIndex(1), std::move(expressions));
+		plan->children.push_back(nullptr);
+
+		auto result = LogicalPlanVerifier::VerifyAlways(*plan);
+		REQUIRE(result.IsValid());
+		REQUIRE(result.GetIssues().size() == 1);
+		RequireInvariant(result.GetIssues()[0], "null_operator_child",
+		                 LogicalPlanVerificationPath {LogicalPlanVerificationPathRoot::LOGICAL_PLAN,
+		                                              {{LogicalPlanVerificationPathComponentType::OPERATOR_CHILD, 0}}});
+		REQUIRE(GetFact(result.GetIssues()[0], "child_index") == Value::UBIGINT(0));
+	}
+
+	SECTION("null operator expression slot") {
+		vector<unique_ptr<Expression>> expressions;
+		expressions.push_back(nullptr);
+		auto plan = make_uniq<LogicalProjection>(TableIndex(2), std::move(expressions));
+		plan->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(3)));
+
+		auto result = LogicalPlanVerifier::VerifyAlways(*plan);
+		REQUIRE(result.IsValid());
+		REQUIRE(result.GetIssues().size() == 1);
+		RequireInvariant(
+		    result.GetIssues()[0], "null_operator_expression",
+		    LogicalPlanVerificationPath {LogicalPlanVerificationPathRoot::LOGICAL_PLAN,
+		                                 {{LogicalPlanVerificationPathComponentType::OPERATOR_EXPRESSION, 0}}});
+		REQUIRE(GetFact(result.GetIssues()[0], "expression_index") == Value::UBIGINT(0));
+	}
+}
+
+TEST_CASE("Logical plan verification validates frozen operator child shapes", "[logical_plan_verification]") {
+	SECTION("expression get requires one child") {
+		auto plan = IntegerExpressionGet(TableIndex(10));
+
+		auto result = LogicalPlanVerifier::VerifyAlways(*plan);
+		REQUIRE(result.IsValid());
+		REQUIRE(result.GetIssues().size() == 1);
+		RequireInvariant(result.GetIssues()[0], "operator_child_count", LogicalPlanVerificationPath {});
+		REQUIRE(GetFact(result.GetIssues()[0], "expected_child_count") == Value::UBIGINT(1));
+		REQUIRE(GetFact(result.GetIssues()[0], "actual_child_count") == Value::UBIGINT(0));
+	}
+
+	SECTION("expression get requires a dummy child") {
+		auto plan = IntegerExpressionGet(TableIndex(11));
+		plan->children.push_back(TypedLeaf(TableIndex(12), LogicalType::INTEGER));
+
+		auto result = LogicalPlanVerifier::VerifyAlways(*plan);
+		REQUIRE(result.IsValid());
+		REQUIRE(result.GetIssues().size() == 1);
+		RequireInvariant(result.GetIssues()[0], "expression_get_dummy_child", LogicalPlanVerificationPath {});
+		REQUIRE(GetFact(result.GetIssues()[0], "actual_child_type") ==
+		        Value::UBIGINT(static_cast<uint64_t>(LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR)));
+	}
+
+	SECTION("dummy scan is childless") {
+		auto plan = make_uniq<LogicalDummyScan>(TableIndex(13));
+		plan->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(14)));
+
+		auto result = LogicalPlanVerifier::VerifyAlways(*plan);
+		REQUIRE(result.IsValid());
+		REQUIRE(result.GetIssues().size() == 1);
+		RequireInvariant(result.GetIssues()[0], "operator_child_count", LogicalPlanVerificationPath {});
+		REQUIRE(GetFact(result.GetIssues()[0], "expected_child_count") == Value::UBIGINT(0));
+	}
+
+	SECTION("dummy scan is expressionless") {
+		auto plan = make_uniq<LogicalDummyScan>(TableIndex(15));
+		plan->expressions.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(42)));
+
+		auto result = LogicalPlanVerifier::VerifyAlways(*plan);
+		REQUIRE(result.IsValid());
+		REQUIRE(result.GetIssues().size() == 1);
+		RequireInvariant(result.GetIssues()[0], "operator_expression_count", LogicalPlanVerificationPath {});
+		REQUIRE(GetFact(result.GetIssues()[0], "expected_expression_count") == Value::UBIGINT(0));
+	}
+
+	SECTION("filter requires one child") {
+		auto plan = make_uniq<LogicalFilter>(make_uniq<BoundConstantExpression>(Value::BOOLEAN(true)));
+
+		auto result = LogicalPlanVerifier::VerifyAlways(*plan);
+		REQUIRE(result.IsValid());
+		REQUIRE(result.GetIssues().size() == 1);
+		RequireInvariant(result.GetIssues()[0], "operator_child_count", LogicalPlanVerificationPath {});
+	}
+
+	SECTION("projection requires one child") {
+		vector<unique_ptr<Expression>> expressions;
+		expressions.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(42)));
+		auto plan = make_uniq<LogicalProjection>(TableIndex(16), std::move(expressions));
+
+		auto result = LogicalPlanVerifier::VerifyAlways(*plan);
+		REQUIRE(result.IsValid());
+		REQUIRE(result.GetIssues().size() == 1);
+		RequireInvariant(result.GetIssues()[0], "operator_child_count", LogicalPlanVerificationPath {});
+	}
+
+	SECTION("aggregate requires one child") {
+		auto plan = make_uniq<LogicalAggregate>(TableIndex(17), TableIndex(18), vector<unique_ptr<Expression>> {});
+
+		auto result = LogicalPlanVerifier::VerifyAlways(*plan);
+		REQUIRE(result.IsValid());
+		REQUIRE(result.GetIssues().size() == 1);
+		RequireInvariant(result.GetIssues()[0], "operator_child_count", LogicalPlanVerificationPath {});
+	}
+
+	SECTION("valid expression get scaffold") {
+		auto plan = IntegerExpressionGet(TableIndex(19));
+		plan->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(20)));
+
+		auto result = LogicalPlanVerifier::VerifyAlways(*plan);
+		REQUIRE(result.IsValid());
+		REQUIRE(result.IsSuccess());
+	}
+
+	SECTION("unsafe parent retains independent child issues") {
+		vector<unique_ptr<Expression>> expressions;
+		expressions.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(42)));
+		auto plan = make_uniq<LogicalProjection>(TableIndex(21), std::move(expressions));
+		plan->children.push_back(MalformedLeaf(TableIndex(22)));
+		plan->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(23)));
+
+		auto result = LogicalPlanVerifier::VerifyAlways(*plan);
+		REQUIRE(result.IsValid());
+		REQUIRE(result.GetIssues().size() == 2);
+		RequireInvariant(result.GetIssues()[0], "operator_child_count", LogicalPlanVerificationPath {});
+		REQUIRE(result.GetIssues()[1].code == LogicalPlanVerificationIssueCode::MALFORMED_EXTENSION_RESULT);
+		REQUIRE(result.GetIssues()[1].path ==
+		        LogicalPlanVerificationPath {LogicalPlanVerificationPathRoot::LOGICAL_PLAN,
+		                                     {{LogicalPlanVerificationPathComponentType::OPERATOR_CHILD, 0}}});
+	}
+}
+
+TEST_CASE("Logical plan verification validates filter projection indexes after its child",
+          "[logical_plan_verification]") {
+	auto CreateFilter = [](ProjectionIndex projection_index) {
+		auto filter = make_uniq<LogicalFilter>(make_uniq<BoundConstantExpression>(Value::BOOLEAN(true)));
+		filter->projection_map.push_back(projection_index);
+		filter->children.push_back(make_uniq<LogicalDummyScan>(TableIndex(30)));
+		return filter;
+	};
+
+	SECTION("out of range") {
+		auto plan = CreateFilter(ProjectionIndex(1));
+		auto result = LogicalPlanVerifier::VerifyAlways(*plan);
+		REQUIRE(result.IsValid());
+		REQUIRE(result.GetIssues().size() == 1);
+		RequireInvariant(result.GetIssues()[0], "projection_index_out_of_range", LogicalPlanVerificationPath {});
+		REQUIRE(GetFact(result.GetIssues()[0], "projection_index") == Value::UBIGINT(1));
+		REQUIRE(GetFact(result.GetIssues()[0], "child_column_count") == Value::UBIGINT(1));
+	}
+
+	SECTION("invalid sentinel") {
+		auto plan = CreateFilter(ProjectionIndex());
+		auto result = LogicalPlanVerifier::VerifyAlways(*plan);
+		REQUIRE(result.IsValid());
+		REQUIRE(result.GetIssues().size() == 1);
+		RequireInvariant(result.GetIssues()[0], "projection_index_out_of_range", LogicalPlanVerificationPath {});
+		REQUIRE(GetFact(result.GetIssues()[0], "projection_index_valid") == Value::BOOLEAN(false));
+	}
+
+	SECTION("valid projection") {
+		auto plan = CreateFilter(ProjectionIndex(0));
+		auto result = LogicalPlanVerifier::VerifyAlways(*plan);
+		REQUIRE(result.IsValid());
+		REQUIRE(result.IsSuccess());
+		REQUIRE(plan->types == vector<LogicalType> {LogicalType::INTEGER});
+	}
 }
 
 TEST_CASE("Logical plan verification accepts typed extension operators", "[logical_plan_verification]") {
@@ -784,6 +975,17 @@ TEST_CASE("Logical plan verification preserves setting and legacy extension beha
 	auto valid_plan = ReferenceProjection(TableIndex(82), ColumnBinding(child_index, ProjectionIndex(0)),
 	                                      LogicalType::INTEGER, TypedLeaf(child_index, LogicalType::INTEGER));
 	REQUIRE_NOTHROW(LogicalPlanVerifier::Verify(*connection.context, *valid_plan));
+
+	vector<unique_ptr<Expression>> malformed_expressions;
+	malformed_expressions.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(42)));
+	auto malformed_plan = make_uniq<LogicalProjection>(TableIndex(83), std::move(malformed_expressions));
+	malformed_plan->children.push_back(nullptr);
+	REQUIRE_NO_FAIL(connection.Query("SET debug_verify_column_bindings=false"));
+	REQUIRE_NOTHROW(LogicalPlanVerifier::Verify(*connection.context, *malformed_plan));
+	REQUIRE_NO_FAIL(connection.Query("SET debug_verify_column_bindings=true"));
+#ifndef DUCKDB_CRASH_ON_ASSERT
+	REQUIRE_THROWS_AS(LogicalPlanVerifier::Verify(*connection.context, *malformed_plan), InternalException);
+#endif
 
 	auto legacy_index = TableIndex(90);
 	auto legacy_plan = ReferenceProjection(TableIndex(91), ColumnBinding(legacy_index, ProjectionIndex(0)),
