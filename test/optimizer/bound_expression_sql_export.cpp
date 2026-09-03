@@ -393,9 +393,24 @@ public:
 	    : source_type(std::move(source_type_p)), target_type(std::move(target_type_p)),
 	      bound_cast(std::move(bound_cast_p)), try_cast(try_cast_p), is_default_cast(is_default_cast_p) {
 	}
+	SpoofCastFunctionData(const SpoofCastFunctionData &other)
+	    : FunctionData(other), source_type(other.source_type), target_type(other.target_type),
+	      bound_cast(other.bound_cast.Copy()), try_cast(other.try_cast), is_default_cast(other.is_default_cast) {
+	}
+	SpoofCastFunctionData(SpoofCastFunctionData &&) = default;
+	SpoofCastFunctionData &operator=(const SpoofCastFunctionData &other) {
+		FunctionData::operator=(other);
+		source_type = other.source_type;
+		target_type = other.target_type;
+		bound_cast = other.bound_cast.Copy();
+		try_cast = other.try_cast;
+		is_default_cast = other.is_default_cast;
+		return *this;
+	}
+	SpoofCastFunctionData &operator=(SpoofCastFunctionData &&) = default;
 
 	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<SpoofCastFunctionData>(source_type, target_type, bound_cast.Copy(), try_cast, is_default_cast);
+		return make_uniq<SpoofCastFunctionData>(*this);
 	}
 
 	bool Equals(const FunctionData &) const override {
@@ -1389,24 +1404,47 @@ TEST_CASE("Bound expression SQL export validates structural expression state", "
 	RequireIssue(BoundExpressionSQLExporter::Export(*malformed_cast, context),
 	             LogicalPlanVerificationIssueCode::INTERNAL_INVARIANT, path);
 
-	auto forged_cast =
-	    BoundCastExpression::AddCastToType(*connection.context, Constant(Value::INTEGER(7)), LogicalType::BIGINT);
-	auto &forged_cast_function = forged_cast->Cast<BoundFunctionExpression>();
-	forged_cast_function.BindInfoMutable() = make_uniq<SpoofCastFunctionData>(
-	    LogicalType::INTEGER, LogicalType::BIGINT, BoundCastInfo(IntegerToBigintNinetyNine), false, false);
-	REQUIRE(ExpressionExecutor::EvaluateScalar(*connection.context, forged_cast_function) == Value::BIGINT(99));
+	BoundCastInfo forged_cast_behavior(IntegerToBigintNinetyNine);
+	Vector forged_cast_source(Value::INTEGER(7), count_t(1));
+	Vector forged_cast_result(LogicalType::BIGINT, 1);
+	CastParameters forged_cast_parameters;
+	REQUIRE(forged_cast_behavior.Cast(forged_cast_source, forged_cast_result, 1, forged_cast_parameters));
+	REQUIRE(forged_cast_result.GetValue(0) == Value::BIGINT(99));
 	auto equivalent_cast_sql = connection.Query("SELECT CAST(CAST(7 AS INTEGER) AS BIGINT)");
 	REQUIRE_FALSE(equivalent_cast_sql->HasError());
 	REQUIRE(equivalent_cast_sql->GetValue(0, 0) == Value::BIGINT(7));
-	REQUIRE_FALSE(BoundCastExpression::HasValidBindData(forged_cast_function));
-	auto forged_cast_result = BoundExpressionSQLExporter::Export(*forged_cast, context);
-	RequireStructuralInvariant(forged_cast_result, path);
 
-	auto forged_cast_copy = forged_cast->Copy();
-	auto &forged_cast_copy_function = forged_cast_copy->Cast<BoundFunctionExpression>();
-	REQUIRE(ExpressionExecutor::EvaluateScalar(*connection.context, forged_cast_copy_function) == Value::BIGINT(99));
-	REQUIRE_FALSE(BoundCastExpression::HasValidBindData(forged_cast_copy_function));
-	RequireStructuralInvariant(BoundExpressionSQLExporter::Export(*forged_cast_copy, context), path);
+	auto require_generic_cast_data = [&](unique_ptr<FunctionData> data, bool require_polymorphic_copy) {
+		auto expression =
+		    BoundCastExpression::AddCastToType(*connection.context, Constant(Value::INTEGER(7)), LogicalType::BIGINT);
+		auto &function = expression->Cast<BoundFunctionExpression>();
+		function.BindInfoMutable() = std::move(data);
+		REQUIRE_FALSE(BoundCastExpression::HasValidBindData(function));
+		RequireStructuralInvariant(BoundExpressionSQLExporter::Export(*expression, context), path);
+		if (require_polymorphic_copy) {
+			auto copied_expression = expression->Copy();
+			auto &copied_function = copied_expression->Cast<BoundFunctionExpression>();
+			REQUIRE_FALSE(BoundCastExpression::HasValidBindData(copied_function));
+			RequireStructuralInvariant(BoundExpressionSQLExporter::Export(*copied_expression, context), path);
+		}
+	};
+	auto spoof_cast_source = make_uniq<SpoofCastFunctionData>(LogicalType::INTEGER, LogicalType::BIGINT,
+	                                                          forged_cast_behavior.Copy(), false, false);
+	auto spoof_cast_copy = make_uniq<SpoofCastFunctionData>(*spoof_cast_source);
+	auto spoof_cast_move_source = make_uniq<SpoofCastFunctionData>(*spoof_cast_source);
+	auto spoof_cast_moved = make_uniq<SpoofCastFunctionData>(std::move(*spoof_cast_move_source));
+	auto spoof_cast_assigned = make_uniq<SpoofCastFunctionData>(LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                                                            BoundCastInfo(IntegerToBigintPlusOne), true, true);
+	*spoof_cast_assigned = *spoof_cast_source;
+	auto spoof_cast_move_assignment_source = make_uniq<SpoofCastFunctionData>(*spoof_cast_source);
+	auto spoof_cast_move_assigned = make_uniq<SpoofCastFunctionData>(LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                                                                 BoundCastInfo(IntegerToBigintPlusOne), true, true);
+	*spoof_cast_move_assigned = std::move(*spoof_cast_move_assignment_source);
+	require_generic_cast_data(std::move(spoof_cast_source), true);
+	require_generic_cast_data(std::move(spoof_cast_copy), false);
+	require_generic_cast_data(std::move(spoof_cast_moved), false);
+	require_generic_cast_data(std::move(spoof_cast_assigned), false);
+	require_generic_cast_data(std::move(spoof_cast_move_assigned), false);
 
 	auto mismatched_cast_data =
 	    BoundCastExpression::AddCastToType(*connection.context, Constant(Value::INTEGER(7)), LogicalType::BIGINT);
@@ -1422,36 +1460,36 @@ TEST_CASE("Bound expression SQL export validates structural expression state", "
 	RequireIssue(BoundExpressionSQLExporter::Export(*malformed_between, context),
 	             LogicalPlanVerificationIssueCode::INTERNAL_INVARIANT, path);
 
-	auto require_generic_between_data = [&](unique_ptr<FunctionData> data) {
+	auto require_generic_between_data = [&](unique_ptr<SpoofBetweenFunctionData> data, bool require_polymorphic_copy) {
+		REQUIRE_FALSE(data->lower_inclusive);
+		REQUIRE(data->upper_inclusive);
 		auto expression = BoundBetweenExpression::Create(Constant(Value::INTEGER(1)), Constant(Value::INTEGER(1)),
 		                                                 Constant(Value::INTEGER(3)), true, true);
 		auto &function = expression->Cast<BoundFunctionExpression>();
 		function.BindInfoMutable() = std::move(data);
 		REQUIRE_FALSE(BoundBetweenExpression::HasValidBindData(function));
+		RequireStructuralInvariant(BoundExpressionSQLExporter::Export(*expression, context), path);
+		if (require_polymorphic_copy) {
+			auto copied_expression = expression->Copy();
+			auto &copied_function = copied_expression->Cast<BoundFunctionExpression>();
+			REQUIRE_FALSE(BoundBetweenExpression::HasValidBindData(copied_function));
+			RequireStructuralInvariant(BoundExpressionSQLExporter::Export(*copied_expression, context), path);
+		}
 	};
-	SpoofBetweenFunctionData spoof_between_source(false, true);
-	SpoofBetweenFunctionData spoof_between_copy(spoof_between_source);
-	SpoofBetweenFunctionData spoof_between_assigned(true, false);
-	spoof_between_assigned = spoof_between_source;
-	SpoofBetweenFunctionData spoof_between_moved(std::move(spoof_between_copy));
-	SpoofBetweenFunctionData spoof_between_move_assigned(true, false);
-	spoof_between_move_assigned = std::move(spoof_between_assigned);
-	for (auto *data : {&spoof_between_source, &spoof_between_moved, &spoof_between_move_assigned}) {
-		REQUIRE_FALSE(data->lower_inclusive);
-		REQUIRE(data->upper_inclusive);
-		require_generic_between_data(data->Copy());
-	}
-
-	auto forged_between = BoundBetweenExpression::Create(Constant(Value::INTEGER(1)), Constant(Value::INTEGER(1)),
-	                                                     Constant(Value::INTEGER(3)), true, true);
-	auto &forged_between_function = forged_between->Cast<BoundFunctionExpression>();
-	forged_between_function.BindInfoMutable() = make_uniq<SpoofBetweenFunctionData>(false, true);
-	REQUIRE(ExpressionExecutor::EvaluateScalar(*connection.context, forged_between_function) == Value::BOOLEAN(false));
-	REQUIRE_FALSE(BoundBetweenExpression::HasValidBindData(forged_between_function));
-	RequireStructuralInvariant(BoundExpressionSQLExporter::Export(*forged_between, context), path);
-	auto forged_between_copy = forged_between->Copy();
-	REQUIRE_FALSE(BoundBetweenExpression::HasValidBindData(forged_between_copy->Cast<BoundFunctionExpression>()));
-	RequireStructuralInvariant(BoundExpressionSQLExporter::Export(*forged_between_copy, context), path);
+	auto spoof_between_source = make_uniq<SpoofBetweenFunctionData>(false, true);
+	auto spoof_between_copy = make_uniq<SpoofBetweenFunctionData>(*spoof_between_source);
+	auto spoof_between_move_source = make_uniq<SpoofBetweenFunctionData>(*spoof_between_source);
+	auto spoof_between_moved = make_uniq<SpoofBetweenFunctionData>(std::move(*spoof_between_move_source));
+	auto spoof_between_assigned = make_uniq<SpoofBetweenFunctionData>(true, false);
+	*spoof_between_assigned = *spoof_between_source;
+	auto spoof_between_move_assignment_source = make_uniq<SpoofBetweenFunctionData>(*spoof_between_source);
+	auto spoof_between_move_assigned = make_uniq<SpoofBetweenFunctionData>(true, false);
+	*spoof_between_move_assigned = std::move(*spoof_between_move_assignment_source);
+	require_generic_between_data(std::move(spoof_between_source), true);
+	require_generic_between_data(std::move(spoof_between_copy), false);
+	require_generic_between_data(std::move(spoof_between_moved), false);
+	require_generic_between_data(std::move(spoof_between_assigned), false);
+	require_generic_between_data(std::move(spoof_between_move_assigned), false);
 
 	auto wrong_arity = BoundBetweenExpression::Create(Constant(Value::INTEGER(2)), Constant(Value::INTEGER(2)),
 	                                                  Constant(Value::INTEGER(9)), true, true);
