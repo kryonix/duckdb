@@ -115,13 +115,10 @@ public:
 		return true;
 	}
 
-	//! One task drives the recursion; every task scans the epoch output or drains the final keyed state
+	//! One task drives the recursion; every task scans the epoch output or drains the final keyed state. The
+	//! source keeps the default insertion-order declaration, so order-preserving consumers stay on one task.
 	bool ParallelSource() const override {
 		return true;
-	}
-
-	OrderPreservationType SourceOrder() const override {
-		return OrderPreservationType::NO_ORDER;
 	}
 
 public:

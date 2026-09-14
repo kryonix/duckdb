@@ -2,6 +2,9 @@
 # description: USING KEY state is split into partitions that commit on several tasks once the commit is worth it
 # group: [cte]
 
+# The promotion thresholds scale with the vector size, so the migration counts below assume the default.
+require vector_size 2048
+
 statement ok
 SET threads=8;
 

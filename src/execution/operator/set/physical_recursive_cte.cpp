@@ -61,6 +61,13 @@ static constexpr const idx_t KEYED_PROMOTION_ROWS = 2 * KEYED_COMMIT_ROWS_PER_TA
 static constexpr const idx_t KEYED_PROMOTION_COMMIT_SHARE_DIVISOR = 5;
 // Each partition costs a hash-table probe per routed chunk and a scan cursor per epoch, so cap the fan-out.
 static constexpr const idx_t MAX_KEYED_PARTITIONS = 16;
+// Rows of frozen state or epoch output that justify one more scan task, independent of the vector size so small
+// results keep a single task at any vector size.
+static constexpr const idx_t SCAN_ROWS_PER_TASK = 2048;
+
+static idx_t ScanTasksForRows(idx_t rows) {
+	return MaxValue<idx_t>((rows + SCAN_ROWS_PER_TASK - 1) / SCAN_ROWS_PER_TASK, 1);
+}
 
 static idx_t GetKeyedPartitionTarget(ClientContext &context) {
 	const auto threads = TaskScheduler::GetScheduler(context).NumberOfThreads();
@@ -374,14 +381,6 @@ idx_t RecursiveCTEState::KeyedGroupCount() const {
 	idx_t count = 0;
 	for (auto &partition : keyed_partitions) {
 		count += partition->ht->Count();
-	}
-	return count;
-}
-
-idx_t RecursiveCTEState::KeyedChunkCount() const {
-	idx_t count = 0;
-	for (auto &partition : keyed_partitions) {
-		count += partition->ht->ChunkCount();
 	}
 	return count;
 }
@@ -1683,7 +1682,7 @@ public:
 	RecursiveCTEStateScanGlobalState(ClientContext &context, RecursiveCTEState &state) {
 		state.InitializeKeyedScan(scan);
 		max_threads = MinValue<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads(),
-		                              MaxValue<idx_t>(state.KeyedChunkCount(), 1));
+		                              ScanTasksForRows(state.KeyedGroupCount()));
 	}
 
 	idx_t MaxThreads() override {
@@ -1865,7 +1864,7 @@ idx_t RecursiveCTESourceState::MaxThreads() {
 		return 1;
 	}
 	auto &state = op.sink_state->Cast<RecursiveCTEState>();
-	return MinValue<idx_t>(thread_count, MaxValue<idx_t>(state.AnchorOutputChunks(), 1));
+	return MinValue<idx_t>(thread_count, ScanTasksForRows(state.AnchorOutputRows()));
 }
 
 RecursiveCTESourceLocalState::RecursiveCTESourceLocalState(ClientContext &context, const PhysicalRecursiveCTE &op)
@@ -1896,11 +1895,8 @@ SourceResultType PhysicalRecursiveCTE::GetDataInternal(ExecutionContext &context
 	return gstate.GetData(context, chunk, input);
 }
 
-idx_t RecursiveCTEState::AnchorOutputChunks() const {
-	if (op.using_key) {
-		return (KeyedGroupCount() + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
-	}
-	return intermediate_table.ChunkCount();
+idx_t RecursiveCTEState::AnchorOutputRows() const {
+	return op.using_key ? KeyedGroupCount() : intermediate_table.Count();
 }
 
 SourceResultType RecursiveCTEState::GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) {
@@ -1986,7 +1982,7 @@ SourceResultType RecursiveCTEState::GetUsingKeyData(ExecutionContext &context, D
 			gstate.driver_active = false;
 			InitializeKeyedScan(gstate.drain_scan);
 			gstate.phase = RecursiveCTESourcePhase::DRAINING_FINAL_KEY_STATE;
-			if (KeyedChunkCount() > 1) {
+			if (ScanTasksForRows(KeyedGroupCount()) > 1) {
 				gstate.UnblockTasks();
 			}
 			break;
@@ -2130,7 +2126,7 @@ SourceResultType RecursiveCTEState::GetUnionData(ExecutionContext &context, Data
 				CurrentOutputTable().InitializeScan(gstate.output_scan);
 				gstate.epoch++;
 				// Narrow epochs are consumed by the driver alone; parked tasks stay parked
-				if (CurrentOutputTable().ChunkCount() > 1) {
+				if (ScanTasksForRows(CurrentOutputTable().Count()) > 1) {
 					gstate.UnblockTasks();
 				}
 				continue;
