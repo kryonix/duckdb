@@ -321,10 +321,17 @@ SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
 statement ok
 PRAGMA explain_output='physical_only';
 
+# The invariant edge scan is estimated larger than the frozen state, so its retained hash-join build is preferred
+# over probing the state with every edge each epoch.
 query II
 EXPLAIN SELECT * FROM query(getvariable('flummi_sql'));
 ----
-physical_plan	<REGEX>:.*RECURSIVE_KEY_JOIN.*
+physical_plan	<REGEX>:.*HASH_JOIN[\s\S]*REC_REC_CTE_SCAN.*
+
+query II
+EXPLAIN SELECT * FROM query(getvariable('flummi_sql'));
+----
+physical_plan	<!REGEX>:.*RECURSIVE_KEY_JOIN.*
 
 statement ok
 DROP VIEW edges;

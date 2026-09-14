@@ -174,6 +174,39 @@ CreateRecursiveKeyProbeNormalizers(ClientContext &context, const PhysicalRecursi
 	return normalizers;
 }
 
+static bool ContainsPipelineBreaker(const PhysicalOperator &op) {
+	if (op.IsSink()) {
+		return true;
+	}
+	for (auto &child : op.GetChildren()) {
+		if (ContainsPipelineBreaker(child.get())) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool ShouldUseRecursiveKeyProbe(const PhysicalRecursiveCTEStateScan &state_scan, const PhysicalOperator &probe,
+                                       bool state_on_left) {
+	if (PhysicalRecursiveCTE::ContainsVisibleRecursiveScan(probe, state_scan.cte_index)) {
+		// frontier-dependent probe inputs are recomputed every epoch regardless of the join
+		return true;
+	}
+	if (!state_on_left) {
+		// the hash join would rebuild the frozen state every epoch, probing it directly is always cheaper
+		return true;
+	}
+	if (ContainsPipelineBreaker(probe)) {
+		// the hash join builds the invariant side once and retains it across epochs
+		return false;
+	}
+	// streaming invariant build side: rebuilding it once beats probing it every epoch unless it is small
+	if (state_scan.estimated_cardinality == 0) {
+		return probe.estimated_cardinality <= STANDARD_VECTOR_SIZE;
+	}
+	return probe.estimated_cardinality <= state_scan.estimated_cardinality;
+}
+
 PhysicalOperator &PhysicalPlanGenerator::PlanComparisonJoin(LogicalComparisonJoin &op) {
 	// now visit the children
 	D_ASSERT(op.children.size() == 2);
@@ -190,7 +223,9 @@ PhysicalOperator &PhysicalPlanGenerator::PlanComparisonJoin(LogicalComparisonJoi
 	vector<ExpressionType> key_comparisons;
 	bool state_on_left;
 	if (TryGetRecursiveKeyProbe(context, op, left, right, left_state, right_state, state_key_indices, probe_key_indices,
-	                            key_comparisons, state_on_left)) {
+	                            key_comparisons, state_on_left) &&
+	    ShouldUseRecursiveKeyProbe(state_on_left ? *left_state : *right_state, state_on_left ? right : left,
+	                               state_on_left)) {
 		auto &state_scan = state_on_left ? *left_state : *right_state;
 		auto &probe = state_on_left ? right : left;
 		auto left_projection_map = PhysicalJoin::FillProjectionMap(left, op.left_projection_map);

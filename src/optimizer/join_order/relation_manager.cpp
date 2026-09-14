@@ -387,6 +387,19 @@ bool RelationManager::AddRelationWithChildren(JoinOrderOptimizer &optimizer, Log
 	return AddRelation(input_op, parent, *operator_stats);
 }
 
+static void SetRecurringReferenceCardinality(LogicalOperator &op, TableIndex cte_index, idx_t cardinality) {
+	if (op.type == LogicalOperatorType::LOGICAL_CTE_REF) {
+		auto &cte_ref = op.Cast<LogicalCTERef>();
+		if (cte_ref.is_recurring && cte_ref.cte_index == cte_index) {
+			cte_ref.SetEstimatedCardinality(cardinality);
+		}
+		return;
+	}
+	for (auto &child : op.children) {
+		SetRecurringReferenceCardinality(*child, cte_index, cardinality);
+	}
+}
+
 bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, LogicalOperator &input_op,
                                            vector<reference<LogicalOperator>> &filter_operators,
                                            optional_ptr<LogicalOperator> parent) {
@@ -621,6 +634,8 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 			// because we don't know how many times it will be executed
 			// we just assume it will be executed 1000 times
 			cte_cardinality = child_1_card + child_2_card * 1000;
+			// The frozen state holds at least the anchor and grows by one member output per epoch
+			SetRecurringReferenceCardinality(*op->children[1], table_index, child_1_card + child_2_card);
 		} else if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
 			// for a materialized CTE, we just take the cardinality of the right children
 			cte_cardinality = child_2_card;

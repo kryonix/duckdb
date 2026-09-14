@@ -476,7 +476,7 @@ static bool ContainsVisibleRecursiveScanInternal(const PhysicalOperator &op, Tab
 	return false;
 }
 
-static bool ContainsVisibleRecursiveScan(const PhysicalOperator &op, TableIndex cte_index) {
+bool PhysicalRecursiveCTE::ContainsVisibleRecursiveScan(const PhysicalOperator &op, TableIndex cte_index) {
 	reference_set_t<const PhysicalOperator> visited;
 	return ContainsVisibleRecursiveScanInternal(op, cte_index, visited);
 }
@@ -491,7 +491,7 @@ static void CountDirectRecursiveReferences(const PhysicalOperator &op, TableInde
 			references.exact_key_probes++;
 		}
 		auto &probe = key_join.children[0].get();
-		if (!ContainsVisibleRecursiveScan(probe, cte_index)) {
+		if (!PhysicalRecursiveCTE::ContainsVisibleRecursiveScan(probe, cte_index)) {
 			const auto probe_work_units = probe.estimated_cardinality / STANDARD_VECTOR_SIZE +
 			                              (probe.estimated_cardinality % STANDARD_VECTOR_SIZE != 0);
 			references.direct_probe_work_units = MaxValue(references.direct_probe_work_units, probe_work_units);

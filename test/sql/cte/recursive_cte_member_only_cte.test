@@ -1,0 +1,162 @@
+# name: test/sql/cte/recursive_cte_member_only_cte.test
+# description: CTEs referenced only inside a recursive member stay materialized when they are expensive to repeat
+# group: [cte]
+
+statement ok
+PRAGMA explain_output='optimized_only';
+
+# A window CTE scanned once per epoch is materialized once instead of being inlined into the member.
+query II
+EXPLAIN WITH RECURSIVE w(k, c) AS (SELECT i, count(*) OVER (PARTITION BY i % 10) FROM range(1000) t(i)),
+r(k, v) AS (SELECT 1, 0 UNION ALL SELECT r.k, r.v + w.c FROM r JOIN w USING (k) WHERE r.v < 1000)
+SELECT count(*), max(v) FROM r;
+----
+logical_opt	<REGEX>:.*CTE Name: w[\s\S]*Rec CTE.*
+
+query II
+WITH RECURSIVE w(k, c) AS (SELECT i, count(*) OVER (PARTITION BY i % 10) FROM range(1000) t(i)),
+r(k, v) AS (SELECT 1, 0 UNION ALL SELECT r.k, r.v + w.c FROM r JOIN w USING (k) WHERE r.v < 1000)
+SELECT count(*), max(v) FROM r;
+----
+11	1000
+
+# The result matches the inlined evaluation.
+query II
+WITH RECURSIVE w(k, c) AS NOT MATERIALIZED (SELECT i, count(*) OVER (PARTITION BY i % 10) FROM range(1000) t(i)),
+r(k, v) AS (SELECT 1, 0 UNION ALL SELECT r.k, r.v + w.c FROM r JOIN w USING (k) WHERE r.v < 1000)
+SELECT count(*), max(v) FROM r;
+----
+11	1000
+
+# NOT MATERIALIZED still inlines the definition.
+query II
+EXPLAIN WITH RECURSIVE w(k, c) AS NOT MATERIALIZED (SELECT i, count(*) OVER (PARTITION BY i % 10) FROM range(1000) t(i)),
+r(k, v) AS (SELECT 1, 0 UNION ALL SELECT r.k, r.v + w.c FROM r JOIN w USING (k) WHERE r.v < 1000)
+SELECT count(*), max(v) FROM r;
+----
+logical_opt	<!REGEX>:.*CTE Name: w.*
+
+# A definition without a pipeline breaker is still inlined so filters keep reaching its scan.
+query II
+EXPLAIN WITH RECURSIVE w(k, c) AS (SELECT i, i FROM range(1000) t(i)),
+r(k, v) AS (SELECT 1, 0 UNION ALL SELECT r.k, r.v + w.c FROM r JOIN w USING (k) WHERE r.v < 1000)
+SELECT count(*), max(v) FROM r;
+----
+logical_opt	<!REGEX>:.*CTE Name: w.*
+
+query II
+WITH RECURSIVE w(k, c) AS (SELECT i, i FROM range(1000) t(i)),
+r(k, v) AS (SELECT 1, 0 UNION ALL SELECT r.k, r.v + w.c FROM r JOIN w USING (k) WHERE r.v < 1000)
+SELECT count(*), max(v) FROM r;
+----
+1001	1000
+
+# A CTE referenced from both the anchor and the member keeps the existing materialization decision.
+query II
+EXPLAIN WITH RECURSIVE w(k, c) AS (SELECT i, count(*) OVER (PARTITION BY i % 10) FROM range(1000) t(i)),
+r(k, v) AS (SELECT k, 0 FROM w WHERE k = 1 UNION ALL SELECT r.k, r.v + w.c FROM r JOIN w USING (k) WHERE r.v < 1000)
+SELECT count(*), max(v) FROM r;
+----
+logical_opt	<REGEX>:.*CTE Name: w[\s\S]*Rec CTE.*
+
+query II
+WITH RECURSIVE w(k, c) AS (SELECT i, count(*) OVER (PARTITION BY i % 10) FROM range(1000) t(i)),
+r(k, v) AS (SELECT k, 0 FROM w WHERE k = 1 UNION ALL SELECT r.k, r.v + w.c FROM r JOIN w USING (k) WHERE r.v < 1000)
+SELECT count(*), max(v) FROM r;
+----
+11	1000
+
+# A CTE defined inside the member scope keeps today's inlining.
+query II
+EXPLAIN WITH RECURSIVE r(k, v) AS (
+	SELECT 1, 0
+	UNION ALL
+	(WITH w(k, c) AS (SELECT i, count(*) OVER (PARTITION BY i % 10) FROM range(1000) t(i))
+	 SELECT r.k, r.v + w.c FROM r JOIN w USING (k) WHERE r.v < 1000)
+)
+SELECT count(*), max(v) FROM r;
+----
+logical_opt	<!REGEX>:.*CTE Name: w.*
+
+query II
+WITH RECURSIVE r(k, v) AS (
+	SELECT 1, 0
+	UNION ALL
+	(WITH w(k, c) AS (SELECT i, count(*) OVER (PARTITION BY i % 10) FROM range(1000) t(i))
+	 SELECT r.k, r.v + w.c FROM r JOIN w USING (k) WHERE r.v < 1000)
+)
+SELECT count(*), max(v) FROM r;
+----
+11	1000
+
+# PageRank-shaped recursion: the member-only degree CTE is evaluated once and the state probes its build.
+statement ok
+PRAGMA explain_output='physical_only';
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+query II
+EXPLAIN WITH RECURSIVE
+edges(here, there) AS (SELECT i % 100, (i * 7) % 100 FROM range(400) t(i)),
+degrees(here, there, outgoing) AS (SELECT here, there, count(*) OVER (PARTITION BY here) FROM edges),
+rank(node, weight, iter) USING KEY (node) AS (
+	SELECT i, 1.0::DOUBLE, 0 FROM range(100) t(i)
+	UNION ALL
+	SELECT d.there, sum(current.weight / d.outgoing), current.iter + 1
+	FROM recurring.rank current JOIN degrees d ON current.node = d.here
+	WHERE current.iter < 5
+	GROUP BY d.there, current.iter
+)
+SELECT count(*), round(sum(weight), 6) FROM rank;
+----
+physical_plan	<REGEX>:.*CTE Name: degrees[\s\S]*REC_CTE[\s\S]*HASH_JOIN[\s\S]*REC_REC_CTE_SCAN.*
+
+query II
+EXPLAIN WITH RECURSIVE
+edges(here, there) AS (SELECT i % 100, (i * 7) % 100 FROM range(400) t(i)),
+degrees(here, there, outgoing) AS (SELECT here, there, count(*) OVER (PARTITION BY here) FROM edges),
+rank(node, weight, iter) USING KEY (node) AS (
+	SELECT i, 1.0::DOUBLE, 0 FROM range(100) t(i)
+	UNION ALL
+	SELECT d.there, sum(current.weight / d.outgoing), current.iter + 1
+	FROM recurring.rank current JOIN degrees d ON current.node = d.here
+	WHERE current.iter < 5
+	GROUP BY d.there, current.iter
+)
+SELECT count(*), round(sum(weight), 6) FROM rank;
+----
+physical_plan	<!REGEX>:.*RECURSIVE_KEY_JOIN.*
+
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+WITH RECURSIVE
+edges(here, there) AS (SELECT i % 100, (i * 7) % 100 FROM range(400) t(i)),
+degrees(here, there, outgoing) AS (SELECT here, there, count(*) OVER (PARTITION BY here) FROM edges),
+rank(node, weight, iter) USING KEY (node) AS (
+	SELECT i, 1.0::DOUBLE, 0 FROM range(100) t(i)
+	UNION ALL
+	SELECT d.there, sum(current.weight / d.outgoing), current.iter + 1
+	FROM recurring.rank current JOIN degrees d ON current.node = d.here
+	WHERE current.iter < 5
+	GROUP BY d.there, current.iter
+)
+SELECT count(*), round(sum(weight), 6) FROM rank;
+----
+100	100.0
+
+statement ok
+CALL disable_logging();
+
+# The degree build is retained across epochs instead of being recomputed.
+query II
+SELECT info.epochs::UBIGINT = 6, info.retained_build_executions::UBIGINT >= 1
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
+----
+true	true
