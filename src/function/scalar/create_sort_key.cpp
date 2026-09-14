@@ -38,7 +38,7 @@ struct SortKeyBindData : public FunctionData {
 	}
 };
 
-void AccumulateSortKeyWidth(const LogicalType &type, bool &all_constant, idx_t &constant_size) {
+static void AccumulateSortKeyWidth(const LogicalType &type, bool &all_constant, idx_t &constant_size) {
 	const auto physical_type = type.InternalType();
 	if (!TypeIsConstantSize(physical_type)) {
 		all_constant = false;
@@ -48,7 +48,7 @@ void AccumulateSortKeyWidth(const LogicalType &type, bool &all_constant, idx_t &
 	constant_size += GetTypeIdSize(physical_type) + 1;
 }
 
-void VerifyDecodeSortKeyType(const LogicalType &sort_key_type, bool all_constant, idx_t constant_size) {
+static void VerifyDecodeSortKeyType(const LogicalType &sort_key_type, bool all_constant, idx_t constant_size) {
 	if (sort_key_type == LogicalType::BIGINT) {
 		if (!all_constant || constant_size > sizeof(int64_t)) {
 			throw BinderException("sort_key has type BIGINT but arguments require BLOB");
