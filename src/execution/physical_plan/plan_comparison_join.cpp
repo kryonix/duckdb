@@ -186,6 +186,9 @@ static bool ContainsPipelineBreaker(const PhysicalOperator &op) {
 	return false;
 }
 
+// A streaming invariant probe input this small is cheaper to probe every epoch than to build a hash table for.
+static constexpr const idx_t SMALL_RECURSIVE_PROBE_ROWS = 2048;
+
 static bool ShouldUseRecursiveKeyProbe(const PhysicalRecursiveCTEStateScan &state_scan, const PhysicalOperator &probe,
                                        bool state_on_left) {
 	if (PhysicalRecursiveCTE::ContainsVisibleRecursiveScan(probe, state_scan.cte_index)) {
@@ -202,7 +205,7 @@ static bool ShouldUseRecursiveKeyProbe(const PhysicalRecursiveCTEStateScan &stat
 	}
 	// streaming invariant build side: rebuilding it once beats probing it every epoch unless it is small
 	if (state_scan.estimated_cardinality == 0) {
-		return probe.estimated_cardinality <= STANDARD_VECTOR_SIZE;
+		return probe.estimated_cardinality <= SMALL_RECURSIVE_PROBE_ROWS;
 	}
 	return probe.estimated_cardinality <= state_scan.estimated_cardinality;
 }

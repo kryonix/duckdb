@@ -1098,9 +1098,14 @@ idx_t GroupedAggregateHashTable::LookupGroups(DataChunk &groups, Vector &group_h
 	}
 	// Matches arrive in probe-iteration order, emit them in ascending row order from the mask
 	const auto found_words = lookup_state.found_mask.GetData();
+	const auto entry_count = ValidityMask::EntryCount(chunk_size);
 	idx_t emitted = 0;
-	for (idx_t word_idx = 0; word_idx < ValidityMask::EntryCount(chunk_size); word_idx++) {
+	for (idx_t word_idx = 0; word_idx < entry_count; word_idx++) {
 		auto word = found_words[word_idx];
+		if (word_idx + 1 == entry_count && chunk_size % ValidityMask::BITS_PER_VALUE != 0) {
+			// SetAllInvalid keeps the bits past the row count valid
+			word &= (validity_t(1) << (chunk_size % ValidityMask::BITS_PER_VALUE)) - 1;
+		}
 		while (word) {
 			const auto bit = CountZeros<validity_t>::Trailing(word);
 			found_groups_out.set_index(emitted++, word_idx * ValidityMask::BITS_PER_VALUE + bit);
