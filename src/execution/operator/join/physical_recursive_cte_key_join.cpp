@@ -325,9 +325,14 @@ idx_t RecursiveCTEKeyJoinState::LookupPartitionedKeys(idx_t lookup_count, Recurs
 
 	// Emit the matches in ascending lookup order, like a single-partition lookup does
 	const auto found_words = found_mask.GetData();
+	const auto entry_count = ValidityMask::EntryCount(lookup_count);
 	idx_t emitted = 0;
-	for (idx_t word_idx = 0; word_idx < ValidityMask::EntryCount(lookup_count); word_idx++) {
+	for (idx_t word_idx = 0; word_idx < entry_count; word_idx++) {
 		auto word = found_words[word_idx];
+		if (word_idx + 1 == entry_count && lookup_count % ValidityMask::BITS_PER_VALUE != 0) {
+			// SetAllInvalid keeps the bits past the row count valid
+			word &= (validity_t(1) << (lookup_count % ValidityMask::BITS_PER_VALUE)) - 1;
+		}
 		while (word) {
 			const auto bit = CountZeros<validity_t>::Trailing(word);
 			found_key_sel.set_index(emitted++, word_idx * ValidityMask::BITS_PER_VALUE + bit);

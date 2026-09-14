@@ -1102,9 +1102,6 @@ void RecursiveCTEState::CommitUsingKeyUpdatesInternal(RecursiveCTEKeyedPartition
 		}
 
 		const auto raw_candidate_count = candidates.Count();
-		if constexpr (COLLECT_METRICS) {
-			GetEpochMetrics().RecordLocalKeyPreaggregationResidual(raw_candidate_count);
-		}
 		bool preaggregate_raw_candidates = false;
 		if (raw_candidate_count >= STANDARD_VECTOR_SIZE) {
 			const auto classification_start =
@@ -1500,6 +1497,8 @@ idx_t RecursiveCTEState::PrepareKeyedCommit() {
 		}
 	}
 	idx_t work_rows = 0;
+	idx_t raw_candidate_rows = 0;
+	bool has_preaggregates = false;
 	for (idx_t partition_idx = 0; partition_idx < keyed_partitions.size(); partition_idx++) {
 		auto &partition = *keyed_partitions[partition_idx];
 		if (!partition.HasWork()) {
@@ -1507,6 +1506,12 @@ idx_t RecursiveCTEState::PrepareKeyedCommit() {
 		}
 		keyed_commit_partitions.push_back(partition_idx);
 		work_rows += partition.WorkRows();
+		raw_candidate_rows += partition.candidates.Count();
+		has_preaggregates = has_preaggregates || !partition.preaggregated.empty();
+	}
+	if (has_preaggregates && metrics.Enabled()) {
+		// Raw candidates that arrived next to worker pre-aggregates, over every partition
+		GetEpochMetrics().RecordLocalKeyPreaggregationResidual(raw_candidate_rows);
 	}
 	if (keyed_commit_partitions.size() <= 1) {
 		return keyed_commit_partitions.size();
@@ -1641,17 +1646,23 @@ void RecursiveCTEState::PromoteKeyedState() {
 			                    }
 			                    return *split[partition_idx];
 		                    });
+		// The rows behind each group are only known in total, so attribute them by cumulative group share, which
+		// keeps the sum over the partitions exact
+		idx_t attributed_groups = 0;
+		idx_t attributed_rows = 0;
 		for (idx_t partition_idx = 0; partition_idx < partition_count; partition_idx++) {
 			if (!split[partition_idx]) {
 				continue;
 			}
 			RecursiveCTELocalPreaggregate entry;
 			entry.ht = std::move(split[partition_idx]);
-			// The rows behind each group are only known in total, so attribute them by group share
-			entry.candidate_rows = MaxValue<idx_t>(entry.ht->Count(), local_preaggregate.candidate_rows *
-			                                                              entry.ht->Count() / local_groups);
+			attributed_groups += entry.ht->Count();
+			const auto cumulative_rows = local_preaggregate.candidate_rows * attributed_groups / local_groups;
+			entry.candidate_rows = cumulative_rows - attributed_rows;
+			attributed_rows = cumulative_rows;
 			keyed_partitions[partition_idx]->preaggregated.push_back(std::move(entry));
 		}
+		D_ASSERT(attributed_groups == local_groups && attributed_rows == local_preaggregate.candidate_rows);
 	}
 	// Row addresses changed, so the indexes over them are rebuilt from the new partitions
 	RebuildPartialKeyIndexes();
