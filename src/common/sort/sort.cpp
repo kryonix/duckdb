@@ -207,6 +207,14 @@ unique_ptr<LocalSinkState> Sort::GetLocalSinkState(ExecutionContext &context) co
 	return make_uniq<SortLocalSinkState>(*this, context.client);
 }
 
+void Sort::ResetLocalSinkState(LocalSinkState &lstate_p) const {
+	auto &lstate = lstate_p.Cast<SortLocalSinkState>();
+	// Combine moved the run into the global state, Sink re-initializes it and refreshes the run limits
+	lstate.sorted_run.reset();
+	lstate.key.Reset();
+	lstate.payload.Reset();
+}
+
 unique_ptr<GlobalSinkState> Sort::GetGlobalSinkState(ClientContext &context) const {
 	return make_uniq<SortGlobalSinkState>(context);
 }
