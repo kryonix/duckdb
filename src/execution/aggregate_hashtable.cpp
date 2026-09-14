@@ -1015,6 +1015,16 @@ void GroupedAggregateHashTable::InitializeLookupState(AggregateHTLookupState &lo
 
 idx_t GroupedAggregateHashTable::LookupGroups(DataChunk &groups, AggregateHTLookupState &lookup_state,
                                               SelectionVector &found_groups_out) const {
+	if (groups.size() == 0) {
+		return 0;
+	}
+	groups.Hash(lookup_state.hashes);
+	return LookupGroups(groups, lookup_state.hashes, lookup_state, found_groups_out);
+}
+
+idx_t GroupedAggregateHashTable::LookupGroups(DataChunk &groups, Vector &group_hashes,
+                                              AggregateHTLookupState &lookup_state,
+                                              SelectionVector &found_groups_out) const {
 	D_ASSERT(groups.ColumnCount() + 1 == layout_ptr->ColumnCount());
 	const auto chunk_size = groups.size();
 	if (chunk_size == 0) {
@@ -1022,16 +1032,15 @@ idx_t GroupedAggregateHashTable::LookupGroups(DataChunk &groups, AggregateHTLook
 	}
 	InitializeLookupState(lookup_state);
 
-	groups.Hash(lookup_state.hashes);
 	for (idx_t group_idx = 0; group_idx < groups.ColumnCount(); group_idx++) {
 		lookup_state.group_chunk.data[group_idx].Reference(groups.data[group_idx]);
 	}
-	lookup_state.group_chunk.data[groups.ColumnCount()].Reference(lookup_state.hashes);
+	lookup_state.group_chunk.data[groups.ColumnCount()].Reference(group_hashes);
 	lookup_state.group_chunk.CheckCardinality(chunk_size);
 	TupleDataCollection::ToUnifiedFormat(lookup_state.chunk_state, lookup_state.group_chunk);
 
 	lookup_state.found_mask.SetAllInvalid(chunk_size);
-	const auto hashes = lookup_state.hashes.Values<hash_t>();
+	const auto hashes = group_hashes.Values<hash_t>();
 	const auto ht_offsets = FlatVector::GetDataMutable<uint64_t>(lookup_state.ht_offsets);
 	const auto hash_salts = FlatVector::GetDataMutable<hash_t>(lookup_state.hash_salts);
 	FlatVector::SetSize(lookup_state.addresses, chunk_size);
@@ -1170,7 +1179,10 @@ void GroupedAggregateHashTable::Combine(GroupedAggregateHashTable &other) {
 	auto other_partitioned_data = other.AcquirePartitionedData();
 	auto other_data = other_partitioned_data->GetUnpartitioned();
 	Combine(*other_data);
+	InheritAllocators(other);
+}
 
+void GroupedAggregateHashTable::InheritAllocators(GroupedAggregateHashTable &other) {
 	// Inherit ownership to all stored aggregate allocators
 	stored_allocators.emplace_back(other.aggregate_allocator);
 	for (const auto &stored_allocator : other.stored_allocators) {

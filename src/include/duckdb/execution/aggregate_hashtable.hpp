@@ -162,6 +162,9 @@ public:
 	//! Finds existing groups without changing the hash table. Returns the number of matches and writes input-row
 	//! indexes to found_groups_out. Matching row addresses are stored at their input-row indexes in state.addresses.
 	idx_t LookupGroups(DataChunk &groups, AggregateHTLookupState &state, SelectionVector &found_groups_out) const;
+	//! Same lookup with hashes the caller already computed, for instance to route the rows to a partition.
+	idx_t LookupGroups(DataChunk &groups, Vector &group_hashes, AggregateHTLookupState &state,
+	                   SelectionVector &found_groups_out) const;
 	//! Gathers matched group values from state.addresses in the order specified by found_groups.
 	void GatherGroups(AggregateHTLookupState &state, const SelectionVector &found_groups, idx_t found_count,
 	                  DataChunk &result) const;
@@ -199,6 +202,8 @@ public:
 	//! Executes the filter(if any) and update the aggregates
 	void Combine(GroupedAggregateHashTable &other);
 	void Combine(TupleDataCollection &other_data, optional_ptr<atomic<double>> progress = nullptr);
+	//! Keeps the aggregate allocators of `other` alive, for states combined from its rows
+	void InheritAllocators(GroupedAggregateHashTable &other);
 	//! Reset the HT for a new execution while reusing internal allocations where possible
 	void ResetForNewIteration(idx_t radix_bits);
 

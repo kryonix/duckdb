@@ -39,6 +39,7 @@ void RecursiveCTEPartialKeyIndex::AddGroups(DataChunk &full_keys, const Selectio
 	if (group_count == 0) {
 		return;
 	}
+	lock_guard<mutex> guard(lock);
 	while (entries.size() + group_count > heads.size()) {
 		Resize(heads.size() * 2);
 	}
@@ -71,6 +72,12 @@ const RecursiveCTEPartialKeyIndex::Entry &RecursiveCTEPartialKeyIndex::GetEntry(
 
 idx_t RecursiveCTEPartialKeyIndex::Count() const {
 	return entries.size();
+}
+
+void RecursiveCTEPartialKeyIndex::Clear() {
+	lock_guard<mutex> guard(lock);
+	entries.clear();
+	std::fill(heads.begin(), heads.end(), DConstants::INVALID_INDEX);
 }
 
 idx_t RecursiveCTEPartialKeyIndex::SizeInBytes() const {
@@ -273,7 +280,20 @@ void RecursiveCTEMetrics::RecordPartialProbeChainVisits(idx_t count) {
 }
 
 void RecursiveCTEMetrics::RecordPartialIndexBuild(idx_t elapsed_us_p) {
-	partial_index_build_us += elapsed_us_p;
+	partial_index_build_us.fetch_add(elapsed_us_p);
+}
+
+void RecursiveCTEMetrics::RecordKeyedPartitions(idx_t partitions) {
+	keyed_partitions = partitions;
+}
+
+void RecursiveCTEMetrics::RecordKeyedCommit(idx_t partitions) {
+	keyed_commits++;
+	keyed_commit_partitions += partitions;
+}
+
+void RecursiveCTEMetrics::RecordKeyedCommitTask() {
+	keyed_commit_tasks.fetch_add(1);
 }
 
 void RecursiveCTEMetrics::RecordFinalStateRows(idx_t rows) {
@@ -299,6 +319,19 @@ void RecursiveCTEMetrics::LogDistinctPromotion(idx_t partitions, idx_t migrated_
 	D_ASSERT(identity);
 	DUCKDB_LOG(logger, PhysicalOperatorLogType, identity->operator_type, identity->operator_parameters,
 	           "PhysicalRecursiveCTE", "DistinctPromoted",
+	           {{"invocation_id", to_string(identity->invocation_id)},
+	            {"partitions", to_string(partitions)},
+	            {"migrated_rows", to_string(migrated_rows)},
+	            {"elapsed_us", to_string(elapsed_us_p)}});
+}
+
+void RecursiveCTEMetrics::LogKeyedPromotion(idx_t partitions, idx_t migrated_rows, idx_t elapsed_us_p) const {
+	if (!enabled) {
+		return;
+	}
+	D_ASSERT(identity);
+	DUCKDB_LOG(logger, PhysicalOperatorLogType, identity->operator_type, identity->operator_parameters,
+	           "PhysicalRecursiveCTE", "KeyedPromoted",
 	           {{"invocation_id", to_string(identity->invocation_id)},
 	            {"partitions", to_string(partitions)},
 	            {"migrated_rows", to_string(migrated_rows)},
@@ -335,10 +368,14 @@ void RecursiveCTEMetrics::Log(const vector<unique_ptr<RecursiveCTEPartialKeyInde
 	            {"direct_probe_rows", to_string(direct_probe_rows.load())},
 	            {"direct_probe_matches", to_string(direct_probe_matches.load())},
 	            {"partial_probe_chain_visits", to_string(partial_probe_chain_visits.load())},
-	            {"partial_index_build_us", to_string(partial_index_build_us)},
+	            {"partial_index_build_us", to_string(partial_index_build_us.load())},
 	            {"partial_index_rows", to_string(partial_index_rows)},
 	            {"partial_index_bytes", to_string(partial_index_bytes)},
 	            {"final_state_rows", to_string(final_state_rows.load())},
+	            {"keyed_partitions", to_string(keyed_partitions)},
+	            {"keyed_commits", to_string(keyed_commits)},
+	            {"keyed_commit_partitions", to_string(keyed_commit_partitions)},
+	            {"keyed_commit_tasks", to_string(keyed_commit_tasks.load())},
 	            {"retained_build_executions", to_string(retained_build_executions)},
 	            {"retained_cte_materializations", to_string(retained_cte_materializations)},
 	            {"retained_cte_reuses", to_string(retained_cte_reuses)}});

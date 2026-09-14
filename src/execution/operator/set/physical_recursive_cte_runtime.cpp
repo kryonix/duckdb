@@ -75,9 +75,9 @@ static idx_t GetRecursiveWorkUnits(const RecursiveCTEState &state, idx_t direct_
 		work_units += state.CurrentInputTable().ChunkCount() * references.frontier_scans;
 	}
 	if (op.recurring_table && references.recurring_scans > 0) {
-		const auto recurring_chunks =
-		    op.using_key ? (state.GetHashTable().Count() + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE
-		                 : op.recurring_table->ChunkCount();
+		const auto recurring_chunks = op.using_key
+		                                  ? (state.KeyedGroupCount() + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE
+		                                  : op.recurring_table->ChunkCount();
 		work_units += recurring_chunks * references.recurring_scans;
 	}
 	// Direct probes consume their visible input without scanning the frozen recurring state. Recursive probe inputs
@@ -94,7 +94,7 @@ static idx_t GetRecursiveInputRows(const RecursiveCTEState &state) {
 		recursive_rows += state.CurrentInputTable().Count() * references.frontier_scans;
 	}
 	if (op.recurring_table && references.recurring_scans > 0) {
-		const auto recurring_rows = op.using_key ? state.GetHashTable().Count() : op.recurring_table->Count();
+		const auto recurring_rows = op.using_key ? state.KeyedGroupCount() : op.recurring_table->Count();
 		recursive_rows += recurring_rows * references.recurring_scans;
 	}
 	return recursive_rows;
@@ -350,6 +350,83 @@ public:
 		}
 	}
 };
+
+//! Commits the keyed partitions of one epoch on several tasks; the last task assembles the next frontier.
+class RecursiveCTEKeyedCommitEvent : public BasePipelineEvent {
+public:
+	RecursiveCTEKeyedCommitEvent(Pipeline &pipeline_p, RecursiveCTEState &state_p, idx_t task_count_p)
+	    : BasePipelineEvent(pipeline_p), state(state_p), task_count(task_count_p) {
+	}
+
+	RecursiveCTEState &state;
+	idx_t task_count;
+
+	void Schedule() override;
+
+	void FinishEvent() override {
+		state.FinishKeyedCommit();
+	}
+};
+
+class RecursiveCTEKeyedCommitTask : public ExecutorTask {
+public:
+	RecursiveCTEKeyedCommitTask(Pipeline &pipeline, shared_ptr<Event> event_p, RecursiveCTEState &state_p)
+	    : ExecutorTask(pipeline.executor, std::move(event_p)), state(state_p) {
+	}
+
+	RecursiveCTEState &state;
+
+	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
+		if (state.GetMetrics().Enabled()) {
+			state.GetMetrics().RecordKeyedCommitTask();
+		}
+		while (true) {
+			const auto partition_idx = state.NextKeyedCommitPartition();
+			if (partition_idx == DConstants::INVALID_INDEX) {
+				break;
+			}
+			state.CommitKeyedPartition(partition_idx);
+		}
+		event->FinishTask();
+		return TaskExecutionResult::TASK_FINISHED;
+	}
+
+	string TaskType() const override {
+		return "RecursiveCTEKeyedCommitTask";
+	}
+};
+
+void RecursiveCTEKeyedCommitEvent::Schedule() {
+	vector<shared_ptr<Task>> tasks;
+	tasks.reserve(task_count);
+	for (idx_t task_idx = 0; task_idx < task_count; task_idx++) {
+		tasks.push_back(make_uniq<RecursiveCTEKeyedCommitTask>(*pipeline, shared_from_this(), state));
+	}
+	SetTasks(std::move(tasks));
+}
+
+SinkFinalizeType PhysicalRecursiveCTE::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+                                                OperatorSinkFinalizeInput &input) const {
+	if (!using_key) {
+		return SinkFinalizeType::READY;
+	}
+	auto &gstate = input.global_state.Cast<RecursiveCTEState>();
+	const auto task_count = gstate.PrepareKeyedCommit();
+	if (task_count <= 1) {
+		const auto commit_rows = gstate.PreparedKeyedCommitRows();
+		const auto commit_start = std::chrono::steady_clock::now();
+		gstate.CommitKeyedPartitionsInline();
+		const auto commit_end = std::chrono::steady_clock::now();
+		gstate.RecordKeyedCommitTime(
+		    NumericCast<idx_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(commit_end - commit_start).count()),
+		    commit_rows);
+		return SinkFinalizeType::READY;
+	}
+	// Everything waiting on this finish now waits on the commit instead
+	auto commit_event = make_shared_ptr<RecursiveCTEKeyedCommitEvent>(pipeline, gstate, task_count);
+	event.InsertEvent(std::move(commit_event));
+	return SinkFinalizeType::READY;
+}
 
 static bool IsDirectRecursiveKeyProbe(const PhysicalOperator &op, TableIndex cte_index) {
 	if (op.type != PhysicalOperatorType::RECURSIVE_KEY_JOIN) {
@@ -758,10 +835,10 @@ static void ScheduleRecursivePlan(const RecursiveCTEPipelineSchedulePlan &plan, 
 		pipeline.get().ResetSource(true);
 	}
 
+	auto &op = state.GetOperator();
 	const auto configured_threads =
-	    TaskScheduler::GetScheduler(state.GetOperator().recursive_meta_pipeline->GetExecutor().context)
-	        .NumberOfThreads();
-	events.reserve(plan.stages.size());
+	    TaskScheduler::GetScheduler(op.recursive_meta_pipeline->GetExecutor().context).NumberOfThreads();
+	events.reserve(plan.stages.size() + 1);
 	for (auto &stage : plan.stages) {
 		auto pipeline = stage.pipeline.get().shared_from_this();
 		switch (stage.type) {
@@ -785,6 +862,19 @@ static void ScheduleRecursivePlan(const RecursiveCTEPipelineSchedulePlan &plan, 
 	for (idx_t stage_idx = 0; stage_idx < plan.stages.size(); stage_idx++) {
 		for (auto dependent_stage : plan.stages[stage_idx].dependents) {
 			events[dependent_stage]->AddDependency(*events[stage_idx]);
+		}
+	}
+	if (op.using_key) {
+		// The keyed commit may insert an event behind the finish of the sink pipeline; a sentinel that depends on
+		// that finish inherits the inserted event, so waiting for the sentinel waits for the commit.
+		for (idx_t stage_idx = 0; stage_idx < plan.stages.size(); stage_idx++) {
+			auto &stage = plan.stages[stage_idx];
+			if (stage.type != PipelineScheduleStageType::FINISH || stage.pipeline.get().GetSink().get() != &op) {
+				continue;
+			}
+			auto sentinel = make_shared_ptr<PipelineCompleteEvent>(stage.pipeline.get().executor, false);
+			sentinel->AddDependency(*events[stage_idx]);
+			events.push_back(std::move(sentinel));
 		}
 	}
 

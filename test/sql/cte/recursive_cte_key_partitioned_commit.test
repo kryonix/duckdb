@@ -1,0 +1,325 @@
+# name: test/sql/cte/recursive_cte_key_partitioned_commit.test
+# description: USING KEY state is split into partitions that commit on several tasks once the commit is worth it
+# group: [cte]
+
+statement ok
+SET threads=8;
+
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# A large anchor partitions the state before the first epoch, so every commit spreads over tasks.
+query III
+WITH RECURSIVE t(k, v) USING KEY (k, max(v)) AS (
+	SELECT i, 0 FROM range(40000) r(i)
+	UNION
+	SELECT k, v + 1 FROM t WHERE v < 3
+)
+SELECT count(*), sum(v)::BIGINT, sum(k * v)::BIGINT FROM t;
+----
+40000	120000	2399940000
+
+statement ok
+CALL disable_logging();
+
+query IIII
+SELECT info.keyed_partitions::UBIGINT > 1,
+       info.keyed_commits::UBIGINT = info.epochs::UBIGINT + 1,
+       info.keyed_commit_partitions::UBIGINT > info.keyed_commits::UBIGINT,
+       info.keyed_commit_tasks::UBIGINT > info.keyed_commits::UBIGINT
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
+----
+true	true	true	true
+
+query II
+SELECT info.partitions::UBIGINT > 1, info.migrated_rows::UBIGINT
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'KeyedPromoted';
+----
+true	0
+
+# A recursion that starts small promotes once its frontier grows, migrating the frozen state and the candidates.
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query III
+WITH RECURSIVE t(k, v, l) USING KEY (k, max(v), list(l)) AS (
+	SELECT 0::BIGINT, 0, 'root'
+	UNION
+	SELECT k * 200 + r, v + 1, 'level ' || (v + 1)
+	FROM t, range(200) rr(r)
+	WHERE v < 2
+)
+SELECT count(*), sum(v)::BIGINT, sum(len(l))::BIGINT FROM t;
+----
+40000	80000	40201
+
+statement ok
+CALL disable_logging();
+
+query II
+SELECT info.partitions::UBIGINT > 1, info.migrated_rows::UBIGINT
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'KeyedPromoted';
+----
+true	200
+
+# The migrated list states still read back the same values as a single-threaded run.
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TABLE expected_lists AS
+WITH RECURSIVE t(k, v, l) USING KEY (k, max(v), list(l)) AS (
+	SELECT 0::BIGINT, 0, 'root'
+	UNION
+	SELECT k * 200 + r, v + 1, 'level ' || (v + 1)
+	FROM t, range(200) rr(r)
+	WHERE v < 2
+)
+SELECT k, v, list_sort(l) AS l FROM t;
+
+statement ok
+SET threads=8;
+
+query II
+WITH RECURSIVE t(k, v, l) USING KEY (k, max(v), list(l)) AS (
+	SELECT 0::BIGINT, 0, 'root'
+	UNION
+	SELECT k * 200 + r, v + 1, 'level ' || (v + 1)
+	FROM t, range(200) rr(r)
+	WHERE v < 2
+),
+actual AS (SELECT k, v, list_sort(l) AS l FROM t)
+SELECT (SELECT count(*) FROM (TABLE actual EXCEPT TABLE expected_lists)),
+       (SELECT count(*) FROM (TABLE expected_lists EXCEPT TABLE actual));
+----
+0	0
+
+# Worker pre-aggregates of a fan-in anchor are split along with the state.
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query III
+WITH RECURSIVE t(k, v) USING KEY (k, max(v)) AS (
+	SELECT i % 100, i FROM range(60000) r(i)
+	UNION
+	SELECT k, v + 1 FROM t WHERE v < 60001
+)
+SELECT count(*), min(v), max(v) FROM t;
+----
+100	60001	60001
+
+statement ok
+CALL disable_logging();
+
+query III
+SELECT info.partitions::UBIGINT > 1, info.migrated_rows::UBIGINT,
+       (SELECT info.local_key_preaggregation_states::UBIGINT > 0
+        FROM duckdb_logs_parsed('PhysicalOperator')
+        WHERE class = 'PhysicalRecursiveCTE' AND event = 'EpochSummary')
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'KeyedPromoted';
+----
+true	0	true
+
+# Partial-key indexes are rebuilt from the new partitions when a recursion promotes late.
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN WITH RECURSIVE t(a, b, v) USING KEY (a, b, max(v)) AS (
+	SELECT 0, 0, 0
+	UNION
+	(SELECT n.a * 150 + r, r % 7, n.v + 1
+	FROM t n, range(150) rr(r)
+	WHERE n.v < 2
+	UNION ALL
+	SELECT r.a, r.b, n.v + 10
+	FROM t n JOIN recurring.t r ON r.a = n.a
+	WHERE n.v = 2)
+)
+SELECT * FROM t;
+----
+physical_plan	<REGEX>:.*RECURSIVE_PARTIAL_KEY_JOIN.*
+
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE TABLE expected_partial AS
+WITH RECURSIVE t(a, b, v) USING KEY (a, b, max(v)) AS (
+	SELECT 0, 0, 0
+	UNION
+	(SELECT n.a * 150 + r, r % 7, n.v + 1
+	FROM t n, range(150) rr(r)
+	WHERE n.v < 2
+	UNION ALL
+	SELECT r.a, r.b, n.v + 10
+	FROM t n JOIN recurring.t r ON r.a = n.a
+	WHERE n.v = 2)
+)
+SELECT * FROM t;
+
+statement ok
+CALL disable_logging();
+
+query II
+SELECT count(*), sum(v)::BIGINT FROM expected_partial;
+----
+22500	270000
+
+query II
+SELECT info.partitions::UBIGINT > 1, info.migrated_rows::UBIGINT
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'KeyedPromoted';
+----
+true	150
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TABLE expected_partial_serial AS
+WITH RECURSIVE t(a, b, v) USING KEY (a, b, max(v)) AS (
+	SELECT 0, 0, 0
+	UNION
+	(SELECT n.a * 150 + r, r % 7, n.v + 1
+	FROM t n, range(150) rr(r)
+	WHERE n.v < 2
+	UNION ALL
+	SELECT r.a, r.b, n.v + 10
+	FROM t n JOIN recurring.t r ON r.a = n.a
+	WHERE n.v = 2)
+)
+SELECT * FROM t;
+
+statement ok
+SET threads=8;
+
+query II
+SELECT (SELECT count(*) FROM (TABLE expected_partial EXCEPT TABLE expected_partial_serial)),
+       (SELECT count(*) FROM (TABLE expected_partial_serial EXCEPT TABLE expected_partial));
+----
+0	0
+
+# Collated and NULL keys route to the same partition as their state row.
+statement ok
+CREATE TABLE expected_collated AS
+WITH RECURSIVE t(s, v) USING KEY (s, max(v)) AS (
+	SELECT CASE WHEN i % 1000 = 0 THEN NULL ELSE 'Key ' || (i % 20000) END COLLATE NOCASE, 0 FROM range(40000) r(i)
+	UNION
+	SELECT upper(s), v + 1 FROM t WHERE v < 2
+)
+SELECT s, v FROM t;
+
+query III
+SELECT count(*), sum(v)::BIGINT, count(*) FILTER (WHERE s IS NULL) FROM expected_collated;
+----
+19981	39962	1
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TABLE expected_collated_serial AS
+WITH RECURSIVE t(s, v) USING KEY (s, max(v)) AS (
+	SELECT CASE WHEN i % 1000 = 0 THEN NULL ELSE 'Key ' || (i % 20000) END COLLATE NOCASE, 0 FROM range(40000) r(i)
+	UNION
+	SELECT upper(s), v + 1 FROM t WHERE v < 2
+)
+SELECT s, v FROM t;
+
+statement ok
+SET threads=8;
+
+query II
+SELECT (SELECT count(*) FROM (TABLE expected_collated EXCEPT TABLE expected_collated_serial)),
+       (SELECT count(*) FROM (TABLE expected_collated_serial EXCEPT TABLE expected_collated));
+----
+0	0
+
+# UNION ALL keeps every candidate as a next-epoch row across partitions.
+query II
+WITH RECURSIVE t(k, v) USING KEY (k) AS (
+	SELECT i, 0 FROM range(40000) r(i)
+	UNION ALL
+	SELECT k, v + 1 FROM t WHERE v < 2
+)
+SELECT count(*), sum(v)::BIGINT FROM t;
+----
+40000	80000
+
+# Direct probes look their keys up in the right partition.
+query II
+WITH RECURSIVE t(k, v) USING KEY (k, max(v)) AS (
+	SELECT i, 0 FROM range(40000) r(i)
+	UNION
+	SELECT n.k, r.v + 1 FROM t n JOIN recurring.t r USING (k) WHERE n.v < 3
+)
+SELECT count(*), sum(v)::BIGINT FROM t;
+----
+40000	120000
+
+# Fresh operator states each epoch take the same partitioned path.
+statement ok
+SET enable_caching_operators=false;
+
+query III
+WITH RECURSIVE t(k, v) USING KEY (k, max(v)) AS (
+	SELECT i, 0 FROM range(40000) r(i)
+	UNION
+	SELECT k, v + 1 FROM t WHERE v < 3
+)
+SELECT count(*), sum(v)::BIGINT, sum(k * v)::BIGINT FROM t;
+----
+40000	120000	2399940000
+
+statement ok
+SET enable_caching_operators=true;
+
+# A single thread never partitions.
+statement ok
+SET threads=1;
+
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query III
+WITH RECURSIVE t(k, v) USING KEY (k, max(v)) AS (
+	SELECT i, 0 FROM range(40000) r(i)
+	UNION
+	SELECT k, v + 1 FROM t WHERE v < 3
+)
+SELECT count(*), sum(v)::BIGINT, sum(k * v)::BIGINT FROM t;
+----
+40000	120000	2399940000
+
+statement ok
+CALL disable_logging();
+
+query II
+SELECT info.keyed_partitions::UBIGINT, info.keyed_commit_tasks::UBIGINT
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
+----
+1	0
