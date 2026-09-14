@@ -277,7 +277,7 @@ void RecursiveCTEMetrics::RecordPartialIndexBuild(idx_t elapsed_us_p) {
 }
 
 void RecursiveCTEMetrics::RecordFinalStateRows(idx_t rows) {
-	final_state_rows += rows;
+	final_state_rows.fetch_add(rows);
 }
 
 void RecursiveCTEMetrics::RecordRetainedBuild() {
@@ -338,7 +338,7 @@ void RecursiveCTEMetrics::Log(const vector<unique_ptr<RecursiveCTEPartialKeyInde
 	            {"partial_index_build_us", to_string(partial_index_build_us)},
 	            {"partial_index_rows", to_string(partial_index_rows)},
 	            {"partial_index_bytes", to_string(partial_index_bytes)},
-	            {"final_state_rows", to_string(final_state_rows)},
+	            {"final_state_rows", to_string(final_state_rows.load())},
 	            {"retained_build_executions", to_string(retained_build_executions)},
 	            {"retained_cte_materializations", to_string(retained_cte_materializations)},
 	            {"retained_cte_reuses", to_string(retained_cte_reuses)}});

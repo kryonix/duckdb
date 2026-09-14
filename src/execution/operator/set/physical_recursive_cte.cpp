@@ -7,6 +7,8 @@
 #include "duckdb/parallel/pipeline_executor.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
+#include "duckdb/common/radix_partitioning.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 
 #include "duckdb/main/settings.hpp"
 
@@ -54,7 +56,8 @@ RecursiveCTEState::RecursiveCTEState(ClientContext &context, const PhysicalRecur
       allow_executor_reuse(Settings::Get<EnableCachingOperatorsSetting>(context)), metrics(context, op),
       scheduler(op.shared_executor_pool, allow_executor_reuse),
       intermediate_table(context, op.using_key ? op.internal_types : op.GetTypes()), context(context),
-      preaggregation_hashes(LogicalType::HASH, nullptr, 0) {
+      preaggregation_hashes(LogicalType::HASH, nullptr, 0), drain_arena(Allocator::Get(context)),
+      drain_row_state(drain_arena) {
 	if (metrics.Enabled()) {
 		epoch_metrics = make_uniq<RecursiveCTEEpochMetrics>();
 	}
@@ -1156,6 +1159,12 @@ void RecursiveCTEState::CommitPreaggregatedUsingKeyUpdatesInternal() {
 	}
 }
 
+void RecursiveCTEState::InitializeFinalStateDrain() {
+	ht->InitializeParallelScan(drain_scan);
+	// The local state re-initializes itself on the first partition it visits
+	drain_local_scan.partition_idx = DConstants::INVALID_INDEX;
+}
+
 void RecursiveCTEState::CommitUsingKeyUpdates() {
 	if (metrics.Enabled()) {
 		CommitUsingKeyUpdatesInternal<true>();
@@ -1166,23 +1175,31 @@ void RecursiveCTEState::CommitUsingKeyUpdates() {
 
 class RecursiveCTEStateScanGlobalState : public GlobalSourceState {
 public:
-	mutex lock;
-	AggregateHTScanState scan_state;
-	bool initialized = false;
+	RecursiveCTEStateScanGlobalState(ClientContext &context, GroupedAggregateHashTable &ht) {
+		ht.InitializeParallelScan(scan);
+		max_threads = MinValue<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads(),
+		                              MaxValue<idx_t>(ht.ChunkCount(), 1));
+	}
+
+	idx_t MaxThreads() override {
+		return max_threads;
+	}
+
+	AggregateHTParallelScanState scan;
+	idx_t max_threads = 1;
 };
 
 class RecursiveCTEStateScanLocalState : public LocalSourceState {
 public:
 	RecursiveCTEStateScanLocalState(ClientContext &context, const PhysicalRecursiveCTE &op)
-	    : found_groups(STANDARD_VECTOR_SIZE), arena(Allocator::Get(context)), row_state(arena) {
+	    : arena(Allocator::Get(context)), row_state(arena) {
 		distinct_rows.Initialize(Allocator::Get(context), op.hash_key_types);
 		aggregate_rows.Initialize(Allocator::Get(context), op.aggregate_types);
 	}
 
 	DataChunk distinct_rows;
 	DataChunk aggregate_rows;
-	AggregateHTLookupState lookup_state;
-	SelectionVector found_groups;
+	AggregateHTLocalScanState scan;
 	ArenaAllocator arena;
 	RowOperationsState row_state;
 };
@@ -1201,7 +1218,12 @@ unique_ptr<GlobalSourceState>
 PhysicalRecursiveCTEStateScan::GetGlobalSourceState(ClientContext &context,
                                                     const OperatorPartitionInfo &partition_info) const {
 	(void)partition_info;
-	return make_uniq<RecursiveCTEStateScanGlobalState>();
+	if (!recursive_cte || !recursive_cte->sink_state) {
+		throw InternalException("USING KEY state scan has no recursive state");
+	}
+	// The state is frozen for the epoch once the scan is scheduled, so its chunk count bounds the scan tasks
+	auto &recursive_state = recursive_cte->sink_state->Cast<RecursiveCTEState>();
+	return make_uniq<RecursiveCTEStateScanGlobalState>(context, recursive_state.GetHashTable());
 }
 
 unique_ptr<LocalSourceState> PhysicalRecursiveCTEStateScan::GetLocalSourceState(ExecutionContext &context,
@@ -1233,34 +1255,20 @@ SourceResultType PhysicalRecursiveCTEStateScan::GetDataFromState(DataChunk &chun
                                                                  RecursiveCTEState &recursive_state) const {
 	auto &gstate = input.global_state.Cast<RecursiveCTEStateScanGlobalState>();
 	auto &lstate = input.local_state.Cast<RecursiveCTEStateScanLocalState>();
-	while (true) {
-		{
-			lock_guard<mutex> guard(gstate.lock);
-			if (!gstate.initialized) {
-				recursive_state.GetHashTable().InitializeScan(gstate.scan_state);
-				gstate.initialized = true;
-			}
-			if (!recursive_state.GetHashTable().ScanGroups(gstate.scan_state, lstate.distinct_rows)) {
-				return SourceResultType::FINISHED;
-			}
-		}
+	auto &ht = recursive_state.GetHashTable();
+	while (ht.ScanGroups(gstate.scan, lstate.scan, lstate.distinct_rows)) {
 		if (lstate.distinct_rows.size() == 0) {
 			continue;
 		}
-		const auto group_count = lstate.distinct_rows.size();
-		const auto found_count =
-		    recursive_state.GetHashTable().LookupGroups(lstate.distinct_rows, lstate.lookup_state, lstate.found_groups);
-		if (found_count != group_count) {
-			throw InternalException("USING KEY state scan could not find %d of %d frozen groups",
-			                        group_count - found_count, group_count);
-		}
-		recursive_state.FinalizeStateRows(lstate.row_state, lstate.lookup_state.addresses, lstate.distinct_rows,
-		                                  lstate.aggregate_rows, chunk);
+		// The scan already located every row, finalize straight from its addresses
+		recursive_state.FinalizeStateRows(lstate.row_state, GroupedAggregateHashTable::ScannedRowLocations(lstate.scan),
+		                                  lstate.distinct_rows, lstate.aggregate_rows, chunk);
 		if (recursive_state.GetMetrics().Enabled()) {
 			recursive_state.GetMetrics().RecordRecurringScanRows(chunk.size());
 		}
 		return SourceResultType::HAVE_MORE_OUTPUT;
 	}
+	return SourceResultType::FINISHED;
 }
 
 InsertionOrderPreservingMap<string> PhysicalRecursiveCTEStateScan::ParamsToString() const {
@@ -1392,7 +1400,7 @@ SourceResultType RecursiveCTEState::GetUsingKeyDataInternal(ExecutionContext &co
 			} else {
 				expected_new = op.working_table->Count();
 				if (expected_new == 0) {
-					ht->InitializeScan(ht_scan_state);
+					InitializeFinalStateDrain();
 					source_phase = RecursiveCTESourcePhase::DRAINING_FINAL_KEY_STATE;
 					break;
 				}
@@ -1409,7 +1417,7 @@ SourceResultType RecursiveCTEState::GetUsingKeyDataInternal(ExecutionContext &co
 			op.ExecuteRecursivePipelines(context);
 			const auto next_count = op.union_all ? intermediate_table.Count() : op.working_table->Count();
 			if (next_count == 0) {
-				ht->InitializeScan(ht_scan_state);
+				InitializeFinalStateDrain();
 				source_phase = RecursiveCTESourcePhase::DRAINING_FINAL_KEY_STATE;
 			}
 			break;
@@ -1417,10 +1425,12 @@ SourceResultType RecursiveCTEState::GetUsingKeyDataInternal(ExecutionContext &co
 		case RecursiveCTESourcePhase::DRAINING_FINAL_KEY_STATE: {
 			const auto drain_start =
 			    COLLECT_METRICS ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-			while (ht->Scan(ht_scan_state, source_distinct_rows, source_aggregate_rows)) {
+			while (ht->ScanGroups(drain_scan, drain_local_scan, source_distinct_rows)) {
 				if (source_distinct_rows.size() == 0) {
 					continue;
 				}
+				FinalizeAggregateRows(drain_row_state, GroupedAggregateHashTable::ScannedRowLocations(drain_local_scan),
+				                      source_aggregate_rows, source_distinct_rows.size());
 				AssembleStateRows(source_distinct_rows, source_aggregate_rows, chunk);
 				if constexpr (COLLECT_METRICS) {
 					metrics.RecordFinalStateRows(chunk.size());

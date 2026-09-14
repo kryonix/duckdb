@@ -1,0 +1,89 @@
+# name: test/sql/cte/recursive_cte_key_parallel_recurring_scan.test
+# description: Recurring-state scans finalize from scanned row locations on several tasks per epoch
+# group: [cte]
+
+require vector_size 2048
+
+statement ok
+SET threads=8;
+
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# A filter on the recurring state keeps the generic state scan instead of a direct probe.
+query IIIII
+WITH RECURSIVE t(k, v) USING KEY (k, max(v)) AS (
+	SELECT i, 0 FROM range(32768) r(i)
+	UNION
+	SELECT n.k, r.v + 1
+	FROM t n JOIN (SELECT * FROM recurring.t WHERE v < 4) r USING (k)
+)
+SELECT count(*), min(v), max(v), sum(v)::BIGINT, sum(k * v)::BIGINT FROM t;
+----
+32768	4	4	131072	2147418112
+
+statement ok
+CALL disable_logging();
+
+# Every epoch, including the final empty one, scans the complete frozen state once and no probe bypasses it.
+query IIII
+SELECT info.recurring_scan_rows::UBIGINT = 32768 * 5,
+       info.direct_probe_rows::UBIGINT = 0,
+       info.epochs::UBIGINT = 5,
+       info.scheduled_tasks::UBIGINT > info.epochs::UBIGINT
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
+----
+true	true	true	true
+
+query I
+SELECT info.recurring_scan_work_ns::UBIGINT > 0
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'EpochSummary';
+----
+true
+
+# Nested payload aggregates go through the same scanned-address finalize.
+query IIII
+WITH RECURSIVE t(k, v, l) USING KEY (k, max(v), list(l)) AS (
+	SELECT i, 0, i::VARCHAR FROM range(32768) r(i)
+	UNION
+	SELECT n.k, r.v + 1, (r.v + 1)::VARCHAR
+	FROM t n JOIN (SELECT * FROM recurring.t WHERE v < 3) r USING (k)
+)
+SELECT count(*), max(v), sum(len(l))::BIGINT, sum(v)::BIGINT FROM t;
+----
+32768	3	131072	98304
+
+# The final state drain finalizes each frozen state once, matching the single-threaded result.
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TABLE expected AS
+WITH RECURSIVE t(k, v, l) USING KEY (k, max(v), list(l)) AS (
+	SELECT i, 0, i::VARCHAR FROM range(32768) r(i)
+	UNION
+	SELECT n.k, r.v + 1, (r.v + 1)::VARCHAR
+	FROM t n JOIN (SELECT * FROM recurring.t WHERE v < 3) r USING (k)
+)
+SELECT * FROM t;
+
+statement ok
+SET threads=8;
+
+query II
+WITH RECURSIVE t(k, v, l) USING KEY (k, max(v), list(l)) AS (
+	SELECT i, 0, i::VARCHAR FROM range(32768) r(i)
+	UNION
+	SELECT n.k, r.v + 1, (r.v + 1)::VARCHAR
+	FROM t n JOIN (SELECT * FROM recurring.t WHERE v < 3) r USING (k)
+),
+actual AS (SELECT * FROM t)
+SELECT (SELECT count(*) FROM (TABLE actual EXCEPT TABLE expected)),
+       (SELECT count(*) FROM (TABLE expected EXCEPT TABLE actual));
+----
+0	0

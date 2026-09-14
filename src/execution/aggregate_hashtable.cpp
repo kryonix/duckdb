@@ -1241,6 +1241,61 @@ bool GroupedAggregateHashTable::ScanGroups(AggregateHTScanState &scan_state, Dat
 	}
 }
 
+void GroupedAggregateHashTable::InitializeParallelScan(AggregateHTParallelScanState &gstate) {
+	gstate.partition_idx = 0;
+	gstate.column_ids.clear();
+	for (idx_t group_idx = 0; group_idx + 1 < layout_ptr->ColumnCount(); group_idx++) {
+		gstate.column_ids.push_back(group_idx);
+	}
+	gstate.partition_scans.clear();
+	for (auto &partition : partitioned_data->GetPartitions()) {
+		auto scan = make_uniq<TupleDataParallelScanState>();
+		partition->InitializeScan(*scan, gstate.column_ids);
+		gstate.partition_scans.push_back(std::move(scan));
+	}
+}
+
+bool GroupedAggregateHashTable::ScanGroups(AggregateHTParallelScanState &gstate, AggregateHTLocalScanState &lstate,
+                                           DataChunk &groups) {
+	auto &partitions = partitioned_data->GetPartitions();
+	while (true) {
+		idx_t partition_idx;
+		{
+			lock_guard<mutex> guard(gstate.lock);
+			partition_idx = gstate.partition_idx;
+		}
+		if (partition_idx >= partitions.size()) {
+			groups.SetChildCardinality(0);
+			return false;
+		}
+		auto &partition = *partitions[partition_idx];
+		if (lstate.partition_idx != partition_idx) {
+			// The local state must point at the partition before the shared cursor hands out its chunks
+			partition.InitializeScan(lstate.scan_state, gstate.column_ids);
+			lstate.partition_idx = partition_idx;
+		}
+		if (partition.Scan(*gstate.partition_scans[partition_idx], lstate.scan_state, groups)) {
+			return true;
+		}
+		lock_guard<mutex> guard(gstate.lock);
+		if (gstate.partition_idx == partition_idx) {
+			gstate.partition_idx++;
+		}
+	}
+}
+
+Vector &GroupedAggregateHashTable::ScannedRowLocations(AggregateHTLocalScanState &lstate) {
+	return lstate.scan_state.chunk_state.row_locations;
+}
+
+idx_t GroupedAggregateHashTable::ChunkCount() const {
+	idx_t chunk_count = 0;
+	for (auto &partition : partitioned_data->GetPartitions()) {
+		chunk_count += partition->ChunkCount();
+	}
+	return chunk_count;
+}
+
 bool GroupedAggregateHashTable::Scan(AggregateHTScanState &scan_state, DataChunk &distinct_rows,
                                      DataChunk &payload_rows) {
 	payload_rows.Reset();
