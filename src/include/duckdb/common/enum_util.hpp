@@ -174,6 +174,8 @@ enum class DebugInitialize : uint8_t;
 
 enum class DebugOrderVerification : uint8_t;
 
+enum class DebugSQLExportVerification : uint8_t;
+
 enum class DebugStatementVerification : uint8_t;
 
 enum class DebugVectorVerification : uint8_t;
@@ -332,6 +334,12 @@ enum class LogicalOperatorRepeatability : uint8_t;
 
 enum class LogicalOperatorType : uint8_t;
 
+enum class LogicalPlanVerificationIssueCode : int32_t;
+
+enum class LogicalPlanVerificationPathComponentType : int32_t;
+
+enum class LogicalPlanVerificationPhase : int32_t;
+
 enum class LogicalTypeId : uint8_t;
 
 enum class LookupResultType : uint8_t;
@@ -485,6 +493,14 @@ enum class ResultOrdering : uint8_t;
 enum class RowGroupAppendMode : uint8_t;
 
 enum class RowIdHandling : uint8_t;
+
+enum class SQLExportComparability : uint8_t;
+
+enum class SQLExportExecutionRoute : uint8_t;
+
+enum class SQLExportExecutionStatus : uint8_t;
+
+enum class SQLExportOutcome : uint8_t;
 
 enum class SampleMethod : uint8_t;
 
@@ -861,6 +877,9 @@ template<>
 const char* EnumUtil::ToChars<DebugOrderVerification>(DebugOrderVerification value);
 
 template<>
+const char* EnumUtil::ToChars<DebugSQLExportVerification>(DebugSQLExportVerification value);
+
+template<>
 const char* EnumUtil::ToChars<DebugStatementVerification>(DebugStatementVerification value);
 
 template<>
@@ -1098,6 +1117,15 @@ template<>
 const char* EnumUtil::ToChars<LogicalOperatorType>(LogicalOperatorType value);
 
 template<>
+const char* EnumUtil::ToChars<LogicalPlanVerificationIssueCode>(LogicalPlanVerificationIssueCode value);
+
+template<>
+const char* EnumUtil::ToChars<LogicalPlanVerificationPathComponentType>(LogicalPlanVerificationPathComponentType value);
+
+template<>
+const char* EnumUtil::ToChars<LogicalPlanVerificationPhase>(LogicalPlanVerificationPhase value);
+
+template<>
 const char* EnumUtil::ToChars<LogicalTypeId>(LogicalTypeId value);
 
 template<>
@@ -1327,6 +1355,18 @@ const char* EnumUtil::ToChars<RowGroupAppendMode>(RowGroupAppendMode value);
 
 template<>
 const char* EnumUtil::ToChars<RowIdHandling>(RowIdHandling value);
+
+template<>
+const char* EnumUtil::ToChars<SQLExportComparability>(SQLExportComparability value);
+
+template<>
+const char* EnumUtil::ToChars<SQLExportExecutionRoute>(SQLExportExecutionRoute value);
+
+template<>
+const char* EnumUtil::ToChars<SQLExportExecutionStatus>(SQLExportExecutionStatus value);
+
+template<>
+const char* EnumUtil::ToChars<SQLExportOutcome>(SQLExportOutcome value);
 
 template<>
 const char* EnumUtil::ToChars<SampleMethod>(SampleMethod value);
@@ -1783,6 +1823,9 @@ template<>
 DebugOrderVerification EnumUtil::FromString<DebugOrderVerification>(const char *value);
 
 template<>
+DebugSQLExportVerification EnumUtil::FromString<DebugSQLExportVerification>(const char *value);
+
+template<>
 DebugStatementVerification EnumUtil::FromString<DebugStatementVerification>(const char *value);
 
 template<>
@@ -2020,6 +2063,15 @@ template<>
 LogicalOperatorType EnumUtil::FromString<LogicalOperatorType>(const char *value);
 
 template<>
+LogicalPlanVerificationIssueCode EnumUtil::FromString<LogicalPlanVerificationIssueCode>(const char *value);
+
+template<>
+LogicalPlanVerificationPathComponentType EnumUtil::FromString<LogicalPlanVerificationPathComponentType>(const char *value);
+
+template<>
+LogicalPlanVerificationPhase EnumUtil::FromString<LogicalPlanVerificationPhase>(const char *value);
+
+template<>
 LogicalTypeId EnumUtil::FromString<LogicalTypeId>(const char *value);
 
 template<>
@@ -2249,6 +2301,18 @@ RowGroupAppendMode EnumUtil::FromString<RowGroupAppendMode>(const char *value);
 
 template<>
 RowIdHandling EnumUtil::FromString<RowIdHandling>(const char *value);
+
+template<>
+SQLExportComparability EnumUtil::FromString<SQLExportComparability>(const char *value);
+
+template<>
+SQLExportExecutionRoute EnumUtil::FromString<SQLExportExecutionRoute>(const char *value);
+
+template<>
+SQLExportExecutionStatus EnumUtil::FromString<SQLExportExecutionStatus>(const char *value);
+
+template<>
+SQLExportOutcome EnumUtil::FromString<SQLExportOutcome>(const char *value);
 
 template<>
 SampleMethod EnumUtil::FromString<SampleMethod>(const char *value);
