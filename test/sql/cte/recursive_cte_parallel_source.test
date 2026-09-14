@@ -14,16 +14,17 @@ CALL enable_logging('PhysicalOperator');
 statement ok
 CALL truncate_duckdb_logs();
 
-# Wide UNION ALL epochs are scanned by every task; the last task out of an epoch runs the next one.
+# Wide UNION ALL epochs feeding an order-independent aggregate are scanned by every task; the last task out of an
+# epoch runs the next one.
 query III
 WITH RECURSIVE t(i, level, h) AS (
 	SELECT i, 0, md5(i::VARCHAR) FROM range(50000) r(i)
 	UNION ALL
 	SELECT i, level + 1, md5(h) FROM t WHERE level < 3
 )
-SELECT count(*), count(DISTINCT h), sum(i * level)::BIGINT FROM t;
+SELECT count(*), max(h), sum(i * level)::BIGINT FROM t;
 ----
-200000	200000	7499850000
+200000	fffffe98d0963d27015c198262d97221	7499850000
 
 statement ok
 CALL disable_logging();

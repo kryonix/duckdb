@@ -369,8 +369,8 @@ public:
 	~RecursiveCTEState() override;
 
 	SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input);
-	//! Chunks the anchor produced, sizing the source tasks before the recursion runs
-	idx_t AnchorOutputChunks() const;
+	//! Rows the anchor produced, sizing the source tasks before the recursion runs
+	idx_t AnchorOutputRows() const;
 	const ColumnDataCollection &CurrentInputTable() const;
 	idx_t CurrentInputCount() const {
 		return CurrentInputTable().Count();
@@ -415,7 +415,6 @@ public:
 	const TupleDataLayout &KeyedLayout() const;
 	shared_ptr<TupleDataLayout> KeyedLayoutPtr() const;
 	idx_t KeyedGroupCount() const;
-	idx_t KeyedChunkCount() const;
 	void InitializeKeyedScan(RecursiveCTEKeyedScanState &gstate);
 	bool ScanKeyedGroups(RecursiveCTEKeyedScanState &gstate, RecursiveCTEKeyedLocalScanState &lstate,
 	                     DataChunk &groups);
