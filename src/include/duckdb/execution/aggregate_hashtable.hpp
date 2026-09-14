@@ -41,6 +41,22 @@ public:
 	TupleDataScanState scan_states;
 };
 
+//! Shared cursor of a parallel group scan, handing out the chunks of one partition at a time.
+struct AggregateHTParallelScanState {
+public:
+	mutex lock;
+	idx_t partition_idx = 0;
+	vector<unique_ptr<TupleDataParallelScanState>> partition_scans;
+	vector<column_t> column_ids;
+};
+
+//! Worker-local part of a parallel group scan. The row locations of the last chunk stay valid until the next call.
+struct AggregateHTLocalScanState {
+public:
+	idx_t partition_idx = DConstants::INVALID_INDEX;
+	TupleDataLocalScanState scan_state;
+};
+
 //! Scratch shared by mutable append probes and task-local read-only lookups.
 struct AggregateHTProbeState {
 public:
@@ -128,6 +144,13 @@ public:
 	//! Scans group columns without reading or finalizing aggregate states.
 	bool ScanGroups(AggregateHTScanState &scan_state, DataChunk &distinct_rows);
 	bool Scan(AggregateHTScanState &scan_state, DataChunk &distinct_rows, DataChunk &payload_rows);
+	//! Initializes a parallel scan over the group columns of every partition.
+	void InitializeParallelScan(AggregateHTParallelScanState &gstate);
+	//! Scans group columns into a worker-local chunk; the row-start addresses are exposed by ScannedRowLocations.
+	bool ScanGroups(AggregateHTParallelScanState &gstate, AggregateHTLocalScanState &lstate, DataChunk &groups);
+	static Vector &ScannedRowLocations(AggregateHTLocalScanState &lstate);
+	//! Number of row chunks over all partitions.
+	idx_t ChunkCount() const;
 
 	//! Finds or creates groups in the hashtable using the specified group keys. The addresses vector will be filled
 	//! with pointers to the groups in the hash table, and the new_groups selection vector will point to the newly

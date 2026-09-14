@@ -221,7 +221,7 @@ private:
 	atomic<idx_t> direct_probe_matches {0};
 	atomic<idx_t> partial_probe_chain_visits {0};
 	idx_t partial_index_build_us = 0;
-	idx_t final_state_rows = 0;
+	atomic<idx_t> final_state_rows {0};
 	idx_t retained_build_executions = 0;
 	idx_t retained_cte_materializations = 0;
 	idx_t retained_cte_reuses = 0;
@@ -262,6 +262,7 @@ public:
 	}
 	void InitializeSharedOutputAppend();
 	void CommitUsingKeyUpdates();
+	void InitializeFinalStateDrain();
 	void PromoteDistinctState(ClientContext &context, idx_t partition_count);
 	void RecordSinkMetrics(idx_t wait_ns, idx_t work_ns, idx_t rows);
 	const RecursiveCTEPartialKeyIndex &GetPartialKeyIndex(const vector<idx_t> &key_indices) const;
@@ -352,6 +353,8 @@ private:
 	unique_ptr<GroupedAggregateHashTable> ht;
 	vector<unique_ptr<RecursiveCTEPartialKeyIndex>> partial_key_indexes;
 	vector<unique_ptr<RecursiveCTEDistinctPartition>> distinct_partitions;
+	//! Radix bits selecting a DISTINCT partition, disjoint from the hash-table bucket bits
+	idx_t distinct_radix_bits = 0;
 	const PhysicalRecursiveCTE &op;
 	ExpressionExecutor executor;
 	DataChunk payload_rows;
@@ -379,7 +382,9 @@ private:
 	DataChunk update_rows;
 	DataChunk source_aggregate_rows;
 	DataChunk source_distinct_rows;
-	AggregateHTScanState ht_scan_state;
+	//! Final-state drain over the frozen hash table
+	AggregateHTParallelScanState drain_scan;
+	AggregateHTLocalScanState drain_local_scan;
 
 	bool use_local_union_all_output = true;
 	//! Whether invariant recursive meta-pipelines have already been materialized for this state
@@ -393,6 +398,8 @@ private:
 	vector<AggregateObject> payload_aggregate_objects;
 	unique_ptr<ExpressionExecutor> key_executor;
 	Vector preaggregation_hashes;
+	ArenaAllocator drain_arena;
+	RowOperationsState drain_row_state;
 	vector<unique_ptr<ExpressionExecutor>> payload_comparison_executors;
 	DataChunk raw_distinct_rows;
 	bool has_payload_comparison_executors = false;
