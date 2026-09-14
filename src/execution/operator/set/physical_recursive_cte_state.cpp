@@ -283,6 +283,18 @@ void RecursiveCTEMetrics::RecordPartialIndexBuild(idx_t elapsed_us_p) {
 	partial_index_build_us.fetch_add(elapsed_us_p);
 }
 
+void RecursiveCTEMetrics::RecordSourceTask() {
+	source_tasks.fetch_add(1);
+}
+
+void RecursiveCTEMetrics::RecordBlockedSourceTask() {
+	blocked_source_tasks.fetch_add(1);
+}
+
+void RecursiveCTEMetrics::RecordDrainTask() {
+	drain_tasks.fetch_add(1);
+}
+
 void RecursiveCTEMetrics::RecordKeyedPartitions(idx_t partitions) {
 	keyed_partitions = partitions;
 }
@@ -372,6 +384,9 @@ void RecursiveCTEMetrics::Log(const vector<unique_ptr<RecursiveCTEPartialKeyInde
 	            {"partial_index_rows", to_string(partial_index_rows)},
 	            {"partial_index_bytes", to_string(partial_index_bytes)},
 	            {"final_state_rows", to_string(final_state_rows.load())},
+	            {"source_tasks", to_string(source_tasks.load())},
+	            {"blocked_source_tasks", to_string(blocked_source_tasks.load())},
+	            {"drain_tasks", to_string(drain_tasks.load())},
 	            {"keyed_partitions", to_string(keyed_partitions)},
 	            {"keyed_commits", to_string(keyed_commits)},
 	            {"keyed_commit_partitions", to_string(keyed_commit_partitions)},

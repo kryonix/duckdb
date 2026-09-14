@@ -198,6 +198,9 @@ public:
 	void RecordPartialProbeChainVisits(idx_t count);
 	void RecordPartialIndexBuild(idx_t elapsed_us);
 	void RecordFinalStateRows(idx_t rows);
+	void RecordSourceTask();
+	void RecordBlockedSourceTask();
+	void RecordDrainTask();
 	void RecordKeyedPartitions(idx_t partitions);
 	void RecordKeyedCommit(idx_t partitions);
 	void RecordKeyedCommitTask();
@@ -231,6 +234,9 @@ private:
 	atomic<idx_t> partial_probe_chain_visits {0};
 	atomic<idx_t> partial_index_build_us {0};
 	atomic<idx_t> final_state_rows {0};
+	atomic<idx_t> source_tasks {0};
+	atomic<idx_t> blocked_source_tasks {0};
+	atomic<idx_t> drain_tasks {0};
 	idx_t keyed_partitions = 0;
 	idx_t keyed_commits = 0;
 	idx_t keyed_commit_partitions = 0;
@@ -316,12 +322,55 @@ struct RecursiveCTEKeyedPartition {
 	Vector preaggregation_hashes;
 };
 
+//! Progress of the recursion as seen by the source tasks, guarded by the blockable-task lock.
+class RecursiveCTESourceState : public GlobalSourceState {
+public:
+	RecursiveCTESourceState(ClientContext &context, const PhysicalRecursiveCTE &op);
+
+	//! Sized by the anchor result, which is all that is known before the recursion runs
+	idx_t MaxThreads() override;
+
+	RecursiveCTESourcePhase phase = RecursiveCTESourcePhase::INITIAL;
+	//! Whether a task is currently running epochs outside the lock
+	bool driver_active = false;
+	//! Tasks that still hold a chunk of the current epoch output
+	idx_t in_flight = 0;
+	//! Tasks currently scanning the epoch output outside the lock
+	idx_t scanning = 0;
+	//! Bumped whenever a new epoch output is exposed, so local scan states start over
+	idx_t epoch = 0;
+	ColumnDataParallelScanState output_scan;
+	RecursiveCTEKeyedScanState drain_scan;
+
+private:
+	const PhysicalRecursiveCTE &op;
+	idx_t thread_count;
+};
+
+class RecursiveCTESourceLocalState : public LocalSourceState {
+public:
+	RecursiveCTESourceLocalState(ClientContext &context, const PhysicalRecursiveCTE &op);
+
+	ColumnDataLocalScanState output_scan;
+	idx_t seen_epoch = DConstants::INVALID_INDEX;
+	bool holds_chunk = false;
+	bool counted = false;
+	bool drained = false;
+	RecursiveCTEKeyedLocalScanState drain_scan;
+	DataChunk distinct_rows;
+	DataChunk aggregate_rows;
+	ArenaAllocator arena;
+	RowOperationsState row_state;
+};
+
 class RecursiveCTEState : public GlobalSinkState {
 public:
 	explicit RecursiveCTEState(ClientContext &context, const PhysicalRecursiveCTE &op);
 	~RecursiveCTEState() override;
 
-	SourceResultType GetData(ExecutionContext &context, DataChunk &chunk);
+	SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input);
+	//! Chunks the anchor produced, sizing the source tasks before the recursion runs
+	idx_t AnchorOutputChunks() const;
 	const ColumnDataCollection &CurrentInputTable() const;
 	idx_t CurrentInputCount() const {
 		return CurrentInputTable().Count();
@@ -346,7 +395,6 @@ public:
 	void RecordKeyedEpochTime(idx_t elapsed_ns) {
 		last_epoch_ns = elapsed_ns;
 	}
-	void InitializeFinalStateDrain();
 	void PreGrowKeyedState(idx_t expected_new);
 	void PromoteDistinctState(ClientContext &context, idx_t partition_count);
 	void RecordSinkMetrics(idx_t wait_ns, idx_t work_ns, idx_t rows);
@@ -476,16 +524,9 @@ private:
 	ColumnDataAppendState intermediate_append_state;
 	ColumnDataAppendState working_append_state;
 	ColumnDataAppendState recurring_append_state;
-	ColumnDataScanState scan_state;
-	RecursiveCTESourcePhase source_phase = RecursiveCTESourcePhase::INITIAL;
 	bool output_is_working = false;
-	//! Cached chunks for source-side hash table scans and recurring table copy paths
+	//! Cached chunk of the recurring table copy between epochs
 	DataChunk source_result;
-	DataChunk source_aggregate_rows;
-	DataChunk source_distinct_rows;
-	//! Final-state drain over the frozen keyed partitions
-	RecursiveCTEKeyedScanState drain_scan;
-	RecursiveCTEKeyedLocalScanState drain_local_scan;
 
 	bool use_local_union_all_output = true;
 	//! Whether invariant recursive meta-pipelines have already been materialized for this state
@@ -496,8 +537,6 @@ private:
 	//! State used only by USING KEY recursive CTEs. Keep this after the regular-recursion hot state.
 	ClientContext &context;
 	vector<AggregateObject> payload_aggregate_objects;
-	ArenaAllocator drain_arena;
-	RowOperationsState drain_row_state;
 	bool has_payload_comparison_executors = false;
 	bool can_preaggregate_using_key = false;
 	//! Whether a payload aggregate mutates its state in finalize, so concurrent finalizes need the lock
@@ -505,10 +544,15 @@ private:
 	bool can_reuse_new_group_candidates = false;
 	bool can_reuse_changed_group_candidates = false;
 
-	SourceResultType GetUsingKeyData(ExecutionContext &context, DataChunk &chunk);
+	SourceResultType GetUsingKeyData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input);
+	SourceResultType GetUnionData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input);
+	//! Runs keyed epochs until the frontier is empty; the state is frozen afterwards
+	void RunUsingKeyRecursion(ExecutionContext &context);
+	//! Runs one UNION epoch over the scanned output; returns whether the new output has rows
+	bool RunUnionEpoch(ExecutionContext &context);
 	template <bool COLLECT_METRICS>
-	SourceResultType GetUsingKeyDataInternal(ExecutionContext &context, DataChunk &chunk);
-	SourceResultType GetUnionData(ExecutionContext &context, DataChunk &chunk);
+	SourceResultType DrainUsingKeyState(DataChunk &chunk, RecursiveCTESourceState &gstate,
+	                                    RecursiveCTESourceLocalState &lstate);
 	void InitializeIntermediateAppend();
 	ColumnDataCollection &CurrentOutputTable();
 	ColumnDataCollection &CurrentInputTable();
