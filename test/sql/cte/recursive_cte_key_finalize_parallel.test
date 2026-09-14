@@ -1,0 +1,96 @@
+# name: test/sql/cte/recursive_cte_key_finalize_parallel.test
+# description: Concurrent finalizes of frozen USING KEY payload aggregates with and without state-mutating finalize
+# group: [cte]
+
+require vector_size 2048
+
+# Read-only finalizes (min/max/sum/count/arg_min) are computed by parallel recurring scans and direct probes.
+statement ok
+SET threads=8;
+
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query IIIIIII
+WITH RECURSIVE t(k, mn, mx, sm, cnt, am) USING KEY (k, min(mn), max(mx), sum(sm), count(cnt), arg_min(am, mn)) AS (
+	SELECT i, 0, 0, 0, 0, i FROM range(16384) r(i)
+	UNION
+	SELECT n.k, r.mn + 1, r.mx + 1, 1, 1, n.am + 1
+	FROM t n JOIN (SELECT * FROM recurring.t WHERE mx < 3) r USING (k)
+)
+SELECT count(*), min(mn), max(mx), sum(sm)::BIGINT, sum(cnt)::BIGINT, sum(am)::BIGINT, sum(k)::BIGINT FROM t;
+----
+16384	0	3	49152	65536	134209536	134209536
+
+statement ok
+CALL disable_logging();
+
+query I
+SELECT info.scheduled_workers::UBIGINT > info.epochs::UBIGINT
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
+----
+true
+
+# The state-mutating finalize path stays serialized: results at 8 threads equal the single-threaded results.
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TABLE expected_approx AS
+WITH RECURSIVE t(k, v) USING KEY (k, approx_quantile(v, 0.5)) AS (
+	SELECT i, 0.0::DOUBLE FROM range(16384) r(i)
+	UNION
+	SELECT n.k, r.v + 1
+	FROM t n JOIN (SELECT * FROM recurring.t WHERE v < 3) r USING (k)
+)
+SELECT * FROM t;
+
+statement ok
+CREATE TABLE expected_reservoir AS
+WITH RECURSIVE t(k, v) USING KEY (k, reservoir_quantile(v, 1.0)) AS (
+	SELECT i, 0.0::DOUBLE FROM range(16384) r(i)
+	UNION
+	SELECT n.k, r.v + 1
+	FROM t n JOIN recurring.t r USING (k)
+	WHERE r.v < 3
+)
+SELECT * FROM t;
+
+statement ok
+SET threads=8;
+
+query II
+WITH RECURSIVE t(k, v) USING KEY (k, approx_quantile(v, 0.5)) AS (
+	SELECT i, 0.0::DOUBLE FROM range(16384) r(i)
+	UNION
+	SELECT n.k, r.v + 1
+	FROM t n JOIN (SELECT * FROM recurring.t WHERE v < 3) r USING (k)
+),
+actual AS (SELECT * FROM t)
+SELECT (SELECT count(*) FROM (TABLE actual EXCEPT TABLE expected_approx)),
+       (SELECT count(*) FROM (TABLE expected_approx EXCEPT TABLE actual));
+----
+0	0
+
+query II
+WITH RECURSIVE t(k, v) USING KEY (k, reservoir_quantile(v, 1.0)) AS (
+	SELECT i, 0.0::DOUBLE FROM range(16384) r(i)
+	UNION
+	SELECT n.k, r.v + 1
+	FROM t n JOIN recurring.t r USING (k)
+	WHERE r.v < 3
+),
+actual AS (SELECT * FROM t)
+SELECT (SELECT count(*) FROM (TABLE actual EXCEPT TABLE expected_reservoir)),
+       (SELECT count(*) FROM (TABLE expected_reservoir EXCEPT TABLE actual));
+----
+0	0
+
+query II
+SELECT count(*), count(DISTINCT k) FROM expected_reservoir;
+----
+16384	16384

@@ -338,6 +338,9 @@ public:
 	//! Whether a single input row finalizes to that input's first argument unchanged
 	bool single_value_identity = false;
 
+	//! Whether finalize modifies the aggregate state, so repeated or concurrent finalizes need exclusion
+	bool finalize_mutates_state = false;
+
 	bool operator==(const AggregateFunctionProperties &rhs) const;
 	bool operator!=(const AggregateFunctionProperties &rhs) const;
 };
@@ -383,6 +386,10 @@ public: // Properties
 	//! Whether a single input row finalizes to that input's first argument unchanged
 	auto HasSingleValueIdentity() const -> bool { return properties.single_value_identity; }
 	auto SetSingleValueIdentity(bool value) -> void { properties.single_value_identity = value; }
+
+	//! Whether finalize modifies the aggregate state
+	auto FinalizeMutatesState() const -> bool { return properties.finalize_mutates_state; }
+	auto SetFinalizeMutatesState(bool value) -> void { properties.finalize_mutates_state = value; }
 
 	// Derived properties
 	bool CanAggregate() const { return callbacks.update || callbacks.combine || callbacks.finalize; }

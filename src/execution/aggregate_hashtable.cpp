@@ -1004,6 +1004,7 @@ void GroupedAggregateHashTable::InitializeLookupState(AggregateHTLookupState &lo
 	lookup_state.group_chunk.InitializeEmpty(layout_ptr->GetTypes());
 	TupleDataCollection::InitializeChunkState(lookup_state.chunk_state, layout_ptr->GetTypes());
 	lookup_state.row_matcher.Initialize(true, *layout_ptr, predicates);
+	lookup_state.found_mask.Initialize(STANDARD_VECTOR_SIZE);
 	for (idx_t group_idx = 0; group_idx + 1 < layout_ptr->ColumnCount(); group_idx++) {
 		lookup_state.gather_functions.push_back(
 		    TupleDataCollection::GetGatherFunction(layout_ptr->GetTypes()[group_idx]));
@@ -1029,6 +1030,7 @@ idx_t GroupedAggregateHashTable::LookupGroups(DataChunk &groups, AggregateHTLook
 	lookup_state.group_chunk.CheckCardinality(chunk_size);
 	TupleDataCollection::ToUnifiedFormat(lookup_state.chunk_state, lookup_state.group_chunk);
 
+	lookup_state.found_mask.SetAllInvalid(chunk_size);
 	const auto hashes = lookup_state.hashes.Values<hash_t>();
 	const auto ht_offsets = FlatVector::GetDataMutable<uint64_t>(lookup_state.ht_offsets);
 	const auto hash_salts = FlatVector::GetDataMutable<hash_t>(lookup_state.hash_salts);
@@ -1070,9 +1072,9 @@ idx_t GroupedAggregateHashTable::LookupGroups(DataChunk &groups, AggregateHTLook
 			    lookup_state.group_chunk, lookup_state.chunk_state.vector_data, lookup_state.group_compare_vector,
 			    compare_count, lookup_state.addresses, &lookup_state.no_match_vector, no_match_count);
 			for (idx_t match_idx = 0; match_idx < match_count; match_idx++) {
-				found_groups_out.set_index(found_count++,
-				                           lookup_state.group_compare_vector.get_index_unsafe(match_idx));
+				lookup_state.found_mask.SetValidUnsafe(lookup_state.group_compare_vector.get_index_unsafe(match_idx));
 			}
+			found_count += match_count;
 		}
 
 		for (idx_t no_match_idx = 0; no_match_idx < no_match_count; no_match_idx++) {
@@ -1085,7 +1087,18 @@ idx_t GroupedAggregateHashTable::LookupGroups(DataChunk &groups, AggregateHTLook
 	if (iteration_count == capacity && remaining_count > 0) {
 		throw InternalException("Maximum outer iteration count reached in GroupedAggregateHashTable lookup");
 	}
-	std::sort(found_groups_out.data(), found_groups_out.data() + found_count);
+	// Matches arrive in probe-iteration order, emit them in ascending row order from the mask
+	const auto found_words = lookup_state.found_mask.GetData();
+	idx_t emitted = 0;
+	for (idx_t word_idx = 0; word_idx < ValidityMask::EntryCount(chunk_size); word_idx++) {
+		auto word = found_words[word_idx];
+		while (word) {
+			const auto bit = CountZeros<validity_t>::Trailing(word);
+			found_groups_out.set_index(emitted++, word_idx * ValidityMask::BITS_PER_VALUE + bit);
+			word &= word - 1;
+		}
+	}
+	D_ASSERT(emitted == found_count);
 	return found_count;
 }
 

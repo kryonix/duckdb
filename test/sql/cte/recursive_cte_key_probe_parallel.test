@@ -1,0 +1,87 @@
+# name: test/sql/cte/recursive_cte_key_probe_parallel.test
+# description: Direct recurring-state probes run on multiple tasks per recursive epoch
+# group: [cte]
+
+require vector_size 2048
+
+statement ok
+SET threads=8;
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+# The probe pipeline must be the direct key probe, not the hash-join fallback.
+query II
+EXPLAIN WITH RECURSIVE state(key, value) USING KEY (key) AS (
+	SELECT key, 0 FROM range(65536) keys(key)
+	UNION ALL
+	SELECT frontier.key, recurring_state.value + 1
+	FROM state frontier JOIN recurring.state recurring_state USING (key)
+	WHERE frontier.value < 3
+)
+SELECT count(*), sum(value) FROM state;
+----
+physical_plan	<REGEX>:.*RECURSIVE_KEY_JOIN.*
+
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+WITH RECURSIVE state(key, value) USING KEY (key) AS (
+	SELECT key, 0 FROM range(65536) keys(key)
+	UNION ALL
+	SELECT frontier.key, recurring_state.value + 1
+	FROM state frontier JOIN recurring.state recurring_state USING (key)
+	WHERE frontier.value < 3
+)
+SELECT count(*), sum(value) FROM state;
+----
+65536	196608
+
+statement ok
+CALL disable_logging();
+
+# Every recursive epoch scans 32 frontier chunks, so the probe pipeline is scheduled with several tasks.
+query III
+SELECT info.epochs::UBIGINT >= 3,
+       info.scheduled_workers::UBIGINT > info.epochs::UBIGINT,
+       info.scheduled_tasks::UBIGINT > info.epochs::UBIGINT
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
+----
+true	true	true
+
+# Partial-key probes run on multiple tasks as well.
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+WITH RECURSIVE state(bucket, item, value) USING KEY (bucket, item) AS (
+	SELECT i // 64, i % 64, 0 FROM range(65536) r(i)
+	UNION ALL
+	SELECT frontier.bucket, frontier.item, recurring_state.value + 1
+	FROM state frontier JOIN recurring.state recurring_state ON frontier.bucket = recurring_state.bucket
+	WHERE frontier.value < 2 AND frontier.item = recurring_state.item
+)
+SELECT count(*), sum(value) FROM state;
+----
+65536	131072
+
+statement ok
+CALL disable_logging();
+
+query II
+SELECT info.epochs::UBIGINT >= 2, info.scheduled_tasks::UBIGINT > info.epochs::UBIGINT
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
+----
+true	true

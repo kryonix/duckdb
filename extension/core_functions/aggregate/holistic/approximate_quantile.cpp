@@ -392,6 +392,7 @@ AggregateFunction ApproxQuantileDecimalFunction(const LogicalType &type) {
 void ReplaceApproxQuantileDecimal(BoundAggregateFunction &function, const AggregateFunction &implementation) {
 	auto declared_arguments = function.GetArguments();
 	function.ReplaceImplementation(implementation);
+	function.SetFinalizeMutatesState(true);
 	for (idx_t i = function.GetArguments().size(); i < declared_arguments.size(); i++) {
 		function.GetArguments().push_back(declared_arguments[i]);
 	}
@@ -408,6 +409,8 @@ unique_ptr<FunctionData> BindApproxQuantileDecimal(BindAggregateFunctionInput &i
 
 AggregateFunction GetApproximateQuantileAggregate(const LogicalType &type) {
 	auto fun = GetApproximateQuantileAggregateFunction(type);
+	// finalize compresses the digest in place
+	fun.SetFinalizeMutatesState(true);
 	fun.SetBindCallback(BindApproxQuantile);
 	fun.SetSerializeCallback(ApproximateQuantileBindData::Serialize);
 	fun.SetDeserializeCallback(ApproximateQuantileBindData::Deserialize);
@@ -533,6 +536,8 @@ unique_ptr<FunctionData> BindApproxQuantileDecimalList(BindAggregateFunctionInpu
 
 AggregateFunction GetApproxQuantileListAggregate(const LogicalType &type) {
 	auto fun = GetApproxQuantileListAggregateFunction(type);
+	// finalize compresses the digest in place
+	fun.SetFinalizeMutatesState(true);
 	fun.SetBindCallback(BindApproxQuantile);
 	fun.SetSerializeCallback(ApproximateQuantileBindData::Serialize);
 	fun.SetDeserializeCallback(ApproximateQuantileBindData::Deserialize);

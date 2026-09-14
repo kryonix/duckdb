@@ -372,6 +372,7 @@ static void SetDecimalImplementation(BoundAggregateFunction &function, const Log
 			throw InternalException("Invalid physical type for decimal reservoir quantile");
 		}
 	}
+	function.SetFinalizeMutatesState(true);
 	for (idx_t i = function.GetArguments().size(); i < declared_arguments.size(); i++) {
 		function.GetArguments().push_back(declared_arguments[i]);
 	}
@@ -416,6 +417,8 @@ unique_ptr<FunctionData> BindReservoirQuantileDecimal(BindAggregateFunctionInput
 
 AggregateFunction GetReservoirQuantileAggregate(PhysicalType type) {
 	auto fun = GetReservoirQuantileAggregateFunction(type);
+	// finalize partially sorts the reservoir in place
+	fun.SetFinalizeMutatesState(true);
 	fun.SetBindCallback(BindReservoirQuantile);
 	fun.SetSerializeCallback(ReservoirQuantileBindData::Serialize);
 	fun.SetDeserializeCallback(ReservoirQuantileBindData::Deserialize);
@@ -427,6 +430,8 @@ AggregateFunction GetReservoirQuantileAggregate(PhysicalType type) {
 
 AggregateFunction GetReservoirQuantileListAggregate(const LogicalType &type) {
 	auto fun = GetReservoirQuantileListAggregateFunction(type);
+	// finalize partially sorts the reservoir in place
+	fun.SetFinalizeMutatesState(true);
 	fun.SetBindCallback(BindReservoirQuantile);
 	fun.SetSerializeCallback(ReservoirQuantileBindData::Serialize);
 	fun.SetDeserializeCallback(ReservoirQuantileBindData::Deserialize);

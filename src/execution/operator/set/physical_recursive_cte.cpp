@@ -67,6 +67,7 @@ RecursiveCTEState::RecursiveCTEState(ClientContext &context, const PhysicalRecur
 			aggr_input_types.push_back(child_expr->GetReturnType());
 		}
 		payload_aggregate_objects.emplace_back(bound_aggr_expr);
+		finalize_requires_lock = finalize_requires_lock || bound_aggr_expr.Function().FinalizeMutatesState();
 	}
 	if (!op.key_normalizers.empty()) {
 		key_executor = make_uniq<ExpressionExecutor>(context);
@@ -272,10 +273,14 @@ void RecursiveCTEState::FinalizeAggregateRows(RowOperationsState &row_state, Vec
                                               idx_t count) {
 	aggregates.Reset();
 	aggregates.SetChildCardinality(count);
-	{
-		lock_guard<mutex> guard(ht_finalize_lock);
-		RowOperations::FinalizeStates(row_state, *GetHashTable().GetLayoutPtr(), addresses, aggregates, 0);
+	auto &layout = *GetHashTable().GetLayoutPtr();
+	if (!finalize_requires_lock) {
+		// Read-only finalizes use caller-local scratch, so concurrent readers need no exclusion
+		RowOperations::FinalizeStates(row_state, layout, addresses, aggregates, 0);
+		return;
 	}
+	lock_guard<mutex> guard(ht_finalize_lock);
+	RowOperations::FinalizeStates(row_state, layout, addresses, aggregates, 0);
 }
 
 void RecursiveCTEState::ExtractUsingKeyKeys(DataChunk &input) {
