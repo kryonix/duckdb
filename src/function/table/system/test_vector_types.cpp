@@ -336,6 +336,9 @@ void TestVectorTypesFun::RegisterFunction(BuiltinFunctions &set) {
 	TableFunction test_vector_types("test_vector_types", {LogicalType::ANY}, TestVectorTypesFunction,
 	                                TestVectorTypesBind, TestVectorTypesInit);
 	test_vector_types.SetVarArgs(LogicalType::ANY);
+	test_vector_types.is_repeatable = [](optional_ptr<const FunctionData>) {
+		return true;
+	};
 	test_vector_types.named_parameters["all_flat"] = LogicalType::BOOLEAN;
 
 	set.AddFunction(std::move(test_vector_types));
