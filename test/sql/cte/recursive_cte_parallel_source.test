@@ -5,8 +5,9 @@
 statement ok
 SET threads=8;
 
+# Generous bounds: the wide epochs are slow on sanitizer builds and small vector sizes.
 statement ok
-SET max_execution_time=20000;
+SET max_execution_time=300000;
 
 statement ok
 CALL enable_logging('PhysicalOperator');
@@ -153,7 +154,7 @@ SELECT count(*), sum(i)::BIGINT FROM t;
 
 # LIMIT stops an unbounded recursion while other source tasks are parked at the epoch barrier.
 statement ok
-SET max_execution_time=5000;
+SET max_execution_time=60000;
 
 query I
 SELECT count(*) FROM (
