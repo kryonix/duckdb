@@ -672,9 +672,8 @@ void RecursiveCTEState::SinkDistinct(DataChunk &chunk, RecursiveCTELocalState &l
 
 	chunk.Hash(lstate.hashes);
 	auto hash_data = FlatVector::GetData<hash_t>(lstate.hashes);
-	const auto partition_mask = partitions.size() - 1;
 	for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
-		const auto partition_idx = hash_data[row_idx] & partition_mask;
+		const auto partition_idx = RadixPartitioning::ApplyMask(hash_data[row_idx], distinct_radix_bits);
 		auto &partition_count = lstate.partition_counts[partition_idx];
 		lstate.partition_selections[partition_idx].set_index(partition_count++, row_idx);
 	}
@@ -731,6 +730,7 @@ void RecursiveCTEState::PromoteDistinctState(ClientContext &context, idx_t parti
 	const auto migrated_rows = ht->Count();
 	const auto promotion_start =
 	    metrics.Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+	distinct_radix_bits = RadixPartitioning::RadixBitsOfPowerOfTwo(partition_count);
 	distinct_partitions.reserve(partition_count);
 	for (idx_t partition_idx = 0; partition_idx < partition_count; partition_idx++) {
 		distinct_partitions.push_back(make_uniq<RecursiveCTEDistinctPartition>(context, op.distinct_types));
@@ -739,10 +739,9 @@ void RecursiveCTEState::PromoteDistinctState(ClientContext &context, idx_t parti
 	RecursiveCTELocalState migration_state(context, op);
 	DataChunk groups;
 	groups.Initialize(Allocator::Get(context), op.distinct_types);
-	DataChunk payload;
 	AggregateHTScanState scan_state;
 	ht->InitializeScan(scan_state);
-	while (ht->Scan(scan_state, groups, payload)) {
+	while (ht->ScanGroups(scan_state, groups)) {
 		context.InterruptCheck();
 		if (groups.size() > 0) {
 			SinkDistinct(groups, migration_state, false, false);

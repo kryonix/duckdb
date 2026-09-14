@@ -1,0 +1,8 @@
+# name: benchmark/recursive_cte/union_distinct_wide_frontier.benchmark
+# group: [recursive_cte]
+
+template benchmark/recursive_cte/recursive_cte.benchmark.in
+TIER=performance
+QUERY=union_distinct_wide_frontier
+BENCHMARK_NAME=UNION DISTINCT wide frontier
+DESCRIPTION=Deduplicate a million-row frontier per epoch across partitioned hash tables

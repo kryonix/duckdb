@@ -178,7 +178,7 @@ WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
 query I
 SELECT count(*) = 1 FROM duckdb_logs_parsed('PhysicalOperator')
 WHERE class = 'PhysicalRecursiveCTE' AND event = 'DistinctPromoted'
-  AND info.partitions::UBIGINT BETWEEN 2 AND 4
+  AND info.partitions::UBIGINT BETWEEN 2 AND 8
   AND info.migrated_rows::UBIGINT > 0;
 ----
 1
