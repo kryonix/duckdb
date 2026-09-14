@@ -138,6 +138,9 @@ public:
 	void ResetSink();
 	void ResetSinkForReschedule();
 	void ResetForReschedule(bool reset_sink);
+	//! Resets the global operator states, which pipelines with shared operators must do before any of them runs
+	void ResetOperatorsForReschedule();
+	void ResetSourceForReschedule();
 	void ResetSource(bool force);
 	void PrepareExternalInput();
 	void ClearSource();

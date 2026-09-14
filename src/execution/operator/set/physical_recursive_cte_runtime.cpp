@@ -247,20 +247,18 @@ public:
 	bool prepared_for_schedule = false;
 
 	void PrepareForSchedule() {
-		// Root recursive pipeline events can be scheduled back-to-back while sharing operator instances.
-		// Prepare their global pipeline state up-front on the main thread so later task execution does
-		// not race with another root event resetting the same operator state.
-		pipeline->ResetForReschedule(false);
+		// Root recursive pipeline events can be scheduled back-to-back, so their source state is prepared
+		// up-front on the main thread.
+		pipeline->ResetSourceForReschedule();
 		prepared_for_schedule = true;
 	}
 
 	void Schedule() override {
-		// Sink state is prepared up-front from the main thread. Reinitialize the remaining
-		// global state here, reusing existing state objects when operators expose reset hooks.
-		// Dependency-free pipeline events can be prepared up-front on the main thread to avoid
-		// racing with another root event that shares operator instances.
+		// Sink and operator states are reset up-front from the driver thread, because operators are shared
+		// between pipelines that may already be executing when a dependent event is scheduled. Only the
+		// pipeline-local source state is reset here.
 		if (!prepared_for_schedule) {
-			pipeline->ResetForReschedule(false);
+			pipeline->ResetSourceForReschedule();
 		}
 
 		SchedulePrepared(GetRecursivePipelineMaxThreads(*pipeline, worker_limit));
@@ -918,7 +916,7 @@ static void ExecuteRecursiveInlinePlan(RecursiveCTEState &state, Executor &execu
 		auto &pipeline = stage.pipeline.get();
 		switch (stage.type) {
 		case PipelineScheduleStageType::EXECUTE: {
-			pipeline.ResetForReschedule(false);
+			pipeline.ResetSourceForReschedule();
 			// Invariant builds have independent source work even when the recursive frontier is tiny.
 			const auto worker_limit =
 			    stage.is_invariant_build ? TaskScheduler::GetScheduler(executor.context).NumberOfThreads() : idx_t(1);
@@ -996,8 +994,10 @@ void PhysicalRecursiveCTE::ExecuteRecursivePipelines(ExecutionContext &context) 
 	// - a cached inline dependency plan when the iteration is effectively single-threaded
 	// - a custom recursive Event graph when the iteration still benefits from parallel execution
 
-	// Reset sink state from the main thread so recursive iterations can reuse or recreate
-	// pipeline-local global sinks without tearing down the rest of the runtime state graph.
+	// Reset sink and operator states from the driver thread so recursive iterations can reuse or recreate
+	// them without tearing down the rest of the runtime state graph. Operators above a UNION are shared by
+	// several pipelines, so resetting them when a dependent event is scheduled would race with a sibling
+	// pipeline that is already executing them.
 	for (auto &meta_pipeline : active_meta_pipelines) {
 		vector<shared_ptr<Pipeline>> pipelines;
 		meta_pipeline->GetPipelines(pipelines, false);
@@ -1006,6 +1006,7 @@ void PhysicalRecursiveCTE::ExecuteRecursivePipelines(ExecutionContext &context) 
 			if (sink.get() != this) {
 				pipeline->ResetSinkForReschedule();
 			}
+			pipeline->ResetOperatorsForReschedule();
 		}
 	}
 
