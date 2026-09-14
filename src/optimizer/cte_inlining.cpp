@@ -37,6 +37,51 @@ static idx_t CountBaseTableReferences(const LogicalOperator &op) {
 	return number_of_references;
 }
 
+//! Counts scans of the CTE that sit inside the recursive member of a recursive CTE
+static idx_t CountRecursiveMemberReferences(const LogicalOperator &op, TableIndex cte_index, bool inside_member) {
+	if (op.type == LogicalOperatorType::LOGICAL_CTE_REF) {
+		return inside_member && op.Cast<LogicalCTERef>().cte_index == cte_index ? 1 : 0;
+	}
+	idx_t references = 0;
+	for (idx_t child_idx = 0; child_idx < op.children.size(); child_idx++) {
+		const bool child_inside_member =
+		    inside_member || (op.type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE && child_idx == 1);
+		references += CountRecursiveMemberReferences(*op.children[child_idx], cte_index, child_inside_member);
+	}
+	return references;
+}
+
+//! Whether the definition contains an operator that materializes its input before producing output
+static bool ContainsPipelineBreaker(const LogicalOperator &op) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+	case LogicalOperatorType::LOGICAL_WINDOW:
+	case LogicalOperatorType::LOGICAL_ORDER_BY:
+	case LogicalOperatorType::LOGICAL_TOP_N:
+	case LogicalOperatorType::LOGICAL_DISTINCT:
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_ANY_JOIN:
+	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
+	case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN:
+	case LogicalOperatorType::LOGICAL_UNION:
+	case LogicalOperatorType::LOGICAL_EXCEPT:
+	case LogicalOperatorType::LOGICAL_INTERSECT:
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+	case LogicalOperatorType::LOGICAL_RECURSIVE_CTE:
+		return true;
+	default:
+		break;
+	}
+	for (auto &child : op.children) {
+		if (ContainsPipelineBreaker(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static idx_t CountCTEReferences(const LogicalOperator &op, TableIndex cte_index) {
 	if (op.type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &cte = op.Cast<LogicalCTERef>();
@@ -141,8 +186,11 @@ void CTEInlining::TryInlining(unique_ptr<LogicalOperator> &op) {
 	}
 
 	// traverse children first, so we can inline the deepest CTEs first
-	for (auto &child : op->children) {
-		TryInlining(child);
+	for (idx_t child_idx = 0; child_idx < op->children.size(); child_idx++) {
+		const bool enters_member = op->type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE && child_idx == 1;
+		recursive_member_depth += enters_member;
+		TryInlining(op->children[child_idx]);
+		recursive_member_depth -= enters_member;
 	}
 
 	if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
@@ -170,6 +218,12 @@ void CTEInlining::TryInlining(unique_ptr<LogicalOperator> &op) {
 		}
 		if (cte.materialize == CTEMaterialize::CTE_MATERIALIZE_ALWAYS) {
 			// This CTE is always materialized, we cannot inline it
+			return;
+		}
+		if (recursive_member_depth == 0 && cte.materialize != CTEMaterialize::CTE_MATERIALIZE_NEVER &&
+		    CountRecursiveMemberReferences(*op->children[1], cte.table_index, false) == ref_count &&
+		    ContainsPipelineBreaker(*cte.children[0])) {
+			// Every scan runs once per recursive epoch, materializing once beats re-evaluating the definition
 			return;
 		}
 		if (ref_count == 1) {

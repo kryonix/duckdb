@@ -34,6 +34,8 @@ private:
 private:
 	//! The optimizer
 	Optimizer &optimizer;
+	//! How many recursive members enclose the operator being visited
+	idx_t recursive_member_depth = 0;
 
 	optional_ptr<bound_parameter_map_t> parameter_data;
 };

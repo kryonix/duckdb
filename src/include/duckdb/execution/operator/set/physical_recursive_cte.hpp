@@ -134,6 +134,9 @@ public:
 
 	vector<const_reference<PhysicalOperator>> GetSources() const override;
 
+	//! Whether the subtree reads the frontier or frozen state of the given recursive CTE
+	static bool ContainsVisibleRecursiveScan(const PhysicalOperator &op, TableIndex cte_index);
+
 private:
 	void ExecuteRecursivePipelines(ExecutionContext &context) const;
 	idx_t NextMetricsInvocation() const;

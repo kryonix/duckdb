@@ -1,0 +1,189 @@
+# name: test/sql/cte/recursive_cte_key_probe_guard.test
+# description: Direct recurring-state probes are only planned when they beat a retained hash-join build
+# group: [cte]
+
+statement ok
+SET threads=8;
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+PRAGMA explain_output='physical_only';
+
+# Fix the join orientation so the physical rewrite decides on its own.
+statement ok
+SET disabled_optimizers='join_order,build_side_probe_side';
+
+# A frontier-dependent probe input is recomputed every epoch anyway, so the direct probe stays.
+query II
+EXPLAIN WITH RECURSIVE t(k, v) USING KEY (k) AS (
+	SELECT i, 0 FROM range(10000) r(i)
+	UNION ALL
+	SELECT n.k, r.v + 1 FROM t n JOIN recurring.t r USING (k) WHERE n.v < 3
+)
+SELECT count(*), sum(v) FROM t;
+----
+physical_plan	<REGEX>:.*RECURSIVE_KEY_JOIN.*
+
+query II
+WITH RECURSIVE t(k, v) USING KEY (k) AS (
+	SELECT i, 0 FROM range(10000) r(i)
+	UNION ALL
+	SELECT n.k, r.v + 1 FROM t n JOIN recurring.t r USING (k) WHERE n.v < 3
+)
+SELECT count(*), sum(v) FROM t;
+----
+10000	30000
+
+# A tiny invariant build side is cheaper to probe with than to build the state for.
+query II
+EXPLAIN WITH RECURSIVE t(k, v) USING KEY (k) AS (
+	SELECT i, 0 FROM range(10000) r(i)
+	UNION ALL
+	SELECT r.k, r.v + 1
+	FROM recurring.t r JOIN (VALUES (1::BIGINT), (2), (3)) b(k) ON b.k = r.k, (VALUES (3)) lim(x)
+	WHERE r.v < lim.x
+)
+SELECT count(*), sum(v) FROM t;
+----
+physical_plan	<REGEX>:.*RECURSIVE_KEY_JOIN.*
+
+query II
+WITH RECURSIVE t(k, v) USING KEY (k) AS (
+	SELECT i, 0 FROM range(10000) r(i)
+	UNION ALL
+	SELECT r.k, r.v + 1
+	FROM recurring.t r JOIN (VALUES (1::BIGINT), (2), (3)) b(k) ON b.k = r.k, (VALUES (3)) lim(x)
+	WHERE r.v < lim.x
+)
+SELECT count(*), sum(v) FROM t;
+----
+10000	9
+
+# A large invariant streaming build side is built once and retained instead of being probed every epoch.
+query II
+EXPLAIN WITH RECURSIVE t(k, v) USING KEY (k) AS (
+	SELECT i, 0 FROM range(10) r(i)
+	UNION ALL
+	SELECT r.k, r.v + 1
+	FROM recurring.t r JOIN range(1000000) b(k) ON b.k = r.k, (VALUES (3)) lim(x)
+	WHERE r.v < lim.x
+)
+SELECT count(*), sum(v) FROM t;
+----
+physical_plan	<REGEX>:.*HASH_JOIN[\s\S]*REC_REC_CTE_SCAN.*
+
+query II
+WITH RECURSIVE t(k, v) USING KEY (k) AS (
+	SELECT i, 0 FROM range(10) r(i)
+	UNION ALL
+	SELECT r.k, r.v + 1
+	FROM recurring.t r JOIN range(1000000) b(k) ON b.k = r.k, (VALUES (3)) lim(x)
+	WHERE r.v < lim.x
+)
+SELECT count(*), sum(v) FROM t;
+----
+10	30
+
+# An invariant build side with its own pipeline breaker is worth retaining as a hash-join build.
+query II
+EXPLAIN WITH RECURSIVE t(k, v) USING KEY (k) AS (
+	SELECT i, 0 FROM range(10000) r(i)
+	UNION ALL
+	SELECT r.k, r.v + b.w
+	FROM recurring.t r
+	JOIN (SELECT i AS k, count(*) OVER (PARTITION BY i % 10) AS w FROM range(10000) t(i)) b ON b.k = r.k,
+	(VALUES (3000)) lim(x)
+	WHERE r.v < lim.x
+)
+SELECT count(*), sum(v) FROM t;
+----
+physical_plan	<REGEX>:.*HASH_JOIN[\s\S]*REC_REC_CTE_SCAN.*
+
+query II
+WITH RECURSIVE t(k, v) USING KEY (k) AS (
+	SELECT i, 0 FROM range(10000) r(i)
+	UNION ALL
+	SELECT r.k, r.v + b.w
+	FROM recurring.t r
+	JOIN (SELECT i AS k, count(*) OVER (PARTITION BY i % 10) AS w FROM range(10000) t(i)) b ON b.k = r.k,
+	(VALUES (3000)) lim(x)
+	WHERE r.v < lim.x
+)
+SELECT count(*), sum(v) FROM t;
+----
+10000	30000000
+
+# When the state itself sits on the build side, the hash join would rebuild it every epoch: keep probing directly.
+query II
+EXPLAIN WITH RECURSIVE t(k, v) USING KEY (k) AS (
+	SELECT i, 0 FROM range(10000) r(i)
+	UNION ALL
+	SELECT r.k, r.v + b.w
+	FROM (SELECT i AS k, count(*) OVER (PARTITION BY i % 10) AS w FROM range(10000) t(i)) b
+	JOIN recurring.t r ON b.k = r.k, (VALUES (3000)) lim(x)
+	WHERE r.v < lim.x
+)
+SELECT count(*), sum(v) FROM t;
+----
+physical_plan	<REGEX>:.*RECURSIVE_KEY_JOIN.*
+
+query II
+WITH RECURSIVE t(k, v) USING KEY (k) AS (
+	SELECT i, 0 FROM range(10000) r(i)
+	UNION ALL
+	SELECT r.k, r.v + b.w
+	FROM (SELECT i AS k, count(*) OVER (PARTITION BY i % 10) AS w FROM range(10000) t(i)) b
+	JOIN recurring.t r ON b.k = r.k, (VALUES (3000)) lim(x)
+	WHERE r.v < lim.x
+)
+SELECT count(*), sum(v) FROM t;
+----
+10000	30000000
+
+query II
+EXPLAIN WITH RECURSIVE t(k, v) USING KEY (k) AS (
+	SELECT i, 0 FROM range(10) r(i)
+	UNION ALL
+	SELECT r.k, r.v + 1
+	FROM range(1000000) b(k) JOIN recurring.t r ON b.k = r.k, (VALUES (3)) lim(x)
+	WHERE r.v < lim.x
+)
+SELECT count(*), sum(v) FROM t;
+----
+physical_plan	<REGEX>:.*RECURSIVE_KEY_JOIN.*
+
+statement ok
+SET disabled_optimizers='';
+
+# With the optimizers enabled the invariant window builds once and is retained across epochs.
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+WITH RECURSIVE t(k, v) USING KEY (k) AS (
+	SELECT i, 0 FROM range(10000) r(i)
+	UNION ALL
+	SELECT r.k, r.v + b.w
+	FROM recurring.t r
+	JOIN (SELECT i AS k, count(*) OVER (PARTITION BY i % 10) AS w FROM range(10000) t(i)) b ON b.k = r.k,
+	(VALUES (3000)) lim(x)
+	WHERE r.v < lim.x
+)
+SELECT count(*), sum(v) FROM t;
+----
+10000	30000000
+
+statement ok
+CALL disable_logging();
+
+query II
+SELECT info.retained_build_executions::UBIGINT >= 1, info.direct_probe_rows::UBIGINT = 0
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
+----
+true	true

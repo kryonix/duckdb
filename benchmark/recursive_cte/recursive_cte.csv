@@ -64,3 +64,4 @@ benchmark/recursive_cte/aoc2024_day20.benchmark
 benchmark/recursive_cte/aoc2024_day20_using_key.benchmark
 benchmark/recursive_cte/tiny_frontier_invariant_build.benchmark
 benchmark/recursive_cte/union_distinct_wide_frontier.benchmark
+benchmark/recursive_cte/direct_probe_invariant_probe.benchmark
