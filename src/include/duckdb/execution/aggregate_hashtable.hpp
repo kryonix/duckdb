@@ -63,6 +63,8 @@ public:
 	AggregateHTLookupState();
 
 	SelectionVector missing_vector;
+	//! One bit per input row, set when the row matched an existing group
+	ValidityMask found_mask;
 	TupleDataChunkState chunk_state;
 	RowMatcher row_matcher;
 	vector<TupleDataGatherFunction> gather_functions;

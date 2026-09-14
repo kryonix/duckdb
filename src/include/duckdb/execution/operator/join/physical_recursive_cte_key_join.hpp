@@ -109,6 +109,10 @@ public:
 	}
 
 	unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) const override;
+	//! Probe state is task-local and the frozen recursive state is only read during an epoch
+	bool ParallelOperator() const override {
+		return true;
+	}
 	string GetName() const override;
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
 
