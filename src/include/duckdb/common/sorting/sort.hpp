@@ -76,6 +76,8 @@ public:
 	// Sink Interface
 	//===--------------------------------------------------------------------===//
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const;
+	//! Prepares a combined local sink state for another sink round against the same Sort
+	void ResetLocalSinkState(LocalSinkState &lstate) const;
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const;
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const;
 	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const;

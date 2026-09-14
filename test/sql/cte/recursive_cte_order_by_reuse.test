@@ -1,0 +1,102 @@
+# name: test/sql/cte/recursive_cte_order_by_reuse.test
+# description: ORDER BY sink states are reused across recursive epochs with and without executor caching
+# group: [cte]
+
+foreach caching true false
+
+foreach threads 1 8
+
+statement ok
+SET enable_caching_operators=${caching};
+
+statement ok
+SET threads=${threads};
+
+# Six epochs through the same ORDER BY sink; the kept rows depend on the sort being correct every epoch.
+query IT
+WITH RECURSIVE r(iter, v) AS (
+	SELECT 0, i FROM range(8) t(i)
+	UNION ALL
+	SELECT iter + 1, (v + 1) % 8
+	FROM (SELECT iter, v, row_number() OVER () AS rn FROM (SELECT iter, v FROM r WHERE iter < 6 ORDER BY v DESC) o) s
+	WHERE rn <= 4
+)
+SELECT iter, list(v ORDER BY v) FROM r GROUP BY iter ORDER BY iter;
+----
+0	[0, 1, 2, 3, 4, 5, 6, 7]
+1	[0, 5, 6, 7]
+2	[0, 1, 6, 7]
+3	[0, 1, 2, 7]
+4	[0, 1, 2, 3]
+5	[1, 2, 3, 4]
+6	[2, 3, 4, 5]
+
+# The ordered branch is empty on odd epochs, so the reused sink must recover from NO_OUTPUT_POSSIBLE.
+query III
+WITH RECURSIVE r(iter, v) AS (
+	SELECT 0, i FROM range(8) t(i)
+	UNION ALL
+	(SELECT iter + 1, v FROM r WHERE iter < 6 AND iter % 2 = 1
+	 UNION ALL
+	 SELECT iter + 1, v FROM (SELECT iter, v FROM r WHERE iter < 6 AND iter % 2 = 0 ORDER BY v DESC) s)
+)
+SELECT iter, count(*), sum(v) FROM r GROUP BY iter ORDER BY iter;
+----
+0	8	28
+1	8	28
+2	8	28
+3	8	28
+4	8	28
+5	8	28
+6	8	28
+
+# External sorting registers fresh temporary memory for every epoch.
+statement ok
+SET debug_force_external=true;
+
+query III
+WITH RECURSIVE r(iter, v) AS (
+	SELECT 0, i FROM range(4096) t(i)
+	UNION ALL
+	SELECT iter + 1, v FROM (SELECT iter, v FROM r WHERE iter < 4 ORDER BY v DESC) s
+)
+SELECT iter, count(*), sum(v) FROM r GROUP BY iter ORDER BY iter;
+----
+0	4096	8386560
+1	4096	8386560
+2	4096	8386560
+3	4096	8386560
+4	4096	8386560
+
+statement ok
+SET debug_force_external=false;
+
+# Prepared statements reuse the same sink across executions.
+statement ok
+PREPARE ordered_reuse AS
+WITH RECURSIVE r(iter, v) AS (
+	SELECT 0, i FROM range(64) t(i)
+	UNION ALL
+	SELECT iter + 1, v FROM (SELECT iter, v FROM r WHERE iter < 3 ORDER BY v DESC) s
+)
+SELECT count(*), sum(v) FROM r;
+
+query II
+EXECUTE ordered_reuse;
+----
+256	8064
+
+query II
+EXECUTE ordered_reuse;
+----
+256	8064
+
+statement ok
+DEALLOCATE ordered_reuse;
+
+endloop
+
+endloop
+
+statement ok
+SET enable_caching_operators=true;

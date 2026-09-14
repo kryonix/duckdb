@@ -21,6 +21,17 @@ public:
 	}
 
 public:
+	bool SupportsReuse() const override {
+		return true;
+	}
+
+	void Reset(ClientContext &context) override {
+		// The Sort is immutable, only the run collection and its memory reservation are rebuilt
+		state = sort.GetGlobalSinkState(context);
+		GlobalSinkState::Reset(context);
+	}
+
+public:
 	Sort sort;
 	unique_ptr<GlobalSinkState> state;
 };
@@ -31,6 +42,26 @@ public:
 	}
 
 public:
+	bool SupportsReuse() const override {
+		return true;
+	}
+
+	void Reset(ExecutionContext &context, GlobalSinkState &gstate_p) override {
+		auto &gstate = gstate_p.Cast<OrderGlobalSinkState>();
+		if (!state) {
+			return;
+		}
+		if (sort.get() != &gstate.sort) {
+			// the global state was rebuilt, the executor references a different Sort
+			state = gstate.sort.GetLocalSinkState(context);
+			sort = gstate.sort;
+			return;
+		}
+		gstate.sort.ResetLocalSinkState(*state);
+	}
+
+public:
+	optional_ptr<const Sort> sort;
 	unique_ptr<LocalSinkState> state;
 };
 
@@ -47,6 +78,7 @@ SinkResultType PhysicalOrder::Sink(ExecutionContext &context, DataChunk &chunk, 
 	auto &lstate = input.local_state.Cast<OrderLocalSinkState>();
 	if (!lstate.state) {
 		lstate.state = gstate.sort.GetLocalSinkState(context);
+		lstate.sort = gstate.sort;
 	}
 	OperatorSinkInput sort_input {*gstate.state, *lstate.state, input.interrupt_state};
 	return gstate.sort.Sink(context, chunk, sort_input);
