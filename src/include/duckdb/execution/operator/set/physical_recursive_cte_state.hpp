@@ -15,6 +15,7 @@ class Logger;
 class RecursiveCTELocalState;
 struct RecursiveCTEDistinctPartition;
 struct RecursiveCTEKeyDeltaState;
+struct RecursiveCTEKeyedPartition;
 
 struct RecursiveExecutorPool {
 	mutex lock;
@@ -50,11 +51,15 @@ public:
 	const Entry &GetEntry(idx_t entry_idx) const;
 	idx_t Count() const;
 	idx_t SizeInBytes() const;
+	void Clear();
 
 	vector<idx_t> key_indices;
 
 private:
 	void Resize(idx_t capacity);
+
+	//! Partition commits add groups concurrently
+	mutex lock;
 
 	DataChunk partial_keys;
 	DataChunk selected_keys;
@@ -193,10 +198,14 @@ public:
 	void RecordPartialProbeChainVisits(idx_t count);
 	void RecordPartialIndexBuild(idx_t elapsed_us);
 	void RecordFinalStateRows(idx_t rows);
+	void RecordKeyedPartitions(idx_t partitions);
+	void RecordKeyedCommit(idx_t partitions);
+	void RecordKeyedCommitTask();
 	void RecordRetainedBuild();
 	void RecordRetainedCTEMaterialization();
 	void RecordRetainedCTEReuse();
 	void LogDistinctPromotion(idx_t partitions, idx_t migrated_rows, idx_t elapsed_us) const;
+	void LogKeyedPromotion(idx_t partitions, idx_t migrated_rows, idx_t elapsed_us) const;
 	void Log(const vector<unique_ptr<RecursiveCTEPartialKeyIndex>> &partial_key_indexes) const;
 	void LogEpochSummary(const RecursiveCTEEpochMetrics &epoch_metrics) const;
 
@@ -220,8 +229,12 @@ private:
 	atomic<idx_t> direct_probe_rows {0};
 	atomic<idx_t> direct_probe_matches {0};
 	atomic<idx_t> partial_probe_chain_visits {0};
-	idx_t partial_index_build_us = 0;
+	atomic<idx_t> partial_index_build_us {0};
 	atomic<idx_t> final_state_rows {0};
+	idx_t keyed_partitions = 0;
+	idx_t keyed_commits = 0;
+	idx_t keyed_commit_partitions = 0;
+	atomic<idx_t> keyed_commit_tasks {0};
 	idx_t retained_build_executions = 0;
 	idx_t retained_cte_materializations = 0;
 	idx_t retained_cte_reuses = 0;
@@ -250,6 +263,59 @@ private:
 	vector<idx_t> ready_schedule_stages;
 };
 
+//! Shared scan cursors over every keyed partition.
+struct RecursiveCTEKeyedScanState {
+	vector<unique_ptr<AggregateHTParallelScanState>> partition_scans;
+};
+
+//! Worker-local part of a keyed partition scan.
+struct RecursiveCTEKeyedLocalScanState {
+	idx_t partition_idx = DConstants::INVALID_INDEX;
+	AggregateHTLocalScanState scan;
+};
+
+//! Worker-local pre-aggregation of the candidates routed to one keyed partition.
+struct RecursiveCTELocalPreaggregate {
+	unique_ptr<GroupedAggregateHashTable> ht;
+	idx_t candidate_rows = 0;
+};
+
+//! One radix partition of a USING KEY state. Everything a commit mutates lives here, so partitions commit in parallel.
+struct RecursiveCTEKeyedPartition {
+	RecursiveCTEKeyedPartition(ClientContext &context, const PhysicalRecursiveCTE &op,
+	                           const vector<AggregateObject> &payload_aggregate_objects, bool own_frontier);
+	~RecursiveCTEKeyedPartition();
+
+	void InitializeCandidateAppend();
+	void InitializeFrontierAppend();
+	bool HasWork() const;
+	idx_t WorkRows() const;
+
+	//! Epoch inputs, written by workers under `lock`
+	mutex lock;
+	ColumnDataCollection candidates;
+	ColumnDataAppendState candidate_append_state;
+	vector<RecursiveCTELocalPreaggregate> preaggregated;
+	//! Frozen state of this partition
+	unique_ptr<GroupedAggregateHashTable> ht;
+	unique_ptr<RecursiveCTEKeyDeltaState> key_delta;
+	//! Next-epoch rows produced by this partition's commit; a single partition writes the working table directly
+	unique_ptr<ColumnDataCollection> owned_frontier;
+	ColumnDataCollection &frontier;
+	ColumnDataAppendState frontier_append_state;
+	//! Commit scratch
+	ExpressionExecutor payload_executor;
+	unique_ptr<ExpressionExecutor> key_executor;
+	vector<unique_ptr<ExpressionExecutor>> payload_comparison_executors;
+	DataChunk payload_rows;
+	DataChunk distinct_rows;
+	DataChunk raw_distinct_rows;
+	DataChunk update_rows;
+	Vector new_group_addresses;
+	SelectionVector new_groups;
+	Vector preaggregation_hashes;
+};
+
 class RecursiveCTEState : public GlobalSinkState {
 public:
 	explicit RecursiveCTEState(ClientContext &context, const PhysicalRecursiveCTE &op);
@@ -261,15 +327,51 @@ public:
 		return CurrentInputTable().Count();
 	}
 	void InitializeSharedOutputAppend();
-	void CommitUsingKeyUpdates();
+	//! Commit protocol of a keyed epoch: partitions with work are handed out to tasks, then the frontier is assembled
+	idx_t PrepareKeyedCommit();
+	idx_t PreparedKeyedCommitRows() const;
+	idx_t NextKeyedCommitPartition();
+	void CommitKeyedPartition(idx_t partition_idx);
+	void FinishKeyedCommit();
+	//! Commits every prepared partition on the calling thread
+	void CommitKeyedPartitionsInline();
+	//! Splits the single keyed partition into the target partition count
+	void PromoteKeyedState();
+	void RebuildPartialKeyIndexes();
+	//! Wall times that decide whether the serial commit is worth partitioning
+	void RecordKeyedCommitTime(idx_t elapsed_ns, idx_t rows) {
+		last_commit_ns = elapsed_ns;
+		last_commit_rows = rows;
+	}
+	void RecordKeyedEpochTime(idx_t elapsed_ns) {
+		last_epoch_ns = elapsed_ns;
+	}
 	void InitializeFinalStateDrain();
+	void PreGrowKeyedState(idx_t expected_new);
 	void PromoteDistinctState(ClientContext &context, idx_t partition_count);
 	void RecordSinkMetrics(idx_t wait_ns, idx_t work_ns, idx_t rows);
 	const RecursiveCTEPartialKeyIndex &GetPartialKeyIndex(const vector<idx_t> &key_indices) const;
 	void AppendOutput(DataChunk &chunk);
 	void CombineOutput(ColumnDataCollection &output);
-	void RegisterLocalPreaggregation(unique_ptr<GroupedAggregateHashTable> local_ht, idx_t candidate_rows,
+	//! Keyed candidates are routed to their partition by the hash of the normalized key
+	void AppendCandidates(idx_t partition_idx, DataChunk &chunk);
+	void CombineCandidates(idx_t partition_idx, ColumnDataCollection &output);
+	void RegisterLocalPreaggregation(vector<RecursiveCTELocalPreaggregate> local_preaggregates,
 	                                 idx_t classification_work_ns, idx_t preaggregation_work_ns);
+	//! Keyed state access for readers of the frozen epoch state
+	idx_t KeyedPartitionCount() const {
+		return keyed_partitions.size();
+	}
+	idx_t KeyedPartitionIndex(hash_t hash) const;
+	GroupedAggregateHashTable &GetKeyedHashTable(idx_t partition_idx);
+	const TupleDataLayout &KeyedLayout() const;
+	shared_ptr<TupleDataLayout> KeyedLayoutPtr() const;
+	idx_t KeyedGroupCount() const;
+	idx_t KeyedChunkCount() const;
+	void InitializeKeyedScan(RecursiveCTEKeyedScanState &gstate);
+	bool ScanKeyedGroups(RecursiveCTEKeyedScanState &gstate, RecursiveCTEKeyedLocalScanState &lstate,
+	                     DataChunk &groups);
+	static Vector &ScannedKeyedRowLocations(RecursiveCTEKeyedLocalScanState &lstate);
 	void SinkSerialDistinct(DataChunk &chunk, RecursiveCTELocalState &local_state);
 	void SinkDistinct(DataChunk &chunk, RecursiveCTELocalState &local_state, bool emit_rows = true,
 	                  bool record_sink_metrics = true);
@@ -280,14 +382,6 @@ public:
 
 	const PhysicalRecursiveCTE &GetOperator() const {
 		return op;
-	}
-	GroupedAggregateHashTable &GetHashTable() {
-		D_ASSERT(ht);
-		return *ht;
-	}
-	const GroupedAggregateHashTable &GetHashTable() const {
-		D_ASSERT(ht);
-		return *ht;
 	}
 	RecursiveCTEMetrics &GetMetrics() {
 		return metrics;
@@ -329,37 +423,49 @@ public:
 
 private:
 	template <bool COLLECT_METRICS>
-	void CommitUsingKeyUpdatesInternal();
+	void CommitUsingKeyUpdatesInternal(RecursiveCTEKeyedPartition &partition);
 	template <bool COLLECT_METRICS>
-	void CommitPreaggregatedUsingKeyUpdatesInternal();
+	void CommitPreaggregatedUsingKeyUpdatesInternal(RecursiveCTEKeyedPartition &partition);
 	template <bool COLLECT_METRICS>
-	void CommitMixedUsingKeyUpdatesInternal(unique_ptr<GroupedAggregateHashTable> epoch_ht,
+	void CommitMixedUsingKeyUpdatesInternal(RecursiveCTEKeyedPartition &partition,
+	                                        unique_ptr<GroupedAggregateHashTable> epoch_ht,
 	                                        idx_t preaggregated_candidate_count);
 	template <bool COLLECT_METRICS>
-	void ApplyPreaggregatedUsingKeyUpdates(GroupedAggregateHashTable &epoch_ht, idx_t &delta_work_ns);
+	void ApplyPreaggregatedUsingKeyUpdates(RecursiveCTEKeyedPartition &partition, GroupedAggregateHashTable &epoch_ht,
+	                                       idx_t &delta_work_ns);
 	template <bool COLLECT_METRICS>
-	idx_t PreaggregateUsingKeyUpdates(GroupedAggregateHashTable &epoch_ht);
+	idx_t PreaggregateUsingKeyUpdates(RecursiveCTEKeyedPartition &partition, GroupedAggregateHashTable &epoch_ht);
 	unique_ptr<GroupedAggregateHashTable> CreateUsingKeyHashTable() const;
-	void ExtractUsingKeyKeys(DataChunk &input);
-	bool ShouldPreaggregateUsingKeyUpdates(idx_t candidate_count);
-	void SnapshotUsingKeyDelta(const Vector &group_addresses, const SelectionVector &new_groups, idx_t new_group_count,
-	                           idx_t row_count, bool allow_candidate_reuse = true);
-	void SnapshotPreaggregatedUsingKeyDeltaGroups(DataChunk &keys);
-	void SnapshotExistingUsingKeyDeltaAddresses(Vector &addresses, idx_t count, bool defer_append = false);
-	void AppendPreviousUsingKeyDeltaRows(Vector &addresses, idx_t count);
-	void ValidateDeferredUsingKeyCandidateReuse(DataChunk &candidates);
-	bool TryReuseChangedGroupCandidates(idx_t candidate_count);
-	idx_t FinalizeUsingKeyDelta(bool update_partial_indexes, bool collect_metrics);
-	unique_ptr<GroupedAggregateHashTable> ht;
+	void ExtractUsingKeyKeys(RecursiveCTEKeyedPartition &partition, DataChunk &input);
+	bool ShouldPreaggregateUsingKeyUpdates(RecursiveCTEKeyedPartition &partition, idx_t candidate_count);
+	void SnapshotUsingKeyDelta(RecursiveCTEKeyedPartition &partition, const Vector &group_addresses,
+	                           const SelectionVector &new_groups, idx_t new_group_count, idx_t row_count,
+	                           bool allow_candidate_reuse = true);
+	void SnapshotPreaggregatedUsingKeyDeltaGroups(RecursiveCTEKeyedPartition &partition, DataChunk &keys);
+	void SnapshotExistingUsingKeyDeltaAddresses(RecursiveCTEKeyedPartition &partition, Vector &addresses, idx_t count,
+	                                            bool defer_append = false);
+	void AppendPreviousUsingKeyDeltaRows(RecursiveCTEKeyedPartition &partition, Vector &addresses, idx_t count);
+	void ValidateDeferredUsingKeyCandidateReuse(RecursiveCTEKeyedPartition &partition, DataChunk &candidates);
+	bool TryReuseChangedGroupCandidates(RecursiveCTEKeyedPartition &partition, idx_t candidate_count);
+	idx_t FinalizeUsingKeyDelta(RecursiveCTEKeyedPartition &partition, bool update_partial_indexes,
+	                            bool collect_metrics);
+	vector<unique_ptr<RecursiveCTEKeyedPartition>> keyed_partitions;
+	idx_t keyed_radix_bits = 0;
+	//! Partition count after promotion; small recursions keep a single partition
+	idx_t keyed_partition_target = 1;
+	idx_t last_commit_ns = 0;
+	idx_t last_commit_rows = 0;
+	idx_t last_epoch_ns = 0;
+	shared_ptr<TupleDataLayout> keyed_layout;
+	vector<idx_t> keyed_commit_partitions;
+	atomic<idx_t> keyed_commit_cursor {0};
+	//! Serial dedup table of UNION recursion before promotion to partitions
+	unique_ptr<GroupedAggregateHashTable> distinct_ht;
 	vector<unique_ptr<RecursiveCTEPartialKeyIndex>> partial_key_indexes;
 	vector<unique_ptr<RecursiveCTEDistinctPartition>> distinct_partitions;
 	//! Radix bits selecting a DISTINCT partition, disjoint from the hash-table bucket bits
 	idx_t distinct_radix_bits = 0;
 	const PhysicalRecursiveCTE &op;
-	ExpressionExecutor executor;
-	DataChunk payload_rows;
-	Vector new_group_addresses;
-	SelectionVector new_groups;
 	const bool allow_executor_reuse;
 	RecursiveCTEMetrics metrics;
 	RecursiveCTESchedulerState scheduler;
@@ -371,20 +477,15 @@ private:
 	ColumnDataAppendState working_append_state;
 	ColumnDataAppendState recurring_append_state;
 	ColumnDataScanState scan_state;
-	vector<unique_ptr<GroupedAggregateHashTable>> local_preaggregates;
-	idx_t local_preaggregate_candidate_count = 0;
 	RecursiveCTESourcePhase source_phase = RecursiveCTESourcePhase::INITIAL;
 	bool output_is_working = false;
-	//! Cached chunk for distinct key extraction in the using_key Sink path
-	DataChunk distinct_rows;
 	//! Cached chunks for source-side hash table scans and recurring table copy paths
 	DataChunk source_result;
-	DataChunk update_rows;
 	DataChunk source_aggregate_rows;
 	DataChunk source_distinct_rows;
-	//! Final-state drain over the frozen hash table
-	AggregateHTParallelScanState drain_scan;
-	AggregateHTLocalScanState drain_local_scan;
+	//! Final-state drain over the frozen keyed partitions
+	RecursiveCTEKeyedScanState drain_scan;
+	RecursiveCTEKeyedLocalScanState drain_local_scan;
 
 	bool use_local_union_all_output = true;
 	//! Whether invariant recursive meta-pipelines have already been materialized for this state
@@ -393,15 +494,10 @@ private:
 	unique_ptr<RecursiveCTEEpochMetrics> epoch_metrics;
 
 	//! State used only by USING KEY recursive CTEs. Keep this after the regular-recursion hot state.
-	unique_ptr<RecursiveCTEKeyDeltaState> key_delta;
 	ClientContext &context;
 	vector<AggregateObject> payload_aggregate_objects;
-	unique_ptr<ExpressionExecutor> key_executor;
-	Vector preaggregation_hashes;
 	ArenaAllocator drain_arena;
 	RowOperationsState drain_row_state;
-	vector<unique_ptr<ExpressionExecutor>> payload_comparison_executors;
-	DataChunk raw_distinct_rows;
 	bool has_payload_comparison_executors = false;
 	bool can_preaggregate_using_key = false;
 	//! Whether a payload aggregate mutates its state in finalize, so concurrent finalizes need the lock
