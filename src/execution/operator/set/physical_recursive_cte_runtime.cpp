@@ -39,6 +39,8 @@ namespace duckdb {
 // Recursive iterations often produce small batches. Aim for about half a vector of input per worker
 // before increasing parallelism so scheduler overhead stays low on narrow recursive workloads.
 static constexpr const idx_t RECURSIVE_ROWS_PER_THREAD = STANDARD_VECTOR_SIZE / 2;
+// Each DISTINCT partition costs one locked probe per non-empty partition per chunk, so cap the fan-out.
+static constexpr const idx_t MAX_DISTINCT_PARTITIONS = 8;
 
 struct RecursiveCTEParallelism {
 	explicit RecursiveCTEParallelism(idx_t worker_count)
@@ -985,7 +987,9 @@ void PhysicalRecursiveCTE::ExecuteRecursivePipelines(ExecutionContext &context) 
 	}
 	const auto max_worker_count = parallelism.MaxWorkerCount();
 	if (max_worker_count > 1 && !using_key && !union_all) {
-		const auto partition_count = MinValue<idx_t>(NextPowerOfTwo(max_worker_count), 4);
+		// Promotion happens once, so size the partitions for the configured threads rather than this epoch
+		const auto configured_threads = TaskScheduler::GetScheduler(context.client).NumberOfThreads();
+		const auto partition_count = MinValue<idx_t>(NextPowerOfTwo(configured_threads), MAX_DISTINCT_PARTITIONS);
 		gstate.PromoteDistinctState(context.client, partition_count);
 	}
 	const auto epoch_start =
