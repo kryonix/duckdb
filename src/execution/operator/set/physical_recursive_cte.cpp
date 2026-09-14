@@ -138,8 +138,7 @@ idx_t RecursiveCTEKeyedPartition::WorkRows() const {
 RecursiveCTEState::RecursiveCTEState(ClientContext &context, const PhysicalRecursiveCTE &op)
     : op(op), allow_executor_reuse(Settings::Get<EnableCachingOperatorsSetting>(context)), metrics(context, op),
       scheduler(op.shared_executor_pool, allow_executor_reuse),
-      intermediate_table(context, op.using_key ? op.internal_types : op.GetTypes()), context(context),
-      drain_arena(Allocator::Get(context)), drain_row_state(drain_arena) {
+      intermediate_table(context, op.using_key ? op.internal_types : op.GetTypes()), context(context) {
 	if (metrics.Enabled()) {
 		epoch_metrics = make_uniq<RecursiveCTEEpochMetrics>();
 	}
@@ -215,8 +214,6 @@ RecursiveCTEState::RecursiveCTEState(ClientContext &context, const PhysicalRecur
 		    make_uniq<RecursiveCTEKeyedPartition>(context, op, payload_aggregate_objects, false));
 		keyed_layout = keyed_partitions[0]->ht->GetLayoutPtr();
 		metrics.RecordKeyedPartitions(1);
-		source_distinct_rows.Initialize(Allocator::DefaultAllocator(), op.hash_key_types);
-		source_aggregate_rows.Initialize(Allocator::DefaultAllocator(), op.aggregate_types);
 	} else if (!op.union_all) {
 		distinct_ht = make_uniq<GroupedAggregateHashTable>(context, BufferAllocator::Get(context), op.distinct_types);
 	}
@@ -1483,12 +1480,6 @@ void RecursiveCTEState::CommitPreaggregatedUsingKeyUpdatesInternal(RecursiveCTEK
 	}
 }
 
-void RecursiveCTEState::InitializeFinalStateDrain() {
-	InitializeKeyedScan(drain_scan);
-	// The local state re-initializes itself on the first partition it visits
-	drain_local_scan.partition_idx = DConstants::INVALID_INDEX;
-}
-
 idx_t RecursiveCTEState::PrepareKeyedCommit() {
 	D_ASSERT(op.using_key);
 	keyed_commit_partitions.clear();
@@ -1865,172 +1856,292 @@ SinkCombineResultType PhysicalRecursiveCTE::Combine(ExecutionContext &context, O
 //===--------------------------------------------------------------------===//
 // Source
 //===--------------------------------------------------------------------===//
+RecursiveCTESourceState::RecursiveCTESourceState(ClientContext &context, const PhysicalRecursiveCTE &op_p)
+    : op(op_p), thread_count(TaskScheduler::GetScheduler(context).NumberOfThreads()) {
+}
+
+idx_t RecursiveCTESourceState::MaxThreads() {
+	if (!op.sink_state) {
+		return 1;
+	}
+	auto &state = op.sink_state->Cast<RecursiveCTEState>();
+	return MinValue<idx_t>(thread_count, MaxValue<idx_t>(state.AnchorOutputChunks(), 1));
+}
+
+RecursiveCTESourceLocalState::RecursiveCTESourceLocalState(ClientContext &context, const PhysicalRecursiveCTE &op)
+    : arena(Allocator::Get(context)), row_state(arena) {
+	if (op.using_key) {
+		distinct_rows.Initialize(Allocator::Get(context), op.hash_key_types);
+		aggregate_rows.Initialize(Allocator::Get(context), op.aggregate_types);
+	}
+}
+
+unique_ptr<GlobalSourceState> PhysicalRecursiveCTE::GetGlobalSourceState(ClientContext &context) const {
+	return make_uniq<RecursiveCTESourceState>(context, *this);
+}
+
+unique_ptr<GlobalSourceState>
+PhysicalRecursiveCTE::GetGlobalSourceState(ClientContext &context, const OperatorPartitionInfo &partition_info) const {
+	return make_uniq<RecursiveCTESourceState>(context, *this);
+}
+
+unique_ptr<LocalSourceState> PhysicalRecursiveCTE::GetLocalSourceState(ExecutionContext &context,
+                                                                       GlobalSourceState &gstate) const {
+	return make_uniq<RecursiveCTESourceLocalState>(context.client, *this);
+}
+
 SourceResultType PhysicalRecursiveCTE::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                        OperatorSourceInput &input) const {
 	auto &gstate = sink_state->Cast<RecursiveCTEState>();
-	return gstate.GetData(context, chunk);
+	return gstate.GetData(context, chunk, input);
 }
 
-SourceResultType RecursiveCTEState::GetData(ExecutionContext &context, DataChunk &chunk) {
-	if (source_phase == RecursiveCTESourcePhase::INITIAL) {
-		if (op.using_key) {
-			source_phase = RecursiveCTESourcePhase::RECURSING_KEY;
-		} else {
-			CurrentOutputTable().InitializeScan(scan_state);
-			source_phase = RecursiveCTESourcePhase::SCANNING_UNION;
+idx_t RecursiveCTEState::AnchorOutputChunks() const {
+	if (op.using_key) {
+		return (KeyedGroupCount() + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
+	}
+	return intermediate_table.ChunkCount();
+}
+
+SourceResultType RecursiveCTEState::GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) {
+	auto &lstate = input.local_state.Cast<RecursiveCTESourceLocalState>();
+	if (!lstate.counted) {
+		lstate.counted = true;
+		if (metrics.Enabled()) {
+			metrics.RecordSourceTask();
 		}
 	}
-	return op.using_key ? GetUsingKeyData(context, chunk) : GetUnionData(context, chunk);
+	return op.using_key ? GetUsingKeyData(context, chunk, input) : GetUnionData(context, chunk, input);
 }
 
-SourceResultType RecursiveCTEState::GetUsingKeyData(ExecutionContext &context, DataChunk &chunk) {
-	if (metrics.Enabled()) {
-		return GetUsingKeyDataInternal<true>(context, chunk);
+void RecursiveCTEState::RunUsingKeyRecursion(ExecutionContext &context) {
+	D_ASSERT(op.using_key);
+	while (true) {
+		// The commit of the previous epoch left the next frontier in the working table
+		const auto expected_new = op.working_table->Count();
+		if (!op.union_all && expected_new == 0) {
+			return;
+		}
+		PreGrowKeyedState(expected_new);
+
+		const auto epoch_start = std::chrono::steady_clock::now();
+		op.ExecuteRecursivePipelines(context);
+		const auto epoch_end = std::chrono::steady_clock::now();
+		RecordKeyedEpochTime(
+		    NumericCast<idx_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(epoch_end - epoch_start).count()));
+		if (op.working_table->Count() == 0) {
+			return;
+		}
 	}
-	return GetUsingKeyDataInternal<false>(context, chunk);
 }
 
 template <bool COLLECT_METRICS>
-SourceResultType RecursiveCTEState::GetUsingKeyDataInternal(ExecutionContext &context, DataChunk &chunk) {
-	D_ASSERT(op.using_key);
-	while (true) {
-		switch (source_phase) {
-		case RecursiveCTESourcePhase::RECURSING_KEY: {
-			// The commit of the previous epoch left the next frontier in the working table
-			const auto expected_new = op.working_table->Count();
-			if (!op.union_all && expected_new == 0) {
-				InitializeFinalStateDrain();
-				source_phase = RecursiveCTESourcePhase::DRAINING_FINAL_KEY_STATE;
-				break;
+SourceResultType RecursiveCTEState::DrainUsingKeyState(DataChunk &chunk, RecursiveCTESourceState &gstate,
+                                                       RecursiveCTESourceLocalState &lstate) {
+	const auto drain_start =
+	    COLLECT_METRICS ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+	while (ScanKeyedGroups(gstate.drain_scan, lstate.drain_scan, lstate.distinct_rows)) {
+		if (lstate.distinct_rows.size() == 0) {
+			continue;
+		}
+		// Every task finalizes its own rows once, from the addresses the scan located
+		FinalizeAggregateRows(lstate.row_state, ScannedKeyedRowLocations(lstate.drain_scan), lstate.aggregate_rows,
+		                      lstate.distinct_rows.size());
+		AssembleStateRows(lstate.distinct_rows, lstate.aggregate_rows, chunk);
+		if constexpr (COLLECT_METRICS) {
+			if (!lstate.drained) {
+				lstate.drained = true;
+				metrics.RecordDrainTask();
 			}
-			PreGrowKeyedState(expected_new);
+			metrics.RecordFinalStateRows(chunk.size());
+			const auto drain_end = std::chrono::steady_clock::now();
+			GetEpochMetrics().RecordFinalStateDrain(NumericCast<idx_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(drain_end - drain_start).count()));
+		}
+		return SourceResultType::HAVE_MORE_OUTPUT;
+	}
+	if constexpr (COLLECT_METRICS) {
+		const auto drain_end = std::chrono::steady_clock::now();
+		GetEpochMetrics().RecordFinalStateDrain(
+		    NumericCast<idx_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(drain_end - drain_start).count()));
+	}
+	return SourceResultType::FINISHED;
+}
 
-			const auto epoch_start = std::chrono::steady_clock::now();
-			op.ExecuteRecursivePipelines(context);
-			const auto epoch_end = std::chrono::steady_clock::now();
-			RecordKeyedEpochTime(NumericCast<idx_t>(
-			    std::chrono::duration_cast<std::chrono::nanoseconds>(epoch_end - epoch_start).count()));
-			if (op.working_table->Count() == 0) {
-				InitializeFinalStateDrain();
-				source_phase = RecursiveCTESourcePhase::DRAINING_FINAL_KEY_STATE;
+SourceResultType RecursiveCTEState::GetUsingKeyData(ExecutionContext &context, DataChunk &chunk,
+                                                    OperatorSourceInput &input) {
+	D_ASSERT(op.using_key);
+	auto &gstate = input.global_state.Cast<RecursiveCTESourceState>();
+	auto &lstate = input.local_state.Cast<RecursiveCTESourceLocalState>();
+	{
+		annotated_unique_lock<annotated_mutex> guard(gstate.lock);
+		switch (gstate.phase) {
+		case RecursiveCTESourcePhase::INITIAL: {
+			// The first task runs the whole recursion; the frozen state is drained by every task afterwards
+			gstate.phase = RecursiveCTESourcePhase::RECURSING_KEY;
+			gstate.driver_active = true;
+			guard.unlock();
+			RunUsingKeyRecursion(context);
+			guard.lock();
+			gstate.driver_active = false;
+			InitializeKeyedScan(gstate.drain_scan);
+			gstate.phase = RecursiveCTESourcePhase::DRAINING_FINAL_KEY_STATE;
+			if (KeyedChunkCount() > 1) {
+				gstate.UnblockTasks();
 			}
 			break;
 		}
-		case RecursiveCTESourcePhase::DRAINING_FINAL_KEY_STATE: {
-			const auto drain_start =
-			    COLLECT_METRICS ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-			while (ScanKeyedGroups(drain_scan, drain_local_scan, source_distinct_rows)) {
-				if (source_distinct_rows.size() == 0) {
-					continue;
-				}
-				FinalizeAggregateRows(drain_row_state, ScannedKeyedRowLocations(drain_local_scan),
-				                      source_aggregate_rows, source_distinct_rows.size());
-				AssembleStateRows(source_distinct_rows, source_aggregate_rows, chunk);
-				if constexpr (COLLECT_METRICS) {
-					metrics.RecordFinalStateRows(chunk.size());
-					const auto drain_end = std::chrono::steady_clock::now();
-					GetEpochMetrics().RecordFinalStateDrain(NumericCast<idx_t>(
-					    std::chrono::duration_cast<std::chrono::nanoseconds>(drain_end - drain_start).count()));
-				}
-				return SourceResultType::HAVE_MORE_OUTPUT;
+		case RecursiveCTESourcePhase::RECURSING_KEY:
+			if (metrics.Enabled()) {
+				metrics.RecordBlockedSourceTask();
 			}
-			if constexpr (COLLECT_METRICS) {
-				const auto drain_end = std::chrono::steady_clock::now();
-				GetEpochMetrics().RecordFinalStateDrain(NumericCast<idx_t>(
-				    std::chrono::duration_cast<std::chrono::nanoseconds>(drain_end - drain_start).count()));
-			}
-			source_phase = RecursiveCTESourcePhase::FINISHED;
+			return gstate.BlockSource(input.interrupt_state);
+		case RecursiveCTESourcePhase::DRAINING_FINAL_KEY_STATE:
 			break;
-		}
 		case RecursiveCTESourcePhase::FINISHED:
 			return SourceResultType::FINISHED;
 		default:
 			throw InternalException("Unsupported recursive CTE key source phase");
 		}
 	}
+	const auto result = metrics.Enabled() ? DrainUsingKeyState<true>(chunk, gstate, lstate)
+	                                      : DrainUsingKeyState<false>(chunk, gstate, lstate);
+	if (result == SourceResultType::FINISHED) {
+		annotated_lock_guard<annotated_mutex> guard(gstate.lock);
+		gstate.phase = RecursiveCTESourcePhase::FINISHED;
+		gstate.UnblockTasks();
+	}
+	return result;
 }
 
-SourceResultType RecursiveCTEState::GetUnionData(ExecutionContext &context, DataChunk &chunk) {
+bool RecursiveCTEState::RunUnionEpoch(ExecutionContext &context) {
 	D_ASSERT(!op.using_key);
-	while (chunk.size() == 0) {
-		if (source_phase == RecursiveCTESourcePhase::SCANNING_UNION) {
-			// scan any chunks we have collected so far
-			CurrentOutputTable().Scan(scan_state, chunk);
-			if (chunk.size() != 0) {
-				break;
-			}
-		} else if (source_phase == RecursiveCTESourcePhase::FINISHED) {
-			break;
-		} else {
-			throw InternalException("Unsupported recursive CTE union source phase");
-		}
+	// The scanned output becomes the next iteration input
+	auto &current_output = CurrentOutputTable();
 
-		if (chunk.size() == 0) {
-			// we have run out of chunks
-			// now we need to recurse
-			// we set up the working table as the data we gathered in this iteration of the recursion
-			auto &current_output = CurrentOutputTable();
-
-			// After an iteration, we reset the recurring table
-			// and fill it up with the new hash table rows for the next iteration.
-			if (op.ref_recurring && current_output.Count() != 0) {
-				// we need to populate the recurring table from the intermediate table
-				// careful: we can not just use Combine here, because this destroys the intermediate table
-				// instead we need to scan and append to create a copy
-				// Note: as we are in the "normal" recursion case here, not the USING KEY case,
-				// we can just scan the intermediate table directly, instead of going through the HT
-				ColumnDataScanState recurring_scan_state;
-				current_output.InitializeScan(recurring_scan_state);
-				while (current_output.Scan(recurring_scan_state, source_result)) {
-					op.recurring_table->Append(recurring_append_state, source_result);
-				}
-			}
-
-			AdvanceIterationBuffers();
-			ResetCurrentOutputTableForReuse();
-			RebindRecursiveScans();
-
-			// Pre-grow the dedup HT to avoid costly Resize + ReinsertTuples during the next Sink phase.
-			// current_output.Count() is the count of rows output in the previous iteration — an upper bound
-			// on the number of new unique rows the next iteration can add (since the recursion is converging).
-			if (!op.union_all) {
-				const idx_t expected_new = current_output.Count();
-				if (expected_new > 0) {
-					if (distinct_partitions.empty()) {
-						const idx_t desired_capacity =
-						    GroupedAggregateHashTable::GetCapacityForCount(distinct_ht->Count() + expected_new);
-						if (desired_capacity > distinct_ht->Capacity()) {
-							distinct_ht->Resize(desired_capacity);
-						}
-					} else {
-						const auto expected_per_partition =
-						    (expected_new + distinct_partitions.size() - 1) / distinct_partitions.size();
-						for (auto &partition : distinct_partitions) {
-							const auto desired_capacity = GroupedAggregateHashTable::GetCapacityForCount(
-							    partition->ht.Count() + expected_per_partition);
-							if (desired_capacity > partition->ht.Capacity()) {
-								partition->ht.Resize(desired_capacity);
-							}
-						}
-					}
-				}
-			}
-
-			// now we need to re-execute all of the pipelines that depend on the recursion
-			op.ExecuteRecursivePipelines(context);
-
-			// check if we obtained any results
-			// if not, we are done
-			if (CurrentOutputTable().Count() == 0) {
-				source_phase = RecursiveCTESourcePhase::FINISHED;
-				break;
-			}
-			// set up the scan again
-			CurrentOutputTable().InitializeScan(scan_state);
+	// After an iteration, we reset the recurring table
+	// and fill it up with the new hash table rows for the next iteration.
+	if (op.ref_recurring && current_output.Count() != 0) {
+		// we need to populate the recurring table from the intermediate table
+		// careful: we can not just use Combine here, because this destroys the intermediate table
+		// instead we need to scan and append to create a copy
+		// Note: as we are in the "normal" recursion case here, not the USING KEY case,
+		// we can just scan the intermediate table directly, instead of going through the HT
+		ColumnDataScanState recurring_scan_state;
+		current_output.InitializeScan(recurring_scan_state);
+		while (current_output.Scan(recurring_scan_state, source_result)) {
+			op.recurring_table->Append(recurring_append_state, source_result);
 		}
 	}
 
-	return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
+	AdvanceIterationBuffers();
+	ResetCurrentOutputTableForReuse();
+	RebindRecursiveScans();
+
+	// Pre-grow the dedup HT to avoid costly Resize + ReinsertTuples during the next Sink phase.
+	// current_output.Count() is the count of rows output in the previous iteration — an upper bound
+	// on the number of new unique rows the next iteration can add (since the recursion is converging).
+	if (!op.union_all) {
+		const idx_t expected_new = current_output.Count();
+		if (expected_new > 0) {
+			if (distinct_partitions.empty()) {
+				const idx_t desired_capacity =
+				    GroupedAggregateHashTable::GetCapacityForCount(distinct_ht->Count() + expected_new);
+				if (desired_capacity > distinct_ht->Capacity()) {
+					distinct_ht->Resize(desired_capacity);
+				}
+			} else {
+				const auto expected_per_partition =
+				    (expected_new + distinct_partitions.size() - 1) / distinct_partitions.size();
+				for (auto &partition : distinct_partitions) {
+					const auto desired_capacity =
+					    GroupedAggregateHashTable::GetCapacityForCount(partition->ht.Count() + expected_per_partition);
+					if (desired_capacity > partition->ht.Capacity()) {
+						partition->ht.Resize(desired_capacity);
+					}
+				}
+			}
+		}
+	}
+
+	// now we need to re-execute all of the pipelines that depend on the recursion
+	op.ExecuteRecursivePipelines(context);
+
+	// check if we obtained any results
+	// if not, we are done
+	return CurrentOutputTable().Count() != 0;
+}
+
+SourceResultType RecursiveCTEState::GetUnionData(ExecutionContext &context, DataChunk &chunk,
+                                                 OperatorSourceInput &input) {
+	D_ASSERT(!op.using_key);
+	auto &gstate = input.global_state.Cast<RecursiveCTESourceState>();
+	auto &lstate = input.local_state.Cast<RecursiveCTESourceLocalState>();
+	while (true) {
+		annotated_unique_lock<annotated_mutex> guard(gstate.lock);
+		if (lstate.holds_chunk) {
+			// The chunk handed out last time has been consumed
+			lstate.holds_chunk = false;
+			gstate.in_flight--;
+		}
+		switch (gstate.phase) {
+		case RecursiveCTESourcePhase::INITIAL:
+			CurrentOutputTable().InitializeScan(gstate.output_scan);
+			gstate.epoch++;
+			gstate.phase = RecursiveCTESourcePhase::SCANNING_UNION;
+			break;
+		case RecursiveCTESourcePhase::SCANNING_UNION:
+			break;
+		case RecursiveCTESourcePhase::FINISHED:
+			return SourceResultType::FINISHED;
+		default:
+			throw InternalException("Unsupported recursive CTE union source phase");
+		}
+		if (!gstate.driver_active) {
+			if (lstate.seen_epoch != gstate.epoch) {
+				// The output collection changed, so the pinned chunk state of the previous epoch is stale
+				lstate.output_scan = ColumnDataLocalScanState();
+				lstate.seen_epoch = gstate.epoch;
+			}
+			// Scanners are counted so the epoch cannot switch under a chunk copy that runs outside the lock
+			gstate.scanning++;
+			guard.unlock();
+			const auto scanned = CurrentOutputTable().Scan(gstate.output_scan, lstate.output_scan, chunk);
+			guard.lock();
+			gstate.scanning--;
+			if (scanned) {
+				lstate.holds_chunk = true;
+				gstate.in_flight++;
+				return SourceResultType::HAVE_MORE_OUTPUT;
+			}
+			if (gstate.in_flight == 0 && gstate.scanning == 0 && !gstate.driver_active) {
+				// The last task out of the epoch runs the next one, without holding the lock, because the recursive
+				// pipelines may execute other tasks of this pipeline on this thread
+				gstate.driver_active = true;
+				guard.unlock();
+				const auto has_output = RunUnionEpoch(context);
+				guard.lock();
+				gstate.driver_active = false;
+				if (!has_output) {
+					gstate.phase = RecursiveCTESourcePhase::FINISHED;
+					gstate.UnblockTasks();
+					return SourceResultType::FINISHED;
+				}
+				CurrentOutputTable().InitializeScan(gstate.output_scan);
+				gstate.epoch++;
+				// Narrow epochs are consumed by the driver alone; parked tasks stay parked
+				if (CurrentOutputTable().ChunkCount() > 1) {
+					gstate.UnblockTasks();
+				}
+				continue;
+			}
+		}
+		// Another task drives the epoch or still holds one of its chunks: park until the next output is exposed
+		if (metrics.Enabled()) {
+			metrics.RecordBlockedSourceTask();
+		}
+		return gstate.BlockSource(input.interrupt_state);
+	}
 }
 
 vector<const_reference<PhysicalOperator>> PhysicalRecursiveCTE::GetSources() const {

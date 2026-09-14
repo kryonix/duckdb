@@ -1,0 +1,197 @@
+# name: test/sql/cte/recursive_cte_parallel_source.test
+# description: Recursive CTE output is scanned and drained by several source tasks while one task drives the epochs
+# group: [cte]
+
+statement ok
+SET threads=8;
+
+statement ok
+SET max_execution_time=20000;
+
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Wide UNION ALL epochs are scanned by every task; the last task out of an epoch runs the next one.
+query III
+WITH RECURSIVE t(i, level, h) AS (
+	SELECT i, 0, md5(i::VARCHAR) FROM range(50000) r(i)
+	UNION ALL
+	SELECT i, level + 1, md5(h) FROM t WHERE level < 3
+)
+SELECT count(*), count(DISTINCT h), sum(i * level)::BIGINT FROM t;
+----
+200000	200000	7499850000
+
+statement ok
+CALL disable_logging();
+
+query III
+SELECT info.source_tasks::UBIGINT > 1, info.blocked_source_tasks::UBIGINT > 0, info.drain_tasks::UBIGINT
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
+----
+true	true	0
+
+# UNION recursion with partitioned dedup keeps its result across the parallel scan.
+query III
+WITH RECURSIVE t(i) AS (
+	SELECT i FROM range(20000) r(i)
+	UNION
+	SELECT (i * 7 + 13) % 30000 FROM t WHERE i < 25000
+)
+SELECT count(*), sum(i)::BIGINT, max(i) FROM t;
+----
+27430	384303348	29998
+
+# The frozen USING KEY state is drained by several tasks after one task ran the recursion.
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query III
+WITH RECURSIVE t(k, v) USING KEY (k, max(v)) AS (
+	SELECT i, i % 7 FROM range(60000) r(i)
+	UNION
+	SELECT k, v + 1 FROM t WHERE v < 9
+)
+SELECT count(*), sum(v)::BIGINT, sum(k * v)::BIGINT FROM t;
+----
+60000	540000	16199730000
+
+statement ok
+CALL disable_logging();
+
+query III
+SELECT info.source_tasks::UBIGINT > 1, info.drain_tasks::UBIGINT > 1,
+       info.final_state_rows::UBIGINT = 60000
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
+----
+true	true	true
+
+# The parallel drain returns the same rows as a single-threaded run.
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TABLE expected_drain AS
+WITH RECURSIVE t(k, v, l) USING KEY (k, max(v), list(l)) AS (
+	SELECT i, i % 7, i::VARCHAR FROM range(60000) r(i)
+	UNION
+	SELECT k, v + 1, (v + 1)::VARCHAR FROM t WHERE v < 9
+)
+SELECT k, v, list_sort(l) AS l FROM t;
+
+statement ok
+SET threads=8;
+
+query II
+WITH RECURSIVE t(k, v, l) USING KEY (k, max(v), list(l)) AS (
+	SELECT i, i % 7, i::VARCHAR FROM range(60000) r(i)
+	UNION
+	SELECT k, v + 1, (v + 1)::VARCHAR FROM t WHERE v < 9
+),
+actual AS (SELECT k, v, list_sort(l) AS l FROM t)
+SELECT (SELECT count(*) FROM (TABLE actual EXCEPT TABLE expected_drain)),
+       (SELECT count(*) FROM (TABLE expected_drain EXCEPT TABLE actual));
+----
+0	0
+
+# A narrow recursion keeps a single source task, so nothing is parked.
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+WITH RECURSIVE t(i) AS (
+	SELECT 1
+	UNION ALL
+	SELECT i + 1 FROM t WHERE i < 100
+)
+SELECT sum(i) FROM t;
+----
+5050
+
+statement ok
+CALL disable_logging();
+
+query II
+SELECT info.source_tasks::UBIGINT, info.blocked_source_tasks::UBIGINT
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
+----
+1	0
+
+# A single-chunk anchor whose recursion grows wide stays on one task, in the driver's order.
+query I
+WITH RECURSIVE t(i) AS (
+	SELECT 0
+	UNION ALL
+	SELECT i + 1 FROM t WHERE i < 9
+)
+SELECT list(i) FROM t;
+----
+[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+query II
+WITH RECURSIVE t(i) AS (
+	SELECT i FROM range(20000) r(i)
+	UNION ALL
+	SELECT i + 20000 FROM t WHERE i < 60000
+)
+SELECT count(*), sum(i)::BIGINT FROM t;
+----
+80000	3199960000
+
+# LIMIT stops an unbounded recursion while other source tasks are parked at the epoch barrier.
+statement ok
+SET max_execution_time=5000;
+
+query I
+SELECT count(*) FROM (
+	WITH RECURSIVE t(i) AS (
+		SELECT i FROM range(20000) r(i)
+		UNION ALL
+		SELECT i + 20000 FROM t
+	)
+	SELECT i FROM t LIMIT 30000
+);
+----
+30000
+
+query I
+WITH RECURSIVE t(i) AS (
+	SELECT 0
+	UNION ALL
+	SELECT i + 1 FROM t
+)
+SELECT i FROM t WHERE i % 2000 = 0 LIMIT 5;
+----
+0
+2000
+4000
+6000
+8000
+
+# Streaming results consume the recursion chunk by chunk with the same barrier.
+statement ok
+SET streaming_buffer_size='1MB';
+
+query I
+SELECT count(*) FROM (
+	WITH RECURSIVE t(i, level, h) AS (
+		SELECT i, 0, md5(i::VARCHAR) FROM range(50000) r(i)
+		UNION ALL
+		SELECT i, level + 1, md5(h) FROM t WHERE level < 3
+	)
+	SELECT h FROM t
+);
+----
+200000

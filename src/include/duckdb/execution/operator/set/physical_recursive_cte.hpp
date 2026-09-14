@@ -103,11 +103,25 @@ public:
 
 public:
 	// Source interface
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context,
+	                                                   const OperatorPartitionInfo &partition_info) const override;
+	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
+	                                                 GlobalSourceState &gstate) const override;
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override;
 
 	bool IsSource() const override {
 		return true;
+	}
+
+	//! One task drives the recursion; every task scans the epoch output or drains the final keyed state
+	bool ParallelSource() const override {
+		return true;
+	}
+
+	OrderPreservationType SourceOrder() const override {
+		return OrderPreservationType::NO_ORDER;
 	}
 
 public:
