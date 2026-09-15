@@ -211,7 +211,7 @@ struct FirstFunction : public FirstFunctionBase {
 	}
 
 	template <class T, class STATE>
-	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
+	static void FinalizeReadOnly(const STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (!state.is_set || !state.value_is_valid) {
 			finalize_data.ReturnNull();
 		} else {
@@ -287,7 +287,7 @@ struct FirstFunctionString : FirstFunctionStringBase<LAST, SKIP_NULLS> {
 	}
 
 	template <class T, class STATE>
-	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
+	static void FinalizeReadOnly(const STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (!state.is_set || !state.value_is_valid) {
 			finalize_data.ReturnNull();
 		} else {
@@ -399,9 +399,9 @@ AggregateFunction GetFirstAggregateTemplated(const LogicalType &type) {
 	    AggregateFunction({type}, type, AggregateFunction::StateSize<FirstState<T>>,
 	                      AggregateFunction::StateInitialize<FirstState<T>, FirstFunction<LAST, SKIP_NULLS>>,
 	                      AggregateFunction::UnaryScatterUpdate<FirstState<T>, T, FirstFunction<LAST, SKIP_NULLS>>,
-	                      AggregateFunction::StateCombine<FirstState<T>, FirstFunction<LAST, SKIP_NULLS>>,
-	                      AggregateFunction::StateFinalize<FirstState<T>, T, FirstFunction<LAST, SKIP_NULLS>>,
+	                      AggregateFunction::StateCombine<FirstState<T>, FirstFunction<LAST, SKIP_NULLS>>, nullptr,
 	                      FunctionNullHandling::DEFAULT_NULL_HANDLING, FirstFunctionClusterUpdate<T, LAST, SKIP_NULLS>);
+	AggregateFunction::UseReadOnlyFinalize<FirstState<T>, T, FirstFunction<LAST, SKIP_NULLS>>(result);
 	AggregateFunction::WireStructStateType<FirstState<T>>(result);
 	return result;
 }
@@ -485,7 +485,6 @@ unique_ptr<FunctionData> BindDecimalFirst(BindAggregateFunctionInput &input) {
 	auto decimal_type = arguments[0]->GetReturnType();
 	auto name = function.GetName();
 	function.ReplaceImplementation(GetFirstFunction<LAST, SKIP_NULLS>(decimal_type));
-	function.SetFinalizeReadOnly(true);
 	function.SetName(std::move(name));
 	function.SetDistinctDependent(AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT);
 	function.SetDirectRewriteCallback(RewriteOrderedFirst<LAST, SKIP_NULLS>);
@@ -511,7 +510,6 @@ unique_ptr<FunctionData> BindFirst(BindAggregateFunctionInput &input) {
 	auto input_type = arguments[0]->GetReturnType();
 	auto name = function.GetName();
 	function.ReplaceImplementation(GetFirstOperator<LAST, SKIP_NULLS>(input_type));
-	function.SetFinalizeReadOnly(true);
 	function.SetName(std::move(name));
 	function.SetDistinctDependent(AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT);
 	function.SetDirectRewriteCallback(RewriteOrderedFirst<LAST, SKIP_NULLS>);
@@ -539,7 +537,6 @@ void AddFirstOperator(AggregateFunctionSet &set) {
 AggregateFunction FirstFunctionGetter::GetFunction(const LogicalType &type) {
 	auto fun = GetFirstFunction<false, false>(type);
 	fun.SetName("first");
-	fun.SetFinalizeReadOnly(true);
 	fun.SetDirectRewriteCallback(RewriteOrderedFirst<false, false>);
 	fun.SetSingleValueIdentity(true);
 	fun.SetStatisticsCallback(AggregateFunction::PropagateInputValueStats);
@@ -549,7 +546,6 @@ AggregateFunction FirstFunctionGetter::GetFunction(const LogicalType &type) {
 AggregateFunction LastFunctionGetter::GetFunction(const LogicalType &type) {
 	auto fun = GetFirstFunction<true, false>(type);
 	fun.SetName("last");
-	fun.SetFinalizeReadOnly(true);
 	fun.SetDirectRewriteCallback(RewriteOrderedFirst<true, false>);
 	fun.SetSingleValueIdentity(true);
 	fun.SetStatisticsCallback(AggregateFunction::PropagateInputValueStats);

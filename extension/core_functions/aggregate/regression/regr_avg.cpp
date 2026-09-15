@@ -58,7 +58,6 @@ AggregateFunction RegrAvgxFun::GetFunction() {
 	    LogicalType::DOUBLE, LogicalType::DOUBLE, LogicalType::DOUBLE);
 	fun.GetSignature().GetParameter(0).SetName("y");
 	fun.GetSignature().GetParameter(1).SetName("x");
-	fun.SetFinalizeReadOnly(true);
 	return fun;
 }
 
@@ -67,7 +66,6 @@ AggregateFunction RegrAvgyFun::GetFunction() {
 	    LogicalType::DOUBLE, LogicalType::DOUBLE, LogicalType::DOUBLE);
 	fun.GetSignature().GetParameter(0).SetName("y");
 	fun.GetSignature().GetParameter(1).SetName("x");
-	fun.SetFinalizeReadOnly(true);
 	return fun;
 }
 

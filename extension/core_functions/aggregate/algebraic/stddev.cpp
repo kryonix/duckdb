@@ -8,7 +8,6 @@ AggregateFunction StdDevSampFun::GetFunction() {
 	auto fun = AggregateFunction::UnaryAggregate<StddevState, double, double, STDDevSampOperation>(LogicalType::DOUBLE,
 	                                                                                               LogicalType::DOUBLE);
 	fun.GetSignature().GetParameter(0).SetName("x");
-	fun.SetFinalizeReadOnly(true);
 	return fun;
 }
 
@@ -16,7 +15,6 @@ AggregateFunction StdDevPopFun::GetFunction() {
 	auto fun = AggregateFunction::UnaryAggregate<StddevState, double, double, STDDevPopOperation>(LogicalType::DOUBLE,
 	                                                                                              LogicalType::DOUBLE);
 	fun.GetSignature().GetParameter(0).SetName("x");
-	fun.SetFinalizeReadOnly(true);
 	return fun;
 }
 
@@ -24,7 +22,6 @@ AggregateFunction VarPopFun::GetFunction() {
 	auto fun = AggregateFunction::UnaryAggregate<StddevState, double, double, VarPopOperation>(LogicalType::DOUBLE,
 	                                                                                           LogicalType::DOUBLE);
 	fun.GetSignature().GetParameter(0).SetName("x");
-	fun.SetFinalizeReadOnly(true);
 	return fun;
 }
 
@@ -32,7 +29,6 @@ AggregateFunction VarSampFun::GetFunction() {
 	auto fun = AggregateFunction::UnaryAggregate<StddevState, double, double, VarSampOperation>(LogicalType::DOUBLE,
 	                                                                                            LogicalType::DOUBLE);
 	fun.GetSignature().GetParameter(0).SetName("x");
-	fun.SetFinalizeReadOnly(true);
 	return fun;
 }
 
@@ -40,7 +36,6 @@ AggregateFunction StandardErrorOfTheMeanFun::GetFunction() {
 	auto fun = AggregateFunction::UnaryAggregate<StddevState, double, double, StandardErrorOfTheMeanOperation>(
 	    LogicalType::DOUBLE, LogicalType::DOUBLE);
 	fun.GetSignature().GetParameter(0).SetName("x");
-	fun.SetFinalizeReadOnly(true);
 	return fun;
 }
 

@@ -4,7 +4,8 @@
 
 require vector_size 2048
 
-# Read-only finalizes (min/max/sum/count/arg_min) are computed by parallel recurring scans and direct probes.
+# Finalizers declared read-only (FinalizeReadOnly: min/max/sum/count/arg_min here) are computed by parallel recurring
+# scans and direct probes without the finalize lock.
 statement ok
 SET threads=8;
 
@@ -387,3 +388,118 @@ SELECT (SELECT count(*) FROM (TABLE actual EXCEPT TABLE expected_bignum)),
        (SELECT count(*) FROM (TABLE expected_bignum EXCEPT TABLE actual));
 ----
 0	0
+
+# Every keyed CTE finalizes first (key representative) and last (payload columns) implicitly; the explicit forms,
+# the hand-built count and string_agg, the bind-replaced decimal sum and avg, and the typed arg_min are declared
+# read-only too.
+statement ok
+SET threads=1;
+
+statement ok
+CREATE OR REPLACE TABLE expected_read_only AS
+WITH RECURSIVE t(k, f, l, a, fs, ls, sa, sd, ad, am, ms, c)
+USING KEY (k, first(f), last(l), any_value(a), first(fs), last(ls), string_agg(sa), sum(sd), avg(ad), arg_min(am, c), min(ms), count(c)) AS (
+	SELECT i, i, i, i, i::VARCHAR, i::VARCHAR, i::VARCHAR, (i % 7)::DECIMAL(18, 3), (i % 5)::DECIMAL(18, 3), i, i::VARCHAR, 0
+	FROM range(16384) r(i)
+	UNION
+	SELECT n.k, r.f + 1, r.l + 1, r.a + 1, r.fs || 'x', r.ls || 'y', 'z', 1::DECIMAL(18, 3), 1::DECIMAL(18, 3), n.am + 1, r.ms || 'q', 1
+	FROM t n JOIN (SELECT * FROM recurring.t WHERE c < 3) r USING (k)
+)
+SELECT k, f, l, a, fs, ls, sa, sd::VARCHAR AS sd, ad::VARCHAR AS ad, am, ms, c FROM t;
+
+statement ok
+CREATE OR REPLACE TABLE expected_implicit AS
+WITH RECURSIVE u(k, v, s) USING KEY (k) AS (
+	SELECT i, 0, '' FROM range(16384) r(i)
+	UNION
+	SELECT n.k, r.v + 1, r.s || 'x' FROM u n JOIN (SELECT * FROM recurring.u WHERE v < 3) r USING (k)
+)
+SELECT * FROM u;
+
+statement ok
+SET threads=8;
+
+statement ok
+CALL enable_logging('PhysicalOperator');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+WITH RECURSIVE t(k, f, l, a, fs, ls, sa, sd, ad, am, ms, c)
+USING KEY (k, first(f), last(l), any_value(a), first(fs), last(ls), string_agg(sa), sum(sd), avg(ad), arg_min(am, c), min(ms), count(c)) AS (
+	SELECT i, i, i, i, i::VARCHAR, i::VARCHAR, i::VARCHAR, (i % 7)::DECIMAL(18, 3), (i % 5)::DECIMAL(18, 3), i, i::VARCHAR, 0
+	FROM range(16384) r(i)
+	UNION
+	SELECT n.k, r.f + 1, r.l + 1, r.a + 1, r.fs || 'x', r.ls || 'y', 'z', 1::DECIMAL(18, 3), 1::DECIMAL(18, 3), n.am + 1, r.ms || 'q', 1
+	FROM t n JOIN (SELECT * FROM recurring.t WHERE c < 3) r USING (k)
+),
+actual AS (SELECT k, f, l, a, fs, ls, sa, sd::VARCHAR AS sd, ad::VARCHAR AS ad, am, ms, c FROM t)
+SELECT (SELECT count(*) FROM (TABLE actual EXCEPT TABLE expected_read_only)),
+       (SELECT count(*) FROM (TABLE expected_read_only EXCEPT TABLE actual));
+----
+0	0
+
+query II
+WITH RECURSIVE u(k, v, s) USING KEY (k) AS (
+	SELECT i, 0, '' FROM range(16384) r(i)
+	UNION
+	SELECT n.k, r.v + 1, r.s || 'x' FROM u n JOIN (SELECT * FROM recurring.u WHERE v < 3) r USING (k)
+),
+actual AS (SELECT * FROM u)
+SELECT (SELECT count(*) FROM (TABLE actual EXCEPT TABLE expected_implicit)),
+       (SELECT count(*) FROM (TABLE expected_implicit EXCEPT TABLE actual));
+----
+0	0
+
+statement ok
+CALL disable_logging();
+
+query I
+SELECT bool_and(info.scheduled_workers::UBIGINT > info.epochs::UBIGINT)
+FROM duckdb_logs_parsed('PhysicalOperator')
+WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
+----
+true
+
+query IIII
+SELECT count(*), min(f - k), max(l - k), max(len(sa)) FROM expected_read_only;
+----
+16384	0	2	9
+
+# Aggregates without a read-only declaration keep the lock and still match the single-threaded results:
+# min and last over lists decode sort keys, arg_min over a list uses the vector variant, bit_or and kurtosis
+# simply never declared one.
+statement ok
+SET threads=1;
+
+statement ok
+CREATE OR REPLACE TABLE expected_locked AS
+WITH RECURSIVE t(k, ml, ll, al, bo, ku, c) USING KEY (k, min(ml), last(ll), arg_min(al, c), bit_or(bo), kurtosis(ku), sum(c)) AS (
+	SELECT i, [i], [i], [i], i, i::DOUBLE, 0 FROM range(16384) r(i)
+	UNION
+	SELECT n.k, [r.c + 1], [r.c + 1], [r.c + 1], r.c + 1, (r.c + 1)::DOUBLE, 1
+	FROM t n JOIN (SELECT * FROM recurring.t WHERE c < 4) r USING (k)
+)
+SELECT k, ml::VARCHAR AS ml, ll::VARCHAR AS ll, al::VARCHAR AS al, bo, round(ku, 6) AS ku, c FROM t;
+
+statement ok
+SET threads=8;
+
+query II
+WITH RECURSIVE t(k, ml, ll, al, bo, ku, c) USING KEY (k, min(ml), last(ll), arg_min(al, c), bit_or(bo), kurtosis(ku), sum(c)) AS (
+	SELECT i, [i], [i], [i], i, i::DOUBLE, 0 FROM range(16384) r(i)
+	UNION
+	SELECT n.k, [r.c + 1], [r.c + 1], [r.c + 1], r.c + 1, (r.c + 1)::DOUBLE, 1
+	FROM t n JOIN (SELECT * FROM recurring.t WHERE c < 4) r USING (k)
+),
+actual AS (SELECT k, ml::VARCHAR AS ml, ll::VARCHAR AS ll, al::VARCHAR AS al, bo, round(ku, 6) AS ku, c FROM t)
+SELECT (SELECT count(*) FROM (TABLE actual EXCEPT TABLE expected_locked)),
+       (SELECT count(*) FROM (TABLE expected_locked EXCEPT TABLE actual));
+----
+0	0
+
+query III
+SELECT count(*), max(c), count(ku) FROM expected_locked;
+----
+16384	4	16384

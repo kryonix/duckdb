@@ -118,7 +118,7 @@ struct NumericMinMaxBase : public MinMaxBase, public ClusteredStateCopy {
 	}
 
 	template <class T, class STATE>
-	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
+	static void FinalizeReadOnly(const STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (!state.is_set) {
 			finalize_data.ReturnNull();
 		} else {
@@ -189,7 +189,7 @@ struct StringMinMaxBase : public MinMaxBase {
 	}
 
 	template <class T, class STATE>
-	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
+	static void FinalizeReadOnly(const STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (!state.is_set) {
 			finalize_data.ReturnNull();
 		} else {
@@ -375,7 +375,6 @@ unique_ptr<FunctionData> BindMinMax(BindAggregateFunctionInput &input) {
 		vector<LogicalType> types {arguments[0]->GetReturnType(), collated_arg->GetReturnType()};
 		function.ReplaceImplementation(*GetCollatedMinMaxFunction(context, function.GetName(), types));
 		function.SetSingleValueIdentity(true);
-		function.SetFinalizeReadOnly(true);
 
 		// Bind function like arg_min/arg_max.
 		arguments.push_back(std::move(collated_arg));
@@ -405,7 +404,6 @@ unique_ptr<FunctionData> BindMinMax(BindAggregateFunctionInput &input) {
 	arguments = std::move(expr->GetChildrenMutable());
 
 	function.ReplaceImplementation(expr->Function());
-	function.SetFinalizeReadOnly(true);
 	return std::move(expr->BindInfoMutable());
 }
 
@@ -511,7 +509,7 @@ void SpecializeMinMaxNFunction(BoundAggregateFunction &function) {
 	function.GetCallbacks().SetStateCombineCallback(AggregateFunction::StateCombine<STATE, OP>);
 	function.GetCallbacks().SetStateDestructorCallback(AggregateFunction::StateDestroy<STATE, OP>);
 
-	function.GetCallbacks().SetStateFinalizeCallback(MinMaxNOperation::Finalize<STATE>);
+	function.SetStateFinalizeCallback(MinMaxNOperation::Finalize<STATE>);
 	function.GetCallbacks().SetStateUpdateCallback(MinMaxNUpdate<STATE>);
 }
 

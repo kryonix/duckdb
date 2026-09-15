@@ -32,7 +32,6 @@ AggregateFunction ListFun::GetFunction() {
 	func.GetSignature().AddParameter("arg", LogicalType::TEMPLATE("T"));
 	AggregateFunction::WireStructStateType<ListAggState>(func);
 
-	func.SetFinalizeReadOnly(true);
 	return func;
 }
 
