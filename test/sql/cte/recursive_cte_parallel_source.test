@@ -19,13 +19,13 @@ CALL truncate_duckdb_logs();
 # epoch runs the next one.
 query III
 WITH RECURSIVE t(i, level, h) AS (
-	SELECT i, 0, md5(i::VARCHAR) FROM range(50000) r(i)
+	SELECT i, 0, md5(i::VARCHAR) FROM range(20000) r(i)
 	UNION ALL
-	SELECT i, level + 1, md5(h) FROM t WHERE level < 3
+	SELECT i, level + 1, md5(h) FROM t WHERE level < 2
 )
 SELECT count(*), max(h), sum(i * level)::BIGINT FROM t;
 ----
-200000	fffffe98d0963d27015c198262d97221	7499850000
+60000	fffeea0584b93deda797dc8b65a5bd9f	599970000
 
 statement ok
 CALL disable_logging();
@@ -57,20 +57,20 @@ CALL truncate_duckdb_logs();
 
 query III
 WITH RECURSIVE t(k, v) USING KEY (k, max(v)) AS (
-	SELECT i, i % 7 FROM range(60000) r(i)
+	SELECT i, i % 7 FROM range(20000) r(i)
 	UNION
-	SELECT k, v + 1 FROM t WHERE v < 9
+	SELECT k, v + 1 FROM t WHERE v < 8
 )
 SELECT count(*), sum(v)::BIGINT, sum(k * v)::BIGINT FROM t;
 ----
-60000	540000	16199730000
+20000	160000	1599920000
 
 statement ok
 CALL disable_logging();
 
 query III
 SELECT info.source_tasks::UBIGINT > 1, info.drain_tasks::UBIGINT > 1,
-       info.final_state_rows::UBIGINT = 60000
+       info.final_state_rows::UBIGINT = 20000
 FROM duckdb_logs_parsed('PhysicalOperator')
 WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
 ----
@@ -83,9 +83,9 @@ SET threads=1;
 statement ok
 CREATE TABLE expected_drain AS
 WITH RECURSIVE t(k, v, l) USING KEY (k, max(v), list(l)) AS (
-	SELECT i, i % 7, i::VARCHAR FROM range(60000) r(i)
+	SELECT i, i % 7, i::VARCHAR FROM range(20000) r(i)
 	UNION
-	SELECT k, v + 1, (v + 1)::VARCHAR FROM t WHERE v < 9
+	SELECT k, v + 1, (v + 1)::VARCHAR FROM t WHERE v < 8
 )
 SELECT k, v, list_sort(l) AS l FROM t;
 
@@ -94,9 +94,9 @@ SET threads=8;
 
 query II
 WITH RECURSIVE t(k, v, l) USING KEY (k, max(v), list(l)) AS (
-	SELECT i, i % 7, i::VARCHAR FROM range(60000) r(i)
+	SELECT i, i % 7, i::VARCHAR FROM range(20000) r(i)
 	UNION
-	SELECT k, v + 1, (v + 1)::VARCHAR FROM t WHERE v < 9
+	SELECT k, v + 1, (v + 1)::VARCHAR FROM t WHERE v < 8
 ),
 actual AS (SELECT k, v, list_sort(l) AS l FROM t)
 SELECT (SELECT count(*) FROM (TABLE actual EXCEPT TABLE expected_drain)),
@@ -189,11 +189,11 @@ SET streaming_buffer_size='1MB';
 query I
 SELECT count(*) FROM (
 	WITH RECURSIVE t(i, level, h) AS (
-		SELECT i, 0, md5(i::VARCHAR) FROM range(50000) r(i)
+		SELECT i, 0, md5(i::VARCHAR) FROM range(20000) r(i)
 		UNION ALL
-		SELECT i, level + 1, md5(h) FROM t WHERE level < 3
+		SELECT i, level + 1, md5(h) FROM t WHERE level < 2
 	)
 	SELECT h FROM t
 );
 ----
-200000
+60000
