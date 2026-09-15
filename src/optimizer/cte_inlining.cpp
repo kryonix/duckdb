@@ -7,6 +7,7 @@
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 
 #include "duckdb/optimizer/optimizer.hpp"
@@ -65,12 +66,17 @@ static bool ContainsPipelineBreaker(const LogicalOperator &op) {
 	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
 	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
 	case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN:
-	case LogicalOperatorType::LOGICAL_UNION:
 	case LogicalOperatorType::LOGICAL_EXCEPT:
 	case LogicalOperatorType::LOGICAL_INTERSECT:
 	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
 	case LogicalOperatorType::LOGICAL_RECURSIVE_CTE:
 		return true;
+	case LogicalOperatorType::LOGICAL_UNION:
+		// UNION ALL streams both inputs; only the duplicate-removing form materializes
+		if (!op.Cast<LogicalSetOperation>().setop_all) {
+			return true;
+		}
+		break;
 	default:
 		break;
 	}
