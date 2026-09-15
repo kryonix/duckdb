@@ -153,7 +153,7 @@ RecursiveCTEState::RecursiveCTEState(ClientContext &context, const PhysicalRecur
 		D_ASSERT(op.payload_aggregates[i]->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE);
 		auto &bound_aggr_expr = op.payload_aggregates[i]->Cast<BoundAggregateExpression>();
 		payload_aggregate_objects.emplace_back(bound_aggr_expr);
-		finalize_requires_lock = finalize_requires_lock || bound_aggr_expr.Function().FinalizeMutatesState();
+		finalize_requires_lock = finalize_requires_lock || !bound_aggr_expr.Function().FinalizeIsReadOnly();
 	}
 	for (auto &comparison : op.payload_comparisons) {
 		if (comparison) {

@@ -301,6 +301,7 @@ unique_ptr<FunctionData> BindDecimalAvg(BindAggregateFunctionInput &input) {
 	auto &arguments = input.GetArguments();
 	auto decimal_type = arguments[0]->GetReturnType();
 	function.ReplaceImplementation(GetAverageAggregate(decimal_type.InternalType()));
+	function.SetFinalizeReadOnly(true);
 	function.SetName("avg");
 	function.GetArguments()[0] = decimal_type;
 	function.SetReturnType(LogicalType::DOUBLE);
@@ -326,29 +327,34 @@ AggregateFunctionSet AvgFun::GetFunctions() {
 	auto numeric_avg = AggregateFunction::UnaryAggregate<AvgState<double>, double, double, NumericAverageOperation>(
 	    LogicalType::DOUBLE, LogicalType::DOUBLE);
 	numeric_avg.GetSignature().GetParameter(0).SetName("x");
+	numeric_avg.SetFinalizeReadOnly(true);
 	avg.AddFunction(numeric_avg);
 
 	auto timestamp_avg =
 	    AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, int64_t, int64_t, DiscreteAverageOperation>(
 	        LogicalType::TIMESTAMP, LogicalType::TIMESTAMP);
 	timestamp_avg.GetSignature().GetParameter(0).SetName("x");
+	timestamp_avg.SetFinalizeReadOnly(true);
 	avg.AddFunction(timestamp_avg);
 
 	auto timestamp_tz_avg =
 	    AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, int64_t, int64_t, DiscreteAverageOperation>(
 	        LogicalType::TIMESTAMP_TZ, LogicalType::TIMESTAMP_TZ);
 	timestamp_tz_avg.GetSignature().GetParameter(0).SetName("x");
+	timestamp_tz_avg.SetFinalizeReadOnly(true);
 	avg.AddFunction(timestamp_tz_avg);
 
 	auto time_avg = AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, int64_t, int64_t, DiscreteAverageOperation>(
 	    LogicalType::TIME, LogicalType::TIME);
 	time_avg.GetSignature().GetParameter(0).SetName("x");
+	time_avg.SetFinalizeReadOnly(true);
 	avg.AddFunction(time_avg);
 
 	auto time_tz_avg =
 	    AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, dtime_tz_t, dtime_tz_t, TimeTZAverageOperation>(
 	        LogicalType::TIME_TZ, LogicalType::TIME_TZ);
 	time_tz_avg.GetSignature().GetParameter(0).SetName("x");
+	time_tz_avg.SetFinalizeReadOnly(true);
 	avg.AddFunction(time_tz_avg);
 
 	return avg;
@@ -358,6 +364,8 @@ AggregateFunction FAvgFun::GetFunction() {
 	auto fun = AggregateFunction::UnaryAggregate<KahanAvgState, double, double, KahanAverageOperation>(
 	    LogicalType::DOUBLE, LogicalType::DOUBLE);
 	fun.GetSignature().GetParameter(0).SetName("x");
+	fun.SetFinalizeReadOnly(true);
+	fun.SetFinalizeReadOnly(true);
 	return fun;
 }
 

@@ -111,8 +111,11 @@ struct DecimalAvgOperation {
 
 template <class INPUT_TYPE>
 static AggregateFunction MakeDecimalAvgFunction(const LogicalType &input_type, const LogicalType &return_type) {
-	return AggregateFunction::UnaryAggregate<DecimalAvgState, INPUT_TYPE, INPUT_TYPE, DecimalAvgOperation<INPUT_TYPE>>(
-	    input_type, return_type);
+	auto fun =
+	    AggregateFunction::UnaryAggregate<DecimalAvgState, INPUT_TYPE, INPUT_TYPE, DecimalAvgOperation<INPUT_TYPE>>(
+	        input_type, return_type);
+	fun.SetFinalizeReadOnly(true);
+	return fun;
 }
 
 static unique_ptr<FunctionData> BindDecimalAverage(BindAggregateFunctionInput &input) {

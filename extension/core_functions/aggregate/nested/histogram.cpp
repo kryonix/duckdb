@@ -179,6 +179,7 @@ AggregateFunction GetHistogramFunction(const LogicalType &type) {
 	    nullptr, AggregateFunction::StateDestroy<STATE_TYPE, HIST_FUNC>);
 	function.GetSignature().AddParameter("arg", type);
 	function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
+	function.SetFinalizeReadOnly(true);
 	return function;
 }
 
