@@ -338,7 +338,8 @@ public:
 	//! Whether a single input row finalizes to that input's first argument unchanged
 	bool single_value_identity = false;
 
-	//! Whether finalize leaves the state untouched, so several threads may finalize the same state at once
+	//! Whether finalize leaves the state untouched, so several threads may finalize the same state at once and the
+	//! state stays valid for further updates and reads. Finalizers that sort, compress or trim in place must not set it.
 	bool finalize_read_only = false;
 
 	bool operator==(const AggregateFunctionProperties &rhs) const;

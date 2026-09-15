@@ -411,7 +411,7 @@ public:
 		return keyed_partitions.size();
 	}
 	idx_t KeyedPartitionIndex(hash_t hash) const;
-	GroupedAggregateHashTable &GetKeyedHashTable(idx_t partition_idx);
+	const GroupedAggregateHashTable &GetKeyedHashTable(idx_t partition_idx) const;
 	const TupleDataLayout &KeyedLayout() const;
 	shared_ptr<TupleDataLayout> KeyedLayoutPtr() const;
 	idx_t KeyedGroupCount() const;

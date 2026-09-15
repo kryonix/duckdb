@@ -363,7 +363,7 @@ idx_t RecursiveCTEState::KeyedPartitionIndex(hash_t hash) const {
 	return RadixPartitioning::ApplyMask(hash, keyed_radix_bits);
 }
 
-GroupedAggregateHashTable &RecursiveCTEState::GetKeyedHashTable(idx_t partition_idx) {
+const GroupedAggregateHashTable &RecursiveCTEState::GetKeyedHashTable(idx_t partition_idx) const {
 	D_ASSERT(partition_idx < keyed_partitions.size());
 	return *keyed_partitions[partition_idx]->ht;
 }

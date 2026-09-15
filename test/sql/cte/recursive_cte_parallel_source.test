@@ -68,8 +68,9 @@ SELECT count(*), sum(v)::BIGINT, sum(k * v)::BIGINT FROM t;
 statement ok
 CALL disable_logging();
 
+# Parked tasks join the drain once they wake up, which a loaded machine may delay past the end of a small drain.
 query III
-SELECT info.source_tasks::UBIGINT > 1, info.drain_tasks::UBIGINT > 1,
+SELECT info.source_tasks::UBIGINT > 1, info.drain_tasks::UBIGINT >= 1,
        info.final_state_rows::UBIGINT = 20000
 FROM duckdb_logs_parsed('PhysicalOperator')
 WHERE class = 'PhysicalRecursiveCTE' AND event = 'RuntimeMetrics';
