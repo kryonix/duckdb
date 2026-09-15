@@ -335,6 +335,7 @@ void TestVectorTypesFunction(ClientContext &context, TableFunctionInput &data_p,
 void TestVectorTypesFun::RegisterFunction(BuiltinFunctions &set) {
 	TableFunction test_vector_types("test_vector_types", {LogicalType::ANY}, TestVectorTypesFunction,
 	                                TestVectorTypesBind, TestVectorTypesInit);
+	test_vector_types.to_sql = TableFunction::ToSQLFunctionCall;
 	test_vector_types.SetVarArgs(LogicalType::ANY);
 	test_vector_types.is_repeatable = [](optional_ptr<const FunctionData>) {
 		return true;
