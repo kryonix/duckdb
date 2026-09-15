@@ -20,6 +20,7 @@ struct BitState {
 
 static AggregateFunction NameArgParameter(AggregateFunction fun) {
 	fun.GetSignature().GetParameter(0).SetName("arg");
+	fun.SetFinalizeReadOnly(true);
 	return fun;
 }
 

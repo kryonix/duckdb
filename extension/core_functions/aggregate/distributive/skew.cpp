@@ -90,6 +90,7 @@ AggregateFunction SkewnessFun::GetFunction() {
 	auto fun = AggregateFunction::UnaryAggregate<SkewState, double, double, SkewnessOperation>(LogicalType::DOUBLE,
 	                                                                                           LogicalType::DOUBLE);
 	fun.GetSignature().GetParameter(0).SetName("x");
+	fun.SetFinalizeReadOnly(true);
 	return fun;
 }
 

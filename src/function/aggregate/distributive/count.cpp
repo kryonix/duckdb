@@ -295,6 +295,7 @@ AggregateFunction CountFunctionBase::GetFunction() {
 	                      FunctionNullHandling::SPECIAL_HANDLING, CountFunction::CountClusterUpdate);
 	fun.GetSignature().AddParameter("arg", LogicalTypeId::ANY);
 	fun.SetName("count");
+	fun.SetFinalizeReadOnly(true);
 	fun.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
 	fun.SetStructStateExport(GetCountStateType);
 	fun.SetStatisticsCallback(CountPropagateStats);
@@ -304,6 +305,7 @@ AggregateFunction CountFunctionBase::GetFunction() {
 AggregateFunction CountStarFun::GetFunction() {
 	auto fun = AggregateFunction::NullaryAggregate<int64_t, int64_t, CountStarFunction>(LogicalType::BIGINT);
 	fun.SetName("count_star");
+	fun.SetFinalizeReadOnly(true);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	fun.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
 	fun.SetWindowBatchCallback(CountStarFunction::Window<int64_t>);

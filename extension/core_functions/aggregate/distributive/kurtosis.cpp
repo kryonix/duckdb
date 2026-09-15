@@ -105,6 +105,7 @@ AggregateFunction KurtosisFun::GetFunction() {
 	        LogicalType::DOUBLE, LogicalType::DOUBLE);
 	result.GetSignature().GetParameter(0).SetName("x");
 	result.SetFallible();
+	result.SetFinalizeReadOnly(true);
 	return result;
 }
 
@@ -114,6 +115,7 @@ AggregateFunction KurtosisPopFun::GetFunction() {
 	    LogicalType::DOUBLE, LogicalType::DOUBLE);
 	result.GetSignature().GetParameter(0).SetName("x");
 	result.SetFallible();
+	result.SetFinalizeReadOnly(true);
 	return result;
 }
 

@@ -538,7 +538,7 @@ private:
 	vector<AggregateObject> payload_aggregate_objects;
 	bool has_payload_comparison_executors = false;
 	bool can_preaggregate_using_key = false;
-	//! Whether a payload aggregate mutates its state in finalize, so concurrent finalizes need the lock
+	//! Whether a payload aggregate has not declared a read-only finalize, so concurrent finalizes need the lock
 	bool finalize_requires_lock = false;
 	bool can_reuse_new_group_candidates = false;
 	bool can_reuse_changed_group_candidates = false;

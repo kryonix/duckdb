@@ -13,6 +13,7 @@ AggregateFunction RegrCountFun::GetFunction() {
 	regr_count.GetSignature().GetParameter(1).SetName("x");
 	regr_count.SetName("regr_count");
 	regr_count.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	regr_count.SetFinalizeReadOnly(true);
 	return regr_count;
 }
 
