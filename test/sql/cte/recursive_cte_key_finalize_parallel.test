@@ -311,3 +311,79 @@ SELECT (SELECT count(*) FROM (TABLE actual EXCEPT TABLE expected_payload)),
        (SELECT count(*) FROM (TABLE expected_payload EXCEPT TABLE actual));
 ----
 0	0
+
+# Reading a state must leave it valid for later reads and updates: min(v, 3) used to sort its heap in place while
+# finalizing, so the inserts of the next epoch corrupted the kept values.
+statement ok
+SET threads=1;
+
+query III
+WITH RECURSIVE t(k, v, iter) USING KEY (k, min(v, 3), max(iter)) AS (
+	SELECT 0, i, 0 FROM range(1, 4) r(i)
+	UNION ALL
+	SELECT n.k, 2, 1 FROM t n JOIN recurring.t r USING (k) WHERE n.iter = 0
+)
+SELECT k, v, iter FROM t;
+----
+0	[1, 2, 2]	1
+
+query III
+WITH RECURSIVE t(k, v, iter) USING KEY (k, max(v, 3), max(iter)) AS (
+	SELECT 0, i, 0 FROM range(1, 4) r(i)
+	UNION ALL
+	SELECT n.k, 2, 1 FROM t n JOIN recurring.t r USING (k) WHERE n.iter = 0
+)
+SELECT k, v, iter FROM t;
+----
+0	[3, 2, 2]	1
+
+query III
+WITH RECURSIVE t(k, v, iter) USING KEY (k, arg_min(v, v, 3), max(iter)) AS (
+	SELECT 0, i, 0 FROM range(1, 4) r(i)
+	UNION ALL
+	SELECT n.k, 2, 1 FROM t n JOIN recurring.t r USING (k) WHERE n.iter = 0
+)
+SELECT k, v, iter FROM t;
+----
+0	[1, 2, 2]	1
+
+# sum(BIGNUM) trims its intermediate while converting, so its finalize keeps the lock.
+statement ok
+SET threads=2;
+
+query I
+WITH RECURSIVE t(k, v, iter) USING KEY (k, sum(v), max(iter)) AS (
+	SELECT i % 10, (i % 100)::BIGNUM, 0 FROM range(4096) r(i)
+	UNION ALL
+	SELECT n.k, r.v, 1 FROM t n JOIN recurring.t r USING (k) WHERE n.iter = 0
+)
+SELECT count(*) FROM t;
+----
+10
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE OR REPLACE TABLE expected_bignum AS
+WITH RECURSIVE t(k, v, iter) USING KEY (k, sum(v), max(iter)) AS (
+	SELECT i % 10, (i % 100)::BIGNUM, 0 FROM range(4096) r(i)
+	UNION ALL
+	SELECT n.k, r.v, 1 FROM t n JOIN recurring.t r USING (k) WHERE n.iter = 0
+)
+SELECT k, v::VARCHAR AS v, iter FROM t;
+
+statement ok
+SET threads=8;
+
+query II
+WITH RECURSIVE t(k, v, iter) USING KEY (k, sum(v), max(iter)) AS (
+	SELECT i % 10, (i % 100)::BIGNUM, 0 FROM range(4096) r(i)
+	UNION ALL
+	SELECT n.k, r.v, 1 FROM t n JOIN recurring.t r USING (k) WHERE n.iter = 0
+),
+actual AS (SELECT k, v::VARCHAR AS v, iter FROM t)
+SELECT (SELECT count(*) FROM (TABLE actual EXCEPT TABLE expected_bignum)),
+       (SELECT count(*) FROM (TABLE expected_bignum EXCEPT TABLE actual));
+----
+0	0
