@@ -51,6 +51,36 @@ SELECT count(*), max(v) FROM r;
 ----
 1001	1000
 
+# UNION ALL streams, so a member-only CTE that only concatenates scans is inlined as well.
+query II
+EXPLAIN WITH RECURSIVE w(k, c) AS (SELECT i, i FROM range(500) t(i) UNION ALL SELECT i, i FROM range(500, 1000) t(i)),
+r(k, v) AS (SELECT 1, 0 UNION ALL SELECT r.k, r.v + w.c FROM r JOIN w USING (k) WHERE r.v < 1000)
+SELECT count(*), max(v) FROM r;
+----
+logical_opt	<!REGEX>:.*CTE Name: w.*
+
+query II
+WITH RECURSIVE w(k, c) AS (SELECT i, i FROM range(500) t(i) UNION ALL SELECT i, i FROM range(500, 1000) t(i)),
+r(k, v) AS (SELECT 1, 0 UNION ALL SELECT r.k, r.v + w.c FROM r JOIN w USING (k) WHERE r.v < 1000)
+SELECT count(*), max(v) FROM r;
+----
+1001	1000
+
+# UNION removes duplicates through an aggregate, so that definition stays materialized.
+query II
+EXPLAIN WITH RECURSIVE w(k, c) AS (SELECT i, i FROM range(1000) t(i) UNION SELECT i, i FROM range(1000) t(i)),
+r(k, v) AS (SELECT 1, 0 UNION ALL SELECT r.k, r.v + w.c FROM r JOIN w USING (k) WHERE r.v < 1000)
+SELECT count(*), max(v) FROM r;
+----
+logical_opt	<REGEX>:.*CTE Name: w[\s\S]*Rec CTE.*
+
+query II
+WITH RECURSIVE w(k, c) AS (SELECT i, i FROM range(1000) t(i) UNION SELECT i, i FROM range(1000) t(i)),
+r(k, v) AS (SELECT 1, 0 UNION ALL SELECT r.k, r.v + w.c FROM r JOIN w USING (k) WHERE r.v < 1000)
+SELECT count(*), max(v) FROM r;
+----
+1001	1000
+
 # A CTE referenced from both the anchor and the member keeps the existing materialization decision.
 query II
 EXPLAIN WITH RECURSIVE w(k, c) AS (SELECT i, count(*) OVER (PARTITION BY i % 10) FROM range(1000) t(i)),
