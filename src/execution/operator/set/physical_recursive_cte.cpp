@@ -54,7 +54,7 @@ idx_t PhysicalRecursiveCTE::NextMetricsInvocation() const {
 // Sink State
 //===--------------------------------------------------------------------===//
 // Partition commits below this many rows in flight are not worth a task each.
-static constexpr const idx_t KEYED_COMMIT_ROWS_PER_TASK = 4 * STANDARD_VECTOR_SIZE;
+static constexpr const idx_t KEYED_COMMIT_ROWS_PER_TASK = idx_t(4) * STANDARD_VECTOR_SIZE;
 // Partitions are only worth their per-epoch bookkeeping once a commit has work for several tasks.
 static constexpr const idx_t KEYED_PROMOTION_ROWS = 2 * KEYED_COMMIT_ROWS_PER_TASK;
 // Routing and partition-major scans have a price too, so the serial commit must be at least this share of an epoch.
