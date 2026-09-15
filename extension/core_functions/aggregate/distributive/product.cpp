@@ -42,7 +42,6 @@ AggregateFunction ProductFun::GetFunction() {
 	auto fun = AggregateFunction::UnaryAggregate<ProductState, double, double, ProductFunction>(
 	    LogicalType(LogicalTypeId::DOUBLE), LogicalType::DOUBLE);
 	fun.GetSignature().GetParameter(0).SetName("arg");
-	fun.SetFinalizeReadOnly(true);
 	return fun;
 }
 

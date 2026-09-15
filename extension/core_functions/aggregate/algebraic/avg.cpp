@@ -97,7 +97,7 @@ struct IntegerAverageOperation : public BaseSumOperation<AverageSetOperation, Re
 	}
 
 	template <class T, class STATE>
-	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
+	static void FinalizeReadOnly(const STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (state.count == 0) {
 			finalize_data.ReturnNull();
 		} else {
@@ -114,7 +114,7 @@ struct IntegerAverageOperationHugeint : public BaseSumOperation<AverageSetOperat
 	}
 
 	template <class T, class STATE>
-	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
+	static void FinalizeReadOnly(const STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (state.count == 0) {
 			finalize_data.ReturnNull();
 		} else {
@@ -131,7 +131,7 @@ struct DiscreteAverageOperation : public BaseSumOperation<AverageSetOperation, A
 	}
 
 	template <class T, class STATE>
-	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
+	static void FinalizeReadOnly(const STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (state.count == 0) {
 			finalize_data.ReturnNull();
 		} else {
@@ -150,7 +150,7 @@ struct HugeintAverageOperation : public BaseSumOperation<AverageSetOperation, Hu
 	}
 
 	template <class T, class STATE>
-	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
+	static void FinalizeReadOnly(const STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (state.count == 0) {
 			finalize_data.ReturnNull();
 		} else {
@@ -167,7 +167,7 @@ struct NumericAverageOperation : public BaseSumOperation<AverageSetOperation, Re
 	}
 
 	template <class T, class STATE>
-	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
+	static void FinalizeReadOnly(const STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (state.count == 0) {
 			finalize_data.ReturnNull();
 		} else {
@@ -178,7 +178,7 @@ struct NumericAverageOperation : public BaseSumOperation<AverageSetOperation, Re
 
 struct KahanAverageOperation : public BaseSumOperation<AverageSetOperation, KahanAdd> {
 	template <class T, class STATE>
-	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
+	static void FinalizeReadOnly(const STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (state.count == 0) {
 			finalize_data.ReturnNull();
 		} else {
@@ -194,7 +194,7 @@ struct IntervalAverageOperation : public BaseSumOperation<AverageSetOperation, I
 	}
 
 	template <class RESULT_TYPE, class STATE>
-	static void Finalize(STATE &state, RESULT_TYPE &target, AggregateFinalizeData &finalize_data) {
+	static void FinalizeReadOnly(const STATE &state, RESULT_TYPE &target, AggregateFinalizeData &finalize_data) {
 		if (state.count == 0) {
 			finalize_data.ReturnNull();
 		} else {
@@ -246,7 +246,7 @@ struct TimeTZAverageOperation : public BaseSumOperation<AverageSetOperation, Add
 	}
 
 	template <class T, class STATE>
-	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
+	static void FinalizeReadOnly(const STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (state.count == 0) {
 			finalize_data.ReturnNull();
 		} else {
@@ -301,7 +301,6 @@ unique_ptr<FunctionData> BindDecimalAvg(BindAggregateFunctionInput &input) {
 	auto &arguments = input.GetArguments();
 	auto decimal_type = arguments[0]->GetReturnType();
 	function.ReplaceImplementation(GetAverageAggregate(decimal_type.InternalType()));
-	function.SetFinalizeReadOnly(true);
 	function.SetName("avg");
 	function.GetArguments()[0] = decimal_type;
 	function.SetReturnType(LogicalType::DOUBLE);
@@ -314,7 +313,6 @@ unique_ptr<FunctionData> BindDecimalAvg(BindAggregateFunctionInput &input) {
 AggregateFunctionSet AvgFun::GetFunctions() {
 	AggregateFunctionSet avg;
 
-	// The first is already opted-in during `BindDecimalAvg`
 	AggregateFunction decimal_avg({}, LogicalTypeId::DECIMAL, nullptr, nullptr, nullptr, nullptr, nullptr,
 	                              FunctionNullHandling::DEFAULT_NULL_HANDLING, nullptr, BindDecimalAvg);
 	decimal_avg.GetSignature().AddParameter("x", LogicalTypeId::DECIMAL);
@@ -327,34 +325,29 @@ AggregateFunctionSet AvgFun::GetFunctions() {
 	auto numeric_avg = AggregateFunction::UnaryAggregate<AvgState<double>, double, double, NumericAverageOperation>(
 	    LogicalType::DOUBLE, LogicalType::DOUBLE);
 	numeric_avg.GetSignature().GetParameter(0).SetName("x");
-	numeric_avg.SetFinalizeReadOnly(true);
 	avg.AddFunction(numeric_avg);
 
 	auto timestamp_avg =
 	    AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, int64_t, int64_t, DiscreteAverageOperation>(
 	        LogicalType::TIMESTAMP, LogicalType::TIMESTAMP);
 	timestamp_avg.GetSignature().GetParameter(0).SetName("x");
-	timestamp_avg.SetFinalizeReadOnly(true);
 	avg.AddFunction(timestamp_avg);
 
 	auto timestamp_tz_avg =
 	    AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, int64_t, int64_t, DiscreteAverageOperation>(
 	        LogicalType::TIMESTAMP_TZ, LogicalType::TIMESTAMP_TZ);
 	timestamp_tz_avg.GetSignature().GetParameter(0).SetName("x");
-	timestamp_tz_avg.SetFinalizeReadOnly(true);
 	avg.AddFunction(timestamp_tz_avg);
 
 	auto time_avg = AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, int64_t, int64_t, DiscreteAverageOperation>(
 	    LogicalType::TIME, LogicalType::TIME);
 	time_avg.GetSignature().GetParameter(0).SetName("x");
-	time_avg.SetFinalizeReadOnly(true);
 	avg.AddFunction(time_avg);
 
 	auto time_tz_avg =
 	    AggregateFunction::UnaryAggregate<AvgState<hugeint_t>, dtime_tz_t, dtime_tz_t, TimeTZAverageOperation>(
 	        LogicalType::TIME_TZ, LogicalType::TIME_TZ);
 	time_tz_avg.GetSignature().GetParameter(0).SetName("x");
-	time_tz_avg.SetFinalizeReadOnly(true);
 	avg.AddFunction(time_tz_avg);
 
 	return avg;
@@ -364,8 +357,6 @@ AggregateFunction FAvgFun::GetFunction() {
 	auto fun = AggregateFunction::UnaryAggregate<KahanAvgState, double, double, KahanAverageOperation>(
 	    LogicalType::DOUBLE, LogicalType::DOUBLE);
 	fun.GetSignature().GetParameter(0).SetName("x");
-	fun.SetFinalizeReadOnly(true);
-	fun.SetFinalizeReadOnly(true);
 	return fun;
 }
 

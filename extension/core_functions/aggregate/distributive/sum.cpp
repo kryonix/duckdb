@@ -83,7 +83,7 @@ struct ClusteredSumOperation : public ClusteredSumStateCopy<BASE> {
 	}
 
 	template <class T, class STATE>
-	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
+	static void FinalizeReadOnly(const STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (!state.is_set) {
 			finalize_data.ReturnNull();
 		} else {
@@ -186,7 +186,7 @@ struct IntegerSumOperation
 	}
 
 	template <class T, class STATE>
-	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
+	static void FinalizeReadOnly(const STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (!state.is_set) {
 			finalize_data.ReturnNull();
 		} else {
@@ -273,7 +273,6 @@ AggregateFunction GetSumAggregateNoOverflow(PhysicalType type) {
 		function.SetBindCallback(SumNoOverflowBind);
 		function.SetSerializeCallback(SumNoOverflowSerialize);
 		function.SetDeserializeCallback(SumNoOverflowDeserialize);
-		function.SetFinalizeReadOnly(true);
 		return function;
 	}
 	case PhysicalType::INT64: {
@@ -285,7 +284,6 @@ AggregateFunction GetSumAggregateNoOverflow(PhysicalType type) {
 		function.SetBindCallback(SumNoOverflowBind);
 		function.SetSerializeCallback(SumNoOverflowSerialize);
 		function.SetDeserializeCallback(SumNoOverflowDeserialize);
-		function.SetFinalizeReadOnly(true);
 		return function;
 	}
 	default:
@@ -375,7 +373,6 @@ AggregateFunction GetSumAggregate(PhysicalType type) {
 		function.GetSignature().GetParameter(0).SetName("arg");
 		function.SetStatisticsCallback(SumPropagateStats);
 		function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
-		function.SetFinalizeReadOnly(true);
 		return function;
 	}
 	case PhysicalType::INT16: {
@@ -384,7 +381,6 @@ AggregateFunction GetSumAggregate(PhysicalType type) {
 		function.GetSignature().GetParameter(0).SetName("arg");
 		function.SetStatisticsCallback(SumPropagateStats);
 		function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
-		function.SetFinalizeReadOnly(true);
 		return function;
 	}
 
@@ -395,7 +391,6 @@ AggregateFunction GetSumAggregate(PhysicalType type) {
 		function.GetSignature().GetParameter(0).SetName("arg");
 		function.SetStatisticsCallback(SumPropagateStats);
 		function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
-		function.SetFinalizeReadOnly(true);
 		return function;
 	}
 	case PhysicalType::INT64: {
@@ -405,7 +400,6 @@ AggregateFunction GetSumAggregate(PhysicalType type) {
 		function.GetSignature().GetParameter(0).SetName("arg");
 		function.SetStatisticsCallback(SumPropagateStats);
 		function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
-		function.SetFinalizeReadOnly(true);
 		return function;
 	}
 	case PhysicalType::INT128: {
@@ -415,7 +409,6 @@ AggregateFunction GetSumAggregate(PhysicalType type) {
 		function.GetSignature().GetParameter(0).SetName("arg");
 		function.SetStatisticsCallback(SumPropagateStats);
 		function.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
-		function.SetFinalizeReadOnly(true);
 		return function;
 	}
 	default:
@@ -428,7 +421,6 @@ unique_ptr<FunctionData> BindDecimalSum(BindAggregateFunctionInput &input) {
 	auto &arguments = input.GetArguments();
 	auto decimal_type = arguments[0]->GetReturnType();
 	function.ReplaceImplementation(GetSumAggregate(decimal_type.InternalType()));
-	function.SetFinalizeReadOnly(true);
 	function.SetName("sum");
 	function.GetArguments()[0] = decimal_type;
 	function.SetReturnType(LogicalType::DECIMAL(Decimal::MAX_WIDTH_DECIMAL, DecimalType::GetScale(decimal_type)));
@@ -503,12 +495,10 @@ AggregateFunctionSet SumFun::GetFunctions() {
 	auto sum_double = AggregateFunction::UnaryAggregate<SumState<double>, double, double, NumericSumOperation>(
 	    LogicalType::DOUBLE, LogicalType::DOUBLE);
 	sum_double.GetSignature().GetParameter(0).SetName("arg");
-	sum_double.SetFinalizeReadOnly(true);
 	sum.AddFunction(sum_double);
 	auto sum_bignum = AggregateFunction::UnaryAggregate<BignumState, bignum_t, bignum_t, BignumOperation>(
 	    LogicalType::BIGNUM, LogicalType::BIGNUM);
 	sum_bignum.GetSignature().GetParameter(0).SetName("arg");
-	sum_bignum.SetFinalizeReadOnly(true);
 	sum.AddFunction(sum_bignum);
 	return sum;
 }
@@ -529,7 +519,6 @@ AggregateFunction KahanSumFun::GetFunction() {
 	auto fun = AggregateFunction::UnaryAggregate<KahanSumState, double, double, KahanSumOperation>(LogicalType::DOUBLE,
 	                                                                                               LogicalType::DOUBLE);
 	fun.GetSignature().GetParameter(0).SetName("arg");
-	fun.SetFinalizeReadOnly(true);
 	return fun;
 }
 

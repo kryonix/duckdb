@@ -51,12 +51,12 @@ struct ArgMinMaxValueAssign<string_t> {
 };
 
 template <typename T>
-inline void ArgMinMaxReadValue(Vector &result, T &arg, T &target) {
+inline void ArgMinMaxReadValue(Vector &result, const T &arg, T &target) {
 	target = arg;
 }
 
 template <>
-inline void ArgMinMaxReadValue(Vector &result, string_t &arg, string_t &target) {
+inline void ArgMinMaxReadValue(Vector &result, const string_t &arg, string_t &target) {
 	target = StringVector::AddStringOrBlob(result, arg);
 }
 
@@ -193,7 +193,7 @@ struct ArgMinMaxBase {
 	}
 
 	template <class T, class STATE>
-	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
+	static void FinalizeReadOnly(const STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (!state.is_set || !state.arg_is_valid) {
 			finalize_data.ReturnNull();
 		} else {
@@ -246,6 +246,7 @@ struct GenericArgMinMaxState {
 	}
 };
 
+//! Decodes a sort key on finalize, so it is wired with StateVoidFinalize and never through the inherited read-only path
 template <typename COMPARATOR, OrderType ORDER_TYPE, class UPDATE_TYPE = SpecializedGenericArgMinMaxState>
 struct VectorArgMinMaxBase : ArgMinMaxBase<COMPARATOR> {
 	static constexpr OrderType ORDER = ORDER_TYPE;
@@ -414,7 +415,6 @@ AggregateFunction GetGenericArgMinMaxFunction(const ArgMinMaxNullHandling null_h
 	function.GetSignature().AddParameter("arg", LogicalType::ANY).AddParameter("val", LogicalType::ANY);
 	AggregateFunction::WireStructStateType<STATE>(function);
 	function.SetStatisticsCallback(AggregateFunction::PropagateInputValueStats);
-	function.SetFinalizeReadOnly(true);
 	return function;
 }
 
@@ -431,7 +431,6 @@ AggregateFunction GetVectorArgMinMaxFunctionInternal(const LogicalType &by_type,
 	function.GetSignature().AddParameter("arg", type).AddParameter("val", by_type);
 	AggregateFunction::WireStructStateType<STATE>(function);
 	function.SetStatisticsCallback(AggregateFunction::PropagateInputValueStats);
-	function.SetFinalizeReadOnly(true);
 	return function;
 #else
 	auto function = GetGenericArgMinMaxFunction<OP>(null_handling);
@@ -493,7 +492,6 @@ AggregateFunction GetArgMinMaxFunctionInternal(const LogicalType &by_type, const
 	function.GetSignature().GetParameter(1).SetName("val");
 	function.SetBindCallback(GetBindFunction<OP>(null_handling));
 	function.SetStatisticsCallback(AggregateFunction::PropagateInputValueStats);
-	function.SetFinalizeReadOnly(true);
 #else
 	auto function = GetGenericArgMinMaxFunction<OP>(null_handling);
 	function.GetSignature().GetParameter(0).SetType(type);
@@ -591,7 +589,6 @@ unique_ptr<FunctionData> BindDecimalArgMinMax(BindAggregateFunctionInput &input)
 
 	auto name = function.GetName();
 	function.ReplaceImplementation(GetDecimalArgMinMaxFunction<OP>(by_type, decimal_type, NULL_HANDLING));
-	function.SetFinalizeReadOnly(true);
 	function.SetName(std::move(name));
 	function.SetStatisticsCallback(AggregateFunction::PropagateInputValueStats);
 	function.SetReturnType(decimal_type);

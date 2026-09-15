@@ -63,7 +63,6 @@ AggregateFunction BoolOrFun::GetFunction() {
 	fun.GetSignature().GetParameter(0).SetName("arg");
 	fun.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
 	fun.SetDistinctDependent(AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT);
-	fun.SetFinalizeReadOnly(true);
 	return fun;
 }
 
@@ -73,7 +72,6 @@ AggregateFunction BoolAndFun::GetFunction() {
 	fun.GetSignature().GetParameter(0).SetName("arg");
 	fun.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
 	fun.SetDistinctDependent(AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT);
-	fun.SetFinalizeReadOnly(true);
 	return fun;
 }
 
