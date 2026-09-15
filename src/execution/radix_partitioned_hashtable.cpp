@@ -885,8 +885,13 @@ void RadixPartitionedHashTable::Combine(ExecutionContext &context, GlobalSinkSta
 		return;
 	}
 
-	// Set any_combined, then check one last time whether we need to repartition
-	gstate.any_combined = true;
+	// Freeze the radix bits before reading them: SetRadixBitsInternal re-checks any_combined under the same lock,
+	// so a grow that already passed its check finishes first and every later grow is refused
+	{
+		const annotated_lock_guard<annotated_mutex> guard {gstate.lock};
+		gstate.any_combined = true;
+	}
+	// Check one last time whether we need to repartition
 	MaybeRepartition(context.client, gstate, lstate, true);
 
 	auto &ht = *lstate.ht;
