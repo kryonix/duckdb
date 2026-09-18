@@ -9,7 +9,8 @@
 				"test/sql/types/variant/json_cast.test",
 				"test/sql/types/variant/test_all_types.test",
 				"test/sql/types/variant/tpch_test_through_json.test",
-				"test/sql/function/variant/variant_typeof.test"
+				"test/sql/function/variant/variant_typeof.test",
+				"test/sql/sql_export/variant_key_order.test"
 			]
 		}
 	]
