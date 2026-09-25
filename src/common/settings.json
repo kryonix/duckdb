@@ -31,7 +31,7 @@
     },
     {
         "name": "allocator_bulk_deallocation_flush_threshold",
-        "description": "If a bulk deallocation larger than this occurs, flush outstanding allocations.",
+        "description": "Flush outstanding allocations when a single deallocation exceeds this size, or when this much memory has been deallocated since the last flush. The buffer pool also flushes after deallocating 1/16th of the memory limit.",
         "type": "VARCHAR",
         "scope": "global",
         "custom_implementation": true

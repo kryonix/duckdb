@@ -149,7 +149,8 @@ struct AllocatorBulkDeallocationFlushThresholdSetting {
 	using RETURN_TYPE = string;
 	static constexpr const char *Name = "allocator_bulk_deallocation_flush_threshold";
 	static constexpr const char *Description =
-	    "If a bulk deallocation larger than this occurs, flush outstanding allocations.";
+	    "Flush outstanding allocations when a single deallocation exceeds this size, or when this much memory has been "
+	    "deallocated since the last flush. The buffer pool also flushes after deallocating 1/16th of the memory limit.";
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr bool IsDebug = false;
 	static constexpr bool IsDeprecated = false;
