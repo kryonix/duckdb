@@ -139,6 +139,7 @@ public:
 	DUCKDB_API string ReadLine();
 	DUCKDB_API string ReadLine(QueryContext context);
 	DUCKDB_API bool Trim(idx_t offset_bytes, idx_t length_bytes);
+	DUCKDB_API void RequestWriteBack(idx_t offset_bytes, idx_t length_bytes);
 	DUCKDB_API virtual idx_t GetProgress();
 	DUCKDB_API virtual FileCompressionType GetFileCompressionType();
 
@@ -222,6 +223,8 @@ public:
 	//! Excise a range of the file. The OS can drop pages from the page-cache, and the file-system is free to deallocate
 	//! this range (sparse file support). Reads to the range will succeed but will return undefined data.
 	DUCKDB_API virtual bool Trim(FileHandle &handle, idx_t offset_bytes, idx_t length_bytes);
+	//! Hint that a written range will not change again, so the OS can start writing it back and reclaim its pages.
+	DUCKDB_API virtual void RequestWriteBack(FileHandle &handle, idx_t offset_bytes, idx_t length_bytes);
 
 	//! Returns the file size of a file handle, returns -1 on error
 	DUCKDB_API virtual int64_t GetFileSize(FileHandle &handle);

@@ -472,6 +472,10 @@ bool FileSystem::Trim(FileHandle &handle, idx_t offset_bytes, idx_t length_bytes
 	return false;
 }
 
+void FileSystem::RequestWriteBack(FileHandle &handle, idx_t offset_bytes, idx_t length_bytes) {
+	// This is not a required method. Derived FileSystems may optionally override/implement.
+}
+
 int64_t FileSystem::GetFileSize(FileHandle &handle) {
 	throw NotImplementedException("%s: GetFileSize is not implemented!", GetName());
 }
@@ -825,6 +829,10 @@ int64_t FileHandle::Read(QueryContext context, void *buffer, idx_t nr_bytes) {
 
 bool FileHandle::Trim(idx_t offset_bytes, idx_t length_bytes) {
 	return file_system.Trim(*this, offset_bytes, length_bytes);
+}
+
+void FileHandle::RequestWriteBack(idx_t offset_bytes, idx_t length_bytes) {
+	file_system.RequestWriteBack(*this, offset_bytes, length_bytes);
 }
 
 int64_t FileHandle::Write(void *buffer, idx_t nr_bytes) {

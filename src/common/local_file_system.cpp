@@ -598,6 +598,14 @@ bool LocalFileSystem::Trim(FileHandle &handle, idx_t offset_bytes, idx_t length_
 	return trimmed;
 }
 
+void LocalFileSystem::RequestWriteBack(FileHandle &handle, idx_t offset_bytes, idx_t length_bytes) {
+#if defined(__linux__)
+	// start writing the range back without waiting for it, so its pages become clean and reclaimable
+	sync_file_range(handle.Cast<UnixFileHandle>().fd, UnsafeNumericCast<int64_t>(offset_bytes),
+	                UnsafeNumericCast<int64_t>(length_bytes), SYNC_FILE_RANGE_WRITE);
+#endif
+}
+
 int64_t LocalFileSystem::GetFileSize(FileHandle &handle) {
 	const auto file_metadata = Stats(handle);
 	return file_metadata.file_size;
@@ -1414,6 +1422,9 @@ int64_t LocalFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_byte
 bool LocalFileSystem::Trim(FileHandle &handle, idx_t offset_bytes, idx_t length_bytes) {
 	// TODO: Not yet implemented on windows.
 	return false;
+}
+
+void LocalFileSystem::RequestWriteBack(FileHandle &handle, idx_t offset_bytes, idx_t length_bytes) {
 }
 
 int64_t LocalFileSystem::GetFileSize(FileHandle &handle) {

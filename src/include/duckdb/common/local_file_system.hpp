@@ -38,6 +38,7 @@ public:
 	//! range (sparse file support). Reads to the range will succeed but will return
 	//! undefined data.
 	bool Trim(FileHandle &handle, idx_t offset_bytes, idx_t length_bytes) override;
+	void RequestWriteBack(FileHandle &handle, idx_t offset_bytes, idx_t length_bytes) override;
 
 	//! Returns the file size of a file handle, returns -1 on error
 	int64_t GetFileSize(FileHandle &handle) override;

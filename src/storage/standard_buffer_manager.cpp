@@ -571,6 +571,7 @@ void StandardBufferManager::WriteTemporaryBuffer(QueryContext context, MemoryTag
 		}
 
 		buffer.Write(context, *handle, offset);
+		handle->RequestWriteBack(0, offset + buffer.AllocSize());
 	} catch (...) {
 		// roll back the accounting and remove the partially written file
 		if (size_on_disk_increased) {

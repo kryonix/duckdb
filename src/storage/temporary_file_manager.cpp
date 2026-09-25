@@ -310,6 +310,9 @@ void TemporaryFileHandle::WriteTemporaryBuffer(QueryContext context, FileBuffer 
 		// write file directly
 		handle->Write(context, write_buffer, write_size, write_position);
 	}
+	// spilled blocks are never rewritten: let the OS write them back right away instead of holding dirty pages
+	const idx_t written_size = write_size + (IsEncrypted() ? DEFAULT_ENCRYPTED_BUFFER_HEADER_SIZE : 0);
+	handle->RequestWriteBack(write_position, written_size);
 }
 
 void TemporaryFileHandle::EraseBlockIndex(block_id_t block_index) {
