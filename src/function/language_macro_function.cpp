@@ -11,6 +11,23 @@ LanguageMacroFunction::LanguageMacroFunction(string language, string source)
 LanguageMacroFunction::LanguageMacroFunction() : MacroFunction(MacroType::LANGUAGE_MACRO) {
 }
 
+LanguageMacroFunction::LanguageMacroFunction(MacroType type) : MacroFunction(type) {
+}
+
+LanguageMacroFunction &LanguageMacroFunction::Get(MacroFunction &member) {
+	if (!member.IsLanguageMember()) {
+		throw InternalException("Failed to get the language member view - macro type mismatch");
+	}
+	return reinterpret_cast<LanguageMacroFunction &>(member);
+}
+
+const LanguageMacroFunction &LanguageMacroFunction::Get(const MacroFunction &member) {
+	if (!member.IsLanguageMember()) {
+		throw InternalException("Failed to get the language member view - macro type mismatch");
+	}
+	return reinterpret_cast<const LanguageMacroFunction &>(member);
+}
+
 unique_ptr<MacroFunction> LanguageMacroFunction::Copy() const {
 	auto result = make_uniq<LanguageMacroFunction>(language, source);
 	CopyProperties(*result);

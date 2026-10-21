@@ -299,7 +299,7 @@ MacroFunction::GetPositionalParametersForSerialization(Serializer &serializer) c
 	// this runs at the start of member serialization: reject a definition the target storage
 	// version cannot represent instead of silently dropping its fields
 	if (!serializer.ShouldSerialize(StorageVersion::V2_1_0)) {
-		if (type == MacroType::LANGUAGE_MACRO) {
+		if (IsLanguageMember()) {
 			throw SerializationException(
 			    "Cannot write a LANGUAGE function for a storage version below v2.1.0. Re-attach "
 			    "with (STORAGE_VERSION 'v2.1.0') or drop the function");
@@ -348,6 +348,10 @@ void MacroFunction::FinalizeDeserialization() {
 	if (parameters.size() != types.size()) {
 		types.resize(parameters.size(), LogicalType::UNKNOWN);
 	}
+}
+
+bool MacroFunction::IsLanguageMember() const {
+	return type == MacroType::LANGUAGE_MACRO || type == MacroType::LANGUAGE_TABLE_MACRO;
 }
 
 bool MacroFunction::HasUntypedParameter() const {
@@ -412,7 +416,7 @@ string MacroFunction::SignatureToString() const {
 	return result;
 }
 
-static string MacroTypeToSQL(const LogicalType &type) {
+string MacroFunction::TypeToSQL(const LogicalType &type) {
 	// an aliased type (e.g. an extension-registered type) carries its own identity: render it as-is
 	if (type.HasAlias()) {
 		return type.ToString();
@@ -428,13 +432,13 @@ static string MacroTypeToSQL(const LogicalType &type) {
 	return type.ToString();
 }
 
-string MacroFunction::ToSQL() const {
+string MacroFunction::ParametersToSQL() const {
 	vector<string> param_strings;
 	for (idx_t param_idx = 0; param_idx < parameters.size(); param_idx++) {
 		const auto &param_name = parameters[param_idx]->Cast<ColumnRefExpression>().GetColumnName();
 		auto param_string = SQLIdentifier::ToString(param_name);
 		if (types[param_idx] != LogicalType::UNKNOWN) {
-			param_string += " " + MacroTypeToSQL(types[param_idx]);
+			param_string += " " + TypeToSQL(types[param_idx]);
 		}
 		auto it = default_parameters.find(param_name);
 		if (it != default_parameters.end()) {
@@ -442,11 +446,15 @@ string MacroFunction::ToSQL() const {
 		}
 		param_strings.emplace_back(std::move(param_string));
 	}
+	return StringUtil::Format("(%s)", StringUtil::Join(param_strings, ", "));
+}
+
+string MacroFunction::ToSQL() const {
 	string returns;
 	if (return_type.id() != LogicalTypeId::UNKNOWN) {
-		returns = " RETURNS " + MacroTypeToSQL(return_type);
+		returns = " RETURNS " + TypeToSQL(return_type);
 	}
-	return StringUtil::Format("(%s)%s AS ", StringUtil::Join(param_strings, ", "), returns);
+	return ParametersToSQL() + returns + " AS ";
 }
 
 } // namespace duckdb

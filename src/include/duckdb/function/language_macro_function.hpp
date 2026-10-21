@@ -35,6 +35,14 @@ public:
 
 	void Serialize(Serializer &serializer) const override;
 	static unique_ptr<MacroFunction> Deserialize(Deserializer &deserializer);
+
+	//! The language member view of a member of either variant (scalar or table)
+	static LanguageMacroFunction &Get(MacroFunction &member);
+	static const LanguageMacroFunction &Get(const MacroFunction &member);
+
+protected:
+	//! Constructor for the table variant, which shares the language and source fields
+	explicit LanguageMacroFunction(MacroType type);
 };
 
 } // namespace duckdb

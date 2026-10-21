@@ -6,9 +6,11 @@
 namespace duckdb {
 
 MacroCatalogEntry::MacroCatalogEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateMacroInfo &info)
-    : FunctionEntry(
-          (info.macros[0]->type == MacroType::TABLE_MACRO ? CatalogType::TABLE_MACRO_ENTRY : CatalogType::MACRO_ENTRY),
-          catalog, schema, info),
+    : FunctionEntry((info.macros[0]->type == MacroType::TABLE_MACRO ||
+                             info.macros[0]->type == MacroType::LANGUAGE_TABLE_MACRO
+                         ? CatalogType::TABLE_MACRO_ENTRY
+                         : CatalogType::MACRO_ENTRY),
+                    catalog, schema, info),
       macros(std::move(info.macros)) {
 	this->temporary = info.temporary;
 	this->internal = info.internal;
