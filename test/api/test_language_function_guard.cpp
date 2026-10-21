@@ -186,6 +186,16 @@ TEST_CASE("ValidateCreate guard rejects an invalid published schema", "[api]") {
 	result = con.Query("CREATE FUNCTION unknown_published() RETURNS TABLE LANGUAGE unknownlang AS 'x'");
 	REQUIRE_FAIL(result);
 	REQUIRE(StringUtil::Contains(result->GetError(), "unresolved column type"));
+
+	// ... also when the unresolved type hides below a concrete container
+	RegisterTestLanguage(*db.instance, "nesteddup", make_shared_ptr<MutatingBinder>([](CreateMacroInfo &info) {
+		auto &member = info.macros[0]->Cast<LanguageTableMacroFunction>();
+		member.return_names = {Identifier("x")};
+		member.return_types = {LogicalType::STRUCT({{"m", LogicalType::UNKNOWN}})};
+	}));
+	result = con.Query("CREATE FUNCTION nested_published() RETURNS TABLE LANGUAGE nesteddup AS 'x'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "unresolved column type"));
 }
 
 TEST_CASE("ValidateCreate guard rejects a language version change", "[api]") {
@@ -527,23 +537,35 @@ TEST_CASE("Batch table member creation follows the overload identity", "[api]") 
 TEST_CASE("Unresolved column-type spellings resolve at CREATE", "[api]") {
 	DuckDB db(nullptr);
 	Connection con(db);
-	RegisterTestLanguage(*db.instance, "coltypelang", make_shared_ptr<MutatingBinder>(nullptr));
+	// the columns must already be resolved when ValidateCreate observes them (and gets frozen so)
+	auto saw_resolved = make_shared_ptr<bool>(false);
+	RegisterTestLanguage(*db.instance, "coltypelang",
+	                     make_shared_ptr<MutatingBinder>([saw_resolved](CreateMacroInfo &info) {
+		                     auto &member = info.macros[0]->Cast<LanguageTableMacroFunction>();
+		                     auto &nested = member.return_types[0];
+		                     *saw_resolved = nested.id() == LogicalTypeId::STRUCT &&
+		                                     StructType::GetChildTypes(nested)[0].second.id() == LogicalTypeId::ENUM;
+	                     }));
 	REQUIRE_NO_FAIL(con.Query("CREATE TYPE col_mood AS ENUM ('happy')"));
 
-	// a dialect may nest an unresolved user type inside a concrete container in a RETURN column
+	// a dialect may nest an unresolved user type inside a concrete container in a RETURN column;
+	// the collated sibling pins that untouched columns keep their identity through resolution
 	auto info = make_uniq<CreateMacroInfo>(CatalogType::TABLE_MACRO_ENTRY);
 	info->SetFunctionName(Identifier("col_tf"));
 	auto member = make_uniq<LanguageTableMacroFunction>("coltypelang", "column types");
 	member->return_names.emplace_back("c");
 	member->return_types.push_back(LogicalType::STRUCT({{"m", UnresolvedUserType("col_mood")}}));
+	member->return_names.emplace_back("s");
+	member->return_types.push_back(LogicalType::VARCHAR_COLLATION("nocase"));
 	info->macros.push_back(std::move(member));
 	auto statement = make_uniq<CreateStatement>();
 	statement->info = std::move(info);
 	unique_ptr<SQLStatement> sql_statement = std::move(statement);
 	auto result = con.Query(std::move(sql_statement));
 	REQUIRE_NO_FAIL(*result);
+	REQUIRE(*saw_resolved);
 
-	// the stored column type is fully resolved
+	// the stored column types are fully resolved and the sibling kept its collation
 	auto shown = con.Query("SELECT return_type FROM duckdb_functions() WHERE function_name = 'col_tf'");
-	REQUIRE(CHECK_COLUMN(shown, 0, {"TABLE(c STRUCT(m ENUM('happy')))"}));
+	REQUIRE(CHECK_COLUMN(shown, 0, {"TABLE(c STRUCT(m ENUM('happy')), s VARCHAR('nocase'))"}));
 }

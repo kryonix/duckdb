@@ -904,8 +904,12 @@ SchemaCatalogEntry &Binder::BindCreateFunctionInfo(CreateInfo &info) {
 					}
 				}
 				for (auto &type : table_member.return_types) {
-					if (type.id() == LogicalTypeId::UNKNOWN || type.id() == LogicalTypeId::UNBOUND ||
-					    type.id() == LogicalTypeId::INVALID) {
+					// recursively: an unresolved type may hide below a concrete container
+					const auto unresolved = [](const LogicalType &child) {
+						return child.id() == LogicalTypeId::UNKNOWN || child.id() == LogicalTypeId::UNBOUND ||
+						       child.id() == LogicalTypeId::INVALID;
+					};
+					if (TypeVisitor::Contains(type, unresolved)) {
 						throw InternalException("The language binder for \"%s\" published a result schema for %s() "
 						                        "with an unresolved column type, which is not allowed",
 						                        entry_language, base.GetFunctionName());
