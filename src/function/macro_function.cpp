@@ -437,7 +437,17 @@ string MacroFunction::SignatureToString() const {
 }
 
 string MacroFunction::TypeToSQL(const LogicalType &type) {
-	// aliases and top-level collations render in re-parseable form through LogicalType::ToString
+	// an aliased type (e.g. an extension-registered type) renders under its own identity, quoting
+	// the alias when required so e.g. an alias named TABLE re-parses as a type name. Top-level
+	// collations render in the re-parseable constructor form through LogicalType::ToString
+	if (type.HasAlias()) {
+		auto text = type.ToString();
+		auto alias = type.GetAlias();
+		if (StringUtil::StartsWith(text, alias)) {
+			return SQLIdentifier::ToString(alias) + text.substr(alias.size());
+		}
+		return text;
+	}
 	return type.ToString();
 }
 
