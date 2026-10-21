@@ -120,9 +120,47 @@ SELECT * FROM ltfdb.main.persistent_tf();
 ----
 <REGEX>:.*Missing Extension Error.*testlang.*no binder for that language is registered.*
 
+# an unresolved schema created without the binder stays unresolved
+statement ok
+USE ltfdb;
+
+statement ok
+CREATE FUNCTION late_tf() RETURNS TABLE LANGUAGE testlang AS 'rows:2';
+
+query T
+SELECT return_type FROM duckdb_functions() WHERE function_name = 'late_tf';
+----
+NULL
+
+statement ok
+USE memory;
+
 # Checkpoint, then read the catalog from the checkpoint without the binder
 statement ok
 LOAD '{BUILD_DIRECTORY}/test/extension/language_function_demo.duckdb_extension';
+
+# loading the extension makes the stored functions callable, the declared schema applies
+query IT
+SELECT i, tag FROM ltfdb.main.persistent_tf(2) ORDER BY i LIMIT 2;
+----
+0	0
+1	1
+
+query I
+SELECT count(*) FROM ltfdb.main.persistent_tf(2);
+----
+5
+
+# the unresolved member binds its schema at the call, the stored definition stays unresolved
+query I
+SELECT count(*) FROM ltfdb.main.late_tf();
+----
+2
+
+query T
+SELECT return_type FROM duckdb_functions() WHERE function_name = 'late_tf';
+----
+NULL
 
 statement ok
 CHECKPOINT ltfdb;

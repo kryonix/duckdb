@@ -11,6 +11,7 @@
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
@@ -32,11 +33,23 @@ public:
 				throw BinderException("testlang: the source of \"%s\" may not contain the word \"invalid\"",
 				                      info.GetFunctionName().GetIdentifierName());
 			}
-			if (member->type == MacroType::LANGUAGE_TABLE_MACRO &&
-			    !StringUtil::StartsWith(language_member.source, "rows:")) {
-				// a testlang table function emits the rows its 'rows:<n>' source denotes
-				throw BinderException("testlang: the source of table function \"%s\" must have the form 'rows:<n>'",
-				                      info.GetFunctionName().GetIdentifierName());
+			if (member->type == MacroType::LANGUAGE_TABLE_MACRO) {
+				if (!StringUtil::StartsWith(language_member.source, "rows:")) {
+					// a testlang table function emits the rows its 'rows:<n>' source denotes
+					throw BinderException(
+					    "testlang: the source of table function \"%s\" must have the form 'rows:<n>'",
+					    info.GetFunctionName().GetIdentifierName());
+				}
+				auto &table_member = member->Cast<LanguageTableMacroFunction>();
+				if (table_member.return_names.empty()) {
+					// publish-once: resolve an undeclared schema at CREATE, like an inferring language
+					table_member.return_names.emplace_back("i");
+					table_member.return_types.emplace_back(LogicalType::BIGINT);
+				}
+			}
+			if (language_member.language_version.empty()) {
+				// publish-once: record the language version the definition was validated with
+				language_member.language_version = "testlang 1.0";
 			}
 		}
 		// publish per-member documentation: function metadata must survive member mutations
@@ -96,7 +109,23 @@ public:
 			throw BinderException("testlang: the source of table function \"%s\" is not a 'rows:<n>' spec",
 			                      entry.name.GetIdentifierName());
 		}
-		const auto spec = member.source.substr(5);
+		auto spec = member.source.substr(5);
+		if (spec == "self") {
+			// a self-call, so tests observe the recursion guard on the expansion
+			auto select = make_uniq<SelectNode>();
+			select->select_list.push_back(make_uniq<StarExpression>());
+			auto self_ref = make_uniq<TableFunctionRef>();
+			self_ref->function = make_uniq<FunctionExpression>(entry.name, vector<unique_ptr<ParsedExpression>>());
+			select->from_table = std::move(self_ref);
+			auto statement = make_uniq<SelectStatement>();
+			statement->node = std::move(select);
+			return statement;
+		}
+		// a ':wide' suffix emits one extra column, so tests observe the declared-schema shape check
+		bool wide = StringUtil::EndsWith(spec, ":wide");
+		if (wide) {
+			spec = spec.substr(0, spec.size() - 5);
+		}
 		unique_ptr<ParsedExpression> count_expr;
 		if (StringUtil::StartsWith(spec, "arg:")) {
 			idx_t argument_idx;
@@ -118,7 +147,7 @@ public:
 		// compile to SELECT range [, range ...] FROM range(count): core binds the statement in a
 		// correlated child binder and renames/casts the columns to the declared schema
 		auto select = make_uniq<SelectNode>();
-		const idx_t column_count = member.return_names.empty() ? 1 : member.return_names.size();
+		const idx_t column_count = (member.return_names.empty() ? 1 : member.return_names.size()) + (wide ? 1 : 0);
 		for (idx_t i = 0; i < column_count; i++) {
 			select->select_list.push_back(make_uniq<ColumnRefExpression>("range"));
 		}
