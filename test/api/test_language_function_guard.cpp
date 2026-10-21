@@ -467,3 +467,83 @@ TEST_CASE("Batch member creation follows the overload identity", "[api]") {
 	auto count = con.Query("SELECT count(*) FROM duckdb_functions() WHERE function_name = 'batch_fun'");
 	REQUIRE(CHECK_COLUMN(count, 0, {2}));
 }
+
+TEST_CASE("Batch table member creation follows the overload identity", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	RegisterTestLanguage(*db.instance, "batchtablelang", make_shared_ptr<MutatingBinder>(nullptr));
+
+	auto make_table_member = [](const string &source, LogicalType param_type, bool with_default = false) {
+		auto member = make_uniq<LanguageTableMacroFunction>("batchtablelang", source);
+		member->parameters.push_back(make_uniq<ColumnRefExpression>(Identifier("a")));
+		member->types.push_back(std::move(param_type));
+		if (with_default) {
+			auto default_expr = make_uniq<ConstantExpression>(Literal(LiteralKind::INTEGER, "5"));
+			default_expr->SetAlias(Identifier("c"));
+			member->default_parameters[Identifier("c")] = std::move(default_expr);
+			member->parameters.push_back(make_uniq<ColumnRefExpression>(Identifier("c")));
+			member->types.push_back(LogicalType::INTEGER);
+		}
+		member->return_names.emplace_back("i");
+		member->return_types.emplace_back(LogicalType::INTEGER);
+		return member;
+	};
+	auto query_batch = [&](unique_ptr<MacroFunction> first, unique_ptr<MacroFunction> second) {
+		auto info = make_uniq<CreateMacroInfo>(CatalogType::TABLE_MACRO_ENTRY);
+		info->SetFunctionName(Identifier("batch_tf"));
+		info->macros.push_back(std::move(first));
+		info->macros.push_back(std::move(second));
+		auto statement = make_uniq<CreateStatement>();
+		statement->info = std::move(info);
+		unique_ptr<SQLStatement> sql_statement = std::move(statement);
+		return con.Query(std::move(sql_statement));
+	};
+
+	// a batch of table members follows the same conflict identity as incremental creation,
+	// including the default arity range
+	auto result = query_batch(make_table_member("fixed", LogicalType::INTEGER),
+	                          make_table_member("ranged", LogicalType::INTEGER, true));
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "conflicting overload members"));
+
+	// an unresolved spelling of the same nested type must not slip past the pairwise check
+	result =
+	    query_batch(make_table_member("resolved ranged", LogicalType::STRUCT({{"m", LogicalType::INTEGER}}), true),
+	                make_table_member("spelled", LogicalType::STRUCT({{"m", UnresolvedUserType("integer")}})));
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "conflicting overload members"));
+
+	// distinct unbound STRUCT spellings resolve to distinct signatures and are not wrongly rejected
+	result = query_batch(make_table_member("int struct", LogicalType::STRUCT({{"m", UnresolvedUserType("integer")}})),
+	                     make_table_member("varchar struct", LogicalType::STRUCT({{"m", UnresolvedUserType("varchar")}})));
+	REQUIRE_NO_FAIL(*result);
+	auto count = con.Query("SELECT count(*) FROM duckdb_functions() WHERE function_name = 'batch_tf'");
+	REQUIRE(CHECK_COLUMN(count, 0, {2}));
+	auto types = con.Query("SELECT unnest(parameter_types) FROM duckdb_functions() WHERE function_name = 'batch_tf' "
+	                       "ORDER BY 1");
+	REQUIRE(CHECK_COLUMN(types, 0, {"STRUCT(m INTEGER)", "STRUCT(m VARCHAR)"}));
+}
+
+TEST_CASE("Unresolved column-type spellings resolve at CREATE", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	RegisterTestLanguage(*db.instance, "coltypelang", make_shared_ptr<MutatingBinder>(nullptr));
+	REQUIRE_NO_FAIL(con.Query("CREATE TYPE col_mood AS ENUM ('happy')"));
+
+	// a dialect may nest an unresolved user type inside a concrete container in a RETURN column
+	auto info = make_uniq<CreateMacroInfo>(CatalogType::TABLE_MACRO_ENTRY);
+	info->SetFunctionName(Identifier("col_tf"));
+	auto member = make_uniq<LanguageTableMacroFunction>("coltypelang", "column types");
+	member->return_names.emplace_back("c");
+	member->return_types.push_back(LogicalType::STRUCT({{"m", UnresolvedUserType("col_mood")}}));
+	info->macros.push_back(std::move(member));
+	auto statement = make_uniq<CreateStatement>();
+	statement->info = std::move(info);
+	unique_ptr<SQLStatement> sql_statement = std::move(statement);
+	auto result = con.Query(std::move(sql_statement));
+	REQUIRE_NO_FAIL(*result);
+
+	// the stored column type is fully resolved
+	auto shown = con.Query("SELECT return_type FROM duckdb_functions() WHERE function_name = 'col_tf'");
+	REQUIRE(CHECK_COLUMN(shown, 0, {"TABLE(c STRUCT(m ENUM('happy')))"}));
+}
