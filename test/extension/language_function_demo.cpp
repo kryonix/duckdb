@@ -20,15 +20,21 @@ public:
 		// deliberately reallocate the member vector: core must not hold member references across this callback
 		info.macros.reserve(info.macros.capacity() + 1);
 		for (auto &member : info.macros) {
-			auto &language_member = member->Cast<LanguageMacroFunction>();
+			auto &language_member = LanguageMacroFunction::Get(*member);
 			if (StringUtil::Contains(language_member.source, "invalid")) {
 				throw BinderException("testlang: the source of \"%s\" may not contain the word \"invalid\"",
+				                      info.GetFunctionName().GetIdentifierName());
+			}
+			if (member->type == MacroType::LANGUAGE_TABLE_MACRO &&
+			    !StringUtil::StartsWith(language_member.source, "rows:")) {
+				// a testlang table function emits the rows its 'rows:<n>' source denotes
+				throw BinderException("testlang: the source of table function \"%s\" must have the form 'rows:<n>'",
 				                      info.GetFunctionName().GetIdentifierName());
 			}
 		}
 		// publish per-member documentation: function metadata must survive member mutations
 		for (auto &member : info.macros) {
-			auto &language_member = member->Cast<LanguageMacroFunction>();
+			auto &language_member = LanguageMacroFunction::Get(*member);
 			FunctionDescription description;
 			for (idx_t i = 0; i < member->parameters.size(); i++) {
 				auto &param_name = member->parameters[i]->Cast<ColumnRefExpression>().GetColumnName();
