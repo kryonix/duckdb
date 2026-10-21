@@ -91,6 +91,20 @@ SELECT count(*) FROM defaulted_rows(n := 4);
 ----
 4
 
+# arguments arrive in parameter declaration order, not caller order
+statement ok
+CREATE FUNCTION ordered_rows(a INTEGER, b INTEGER := 2, c INTEGER := 3) RETURNS TABLE(i BIGINT) LANGUAGE testlang AS 'rows:arg:1';
+
+query I
+SELECT count(*) FROM ordered_rows(c := 7, a := 1, b := 5);
+----
+5
+
+query I
+SELECT count(*) FROM ordered_rows(1);
+----
+2
+
 # the declared column types are enforced with standard CAST semantics at runtime
 statement ok
 CREATE FUNCTION narrow() RETURNS TABLE(i TINYINT) LANGUAGE testlang AS 'rows:300';
@@ -194,8 +208,35 @@ SELECT parameter_types, return_type FROM duckdb_functions() WHERE function_name 
 ----
 [ci_text]	TABLE(c ci_text)
 
+# the informational language version is published by ValidateCreate, also on re-import
+query T
+SELECT language_version FROM duckdb_functions() WHERE function_name = 'aliased_tf';
+----
+testlang 1.0
+
 statement ok
 DROP FUNCTION aliased_tf;
+
+# an alias that collides with a keyword renders quoted, so the member kind survives the round trip
+statement ok
+CREATE FUNCTION keyword_alias() RETURNS "table" LANGUAGE testlang AS '7';
+
+statement ok
+EXPORT DATABASE '{TEST_DIR}/language_table_function_keyword_alias_export';
+
+statement ok
+DROP FUNCTION keyword_alias;
+
+statement ok
+IMPORT DATABASE '{TEST_DIR}/language_table_function_keyword_alias_export';
+
+query TTT
+SELECT function_type, return_type, macro_definition FROM duckdb_functions() WHERE function_name = 'keyword_alias';
+----
+macro	table	7
+
+statement ok
+DROP FUNCTION keyword_alias;
 
 statement ok
 USE memory;
