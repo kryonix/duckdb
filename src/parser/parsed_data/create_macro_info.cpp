@@ -17,7 +17,7 @@ CreateMacroInfo::CreateMacroInfo(CatalogType type, unique_ptr<MacroFunction> fun
 }
 
 string CreateMacroInfo::ToString() const {
-	if (!macros.empty() && macros[0]->type == MacroType::LANGUAGE_MACRO) {
+	if (!macros.empty() && macros[0]->IsLanguageMember()) {
 		// language members round-trip through the CREATE FUNCTION sugar, one statement per member:
 		// replaying the later statements adds the members back as overloads
 		string result;
