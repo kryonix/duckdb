@@ -1,0 +1,67 @@
+# name: test/sql/function/language_function/language_table_function_storage_version.test
+# description: Persistent language table functions require storage version v2.1.0
+# group: [language_function]
+
+require noforcestorage
+
+statement ok
+ATTACH '{TEST_DIR}/language_table_function_old_version.db' AS old_db (STORAGE_VERSION 'v2.0.0');
+
+statement ok
+USE old_db;
+
+# the member type alone triggers the gate: a table member has no scalar RETURNS type
+statement error
+CREATE FUNCTION gated_tf() RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:1';
+----
+<REGEX>:.*only supported for storage versions v2\.1\.0 and higher.*
+
+# a plain table macro is not gated
+statement ok
+CREATE MACRO ungated_tf() AS TABLE SELECT 1 AS i;
+
+# temporary functions are not gated
+statement ok
+CREATE TEMPORARY FUNCTION ungated_temp_tf() RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:1';
+
+statement ok
+USE memory;
+
+# in-memory databases are not gated
+statement ok
+CREATE FUNCTION memory_tf() RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:1';
+
+statement ok
+DETACH old_db;
+
+# a v2.1.0 database accepts persistent language table functions
+statement ok
+ATTACH '{TEST_DIR}/language_table_function_new_version.db' AS new_db (STORAGE_VERSION 'v2.1.0');
+
+statement ok
+CREATE FUNCTION new_db.main.allowed_tf() RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:1';
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'allowed_tf' AND database_name = 'new_db';
+----
+1
+
+# the gate examines the resolved destination catalog, not the current database
+statement ok
+ATTACH '{TEST_DIR}/language_table_function_old_version2.db' AS old_db (STORAGE_VERSION 'v2.0.0');
+
+statement error
+CREATE FUNCTION old_db.gated_two_part() RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:1';
+----
+<REGEX>:.*only supported for storage versions v2\.1\.0 and higher.*
+
+statement error
+CREATE FUNCTION old_db.main.gated_three_part() RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:1';
+----
+<REGEX>:.*only supported for storage versions v2\.1\.0 and higher.*
+
+statement ok
+DETACH old_db;
+
+statement ok
+DETACH new_db;

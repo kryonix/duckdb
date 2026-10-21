@@ -1,0 +1,163 @@
+# name: test/sql/function/language_function/language_table_function_persistence.test
+# description: Language table functions survive WAL replay and checkpoints, with and without the extension loaded
+# group: [language_function]
+
+# Language function tests manage their own storage version (v2.1.0+) and extension loading
+require noforcestorage
+
+require skip_reload
+
+require allow_unsigned_extensions
+
+statement ok
+SET checkpoint_threshold = '10.0 GB';
+
+statement ok
+PRAGMA disable_checkpoint_on_shutdown;
+
+statement ok
+LOAD '{BUILD_DIRECTORY}/test/extension/language_function_demo.duckdb_extension';
+
+statement ok
+ATTACH '{TEST_DIR}/language_table_function_persistence.db' AS ltfdb (STORAGE_VERSION 'v2.1.0');
+
+statement ok
+USE ltfdb;
+
+statement ok
+CREATE FUNCTION persistent_tf() RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:3';
+
+statement ok
+CREATE FUNCTION persistent_tf(n INTEGER) RETURNS TABLE(i INTEGER, tag VARCHAR) LANGUAGE testlang AS 'rows:5';
+
+statement ok
+CREATE FUNCTION dropped_tf() RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:1';
+
+statement ok
+DROP FUNCTION dropped_tf;
+
+# a member replacement and an interleaved COMMENT must replay from the WAL too
+statement ok
+CREATE FUNCTION replaced_tf() RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:1';
+
+statement ok
+COMMENT ON MACRO TABLE replaced_tf IS 'persisted comment';
+
+statement ok
+CREATE OR REPLACE FUNCTION replaced_tf() RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:2';
+
+# a column type naming a user type is resolved at CREATE and persists as the resolved type
+statement ok
+CREATE TYPE ptype AS ENUM ('p');
+
+statement ok
+CREATE FUNCTION typed_tf() RETURNS TABLE(m ptype) LANGUAGE testlang AS 'rows:1';
+
+# Detach without checkpoint - the functions must survive WAL replay
+statement ok
+USE memory;
+
+statement ok
+DETACH ltfdb;
+
+# Re-attach replays the WAL in the same instance (binder registered)
+statement ok
+ATTACH '{TEST_DIR}/language_table_function_persistence.db' AS ltfdb;
+
+query TTT rowsort
+SELECT language, return_type, macro_definition FROM duckdb_functions() WHERE function_name = 'persistent_tf' AND database_name = 'ltfdb';
+----
+testlang	TABLE(i INTEGER)	rows:3
+testlang	TABLE(i INTEGER, tag VARCHAR)	rows:5
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'dropped_tf';
+----
+0
+
+# the replayed member replacement and the interleaved comment are both visible
+query TT
+SELECT macro_definition, comment FROM duckdb_functions() WHERE function_name = 'replaced_tf';
+----
+rows:2	persisted comment
+
+# the typed column replayed with its resolved type
+query T
+SELECT return_type LIKE 'TABLE(m ENUM%' FROM duckdb_functions() WHERE function_name = 'typed_tf';
+----
+true
+
+statement ok
+USE ltfdb;
+
+statement ok
+DROP FUNCTION typed_tf;
+
+statement ok
+DROP TYPE ptype;
+
+statement ok
+USE memory;
+
+statement ok
+DETACH ltfdb;
+
+# A fresh instance without the extension: WAL replay must succeed without the binder
+restart no_extension_load
+
+statement ok
+ATTACH '{TEST_DIR}/language_table_function_persistence.db' AS ltfdb;
+
+query TTTT rowsort
+SELECT function_type, language, parameter_types, macro_definition FROM duckdb_functions() WHERE function_name = 'persistent_tf';
+----
+table_macro	testlang	[INTEGER]	rows:5
+table_macro	testlang	[]	rows:3
+
+# calling without the binder names the language and suggests loading it
+statement error
+SELECT * FROM ltfdb.main.persistent_tf();
+----
+<REGEX>:.*Missing Extension Error.*testlang.*no binder for that language is registered.*
+
+# Checkpoint, then read the catalog from the checkpoint without the binder
+statement ok
+LOAD '{BUILD_DIRECTORY}/test/extension/language_function_demo.duckdb_extension';
+
+statement ok
+CHECKPOINT ltfdb;
+
+statement ok
+DETACH ltfdb;
+
+restart no_extension_load
+
+statement ok
+ATTACH '{TEST_DIR}/language_table_function_persistence.db' AS ltfdb;
+
+query TTTT rowsort
+SELECT function_type, language, parameter_types, macro_definition FROM duckdb_functions() WHERE function_name = 'persistent_tf';
+----
+table_macro	testlang	[INTEGER]	rows:5
+table_macro	testlang	[]	rows:3
+
+# member-granular DROP works on the checkpointed entry without the binder
+statement ok
+USE ltfdb;
+
+statement ok
+DROP FUNCTION persistent_tf(INTEGER);
+
+statement ok
+USE memory;
+
+statement ok
+DETACH ltfdb;
+
+statement ok
+ATTACH '{TEST_DIR}/language_table_function_persistence.db' AS ltfdb;
+
+query TT
+SELECT parameter_types, macro_definition FROM duckdb_functions() WHERE function_name = 'persistent_tf';
+----
+[]	rows:3

@@ -1,0 +1,116 @@
+# name: test/sql/function/language_function/language_table_function_demo.test
+# description: Language table function behavior with a registered binder (testlang demo extension)
+# group: [language_function]
+
+# Language function tests manage their own storage version (persistent entries need v2.1.0+)
+require noforcestorage
+
+require skip_reload
+
+require allow_unsigned_extensions
+
+statement ok
+LOAD '{BUILD_DIRECTORY}/test/extension/language_function_demo.duckdb_extension';
+
+# the binder validates table definitions at CREATE time
+statement error
+CREATE FUNCTION rejected_tf() RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:invalid';
+----
+<REGEX>:.*testlang: the source of "rejected_tf" may not contain.*
+
+# testlang table sources must have the form 'rows:<n>'
+statement error
+CREATE FUNCTION malformed_tf() RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'not a row spec';
+----
+<REGEX>:.*testlang: the source of table function "malformed_tf" must have the form 'rows:<n>'.*
+
+statement ok
+CREATE FUNCTION numbers(n INTEGER) RETURNS TABLE(i INTEGER, tag VARCHAR) LANGUAGE testlang AS 'rows:3';
+
+# PROVISIONAL (phase 2 wires LanguageFunctionBinder::BindTableCall): a registered language
+# cannot bind table calls yet, but the error is the seam's, not a missing-extension error
+statement error
+SELECT * FROM numbers(3);
+----
+<REGEX>:.*binding language table function calls is not supported yet.*
+
+# argument resolution errors surface before the seam error
+statement error
+SELECT * FROM numbers();
+----
+<REGEX>:.*Binder Error.*
+
+# binder-published descriptions carry the member's signature and survive member mutations
+statement ok
+CREATE FUNCTION numbers() RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:1';
+
+query TT rowsort
+SELECT description, parameter_types FROM duckdb_functions() WHERE function_name = 'numbers';
+----
+testlang: rows:1	[]
+testlang: rows:3	[INTEGER]
+
+# replacing a member replaces its description instead of shadowing it with the old one
+statement ok
+CREATE OR REPLACE FUNCTION numbers(n INTEGER) RETURNS TABLE(i INTEGER, tag VARCHAR) LANGUAGE testlang AS 'rows:5';
+
+query TT
+SELECT description, macro_definition FROM duckdb_functions() WHERE function_name = 'numbers' AND parameter_types = ['INTEGER'];
+----
+testlang: rows:5	rows:5
+
+# a dropped member takes its description with it
+statement ok
+DROP FUNCTION numbers(INTEGER);
+
+query TT
+SELECT description, macro_definition FROM duckdb_functions() WHERE function_name = 'numbers';
+----
+testlang: rows:1	rows:1
+
+statement ok
+DROP FUNCTION numbers;
+
+# an extension-registered aliased type keeps its identity in the declared columns through EXPORT
+statement ok
+CREATE FUNCTION aliased_tf(x ci_text) RETURNS TABLE(c ci_text) LANGUAGE testlang AS 'rows:1';
+
+query TT
+SELECT parameter_types, return_type FROM duckdb_functions() WHERE function_name = 'aliased_tf';
+----
+[ci_text]	TABLE(c ci_text)
+
+statement ok
+EXPORT DATABASE '{TEST_DIR}/language_table_function_demo_export';
+
+statement ok
+DROP FUNCTION aliased_tf;
+
+statement ok
+IMPORT DATABASE '{TEST_DIR}/language_table_function_demo_export';
+
+query TT
+SELECT parameter_types, return_type FROM duckdb_functions() WHERE function_name = 'aliased_tf';
+----
+[ci_text]	TABLE(c ci_text)
+
+statement ok
+DROP FUNCTION aliased_tf;
+
+# scalar language functions keep working with table members around (shared machinery)
+statement ok
+CREATE FUNCTION scalar_twin() RETURNS INTEGER LANGUAGE testlang AS '42';
+
+statement ok
+CREATE FUNCTION scalar_twin() RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:1';
+
+query I
+SELECT scalar_twin();
+----
+42
+
+statement ok
+DROP MACRO TABLE scalar_twin;
+
+statement ok
+DROP FUNCTION scalar_twin;
