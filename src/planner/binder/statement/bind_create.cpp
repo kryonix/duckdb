@@ -7,6 +7,7 @@
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/catalog/catalog_entry/language_catalog_entry.hpp"
 #include "duckdb/function/language_macro_function.hpp"
+#include "duckdb/function/language_table_macro_function.hpp"
 #include "duckdb/function/scalar_macro_function.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/main/language_function_binder.hpp"
@@ -406,7 +407,7 @@ void Binder::BindCreateViewInfo(CreateViewInfo &base) {
 void Binder::CheckMacroStorageVersion(Catalog &catalog, const CreateMacroInfo &info) {
 	bool uses_gated_features = false;
 	for (auto &member : info.macros) {
-		if (member->type == MacroType::LANGUAGE_MACRO || member->return_type.id() != LogicalTypeId::UNKNOWN) {
+		if (member->IsLanguageMember() || member->return_type.id() != LogicalTypeId::UNKNOWN) {
 			uses_gated_features = true;
 			break;
 		}
@@ -481,11 +482,11 @@ SchemaCatalogEntry &Binder::BindCreateFunctionInfo(CreateInfo &info) {
 	bool has_language_members = false;
 	bool has_plain_members = false;
 	for (auto &function : base.macros) {
-		if (function->type != MacroType::LANGUAGE_MACRO) {
+		if (!function->IsLanguageMember()) {
 			has_plain_members = true;
 			continue;
 		}
-		auto &language_member = function->Cast<LanguageMacroFunction>();
+		auto &language_member = LanguageMacroFunction::Get(*function);
 		if (has_language_members && !StringUtil::CIEquals(language_member.language, entry_language)) {
 			throw BinderException("Macro %s() cannot mix members of languages \"%s\" and \"%s\"",
 			                      base.GetFunctionName(), entry_language, language_member.language);
@@ -527,7 +528,7 @@ SchemaCatalogEntry &Binder::BindCreateFunctionInfo(CreateInfo &info) {
 				}
 			}
 		}
-		if (function->type == MacroType::LANGUAGE_MACRO) {
+		if (function->IsLanguageMember()) {
 			// the source is stored verbatim, there is no expression to verify here
 		} else if (info.type == CatalogType::MACRO_ENTRY) {
 			auto &scalar_function = function->Cast<ScalarMacroFunction>();
@@ -585,6 +586,16 @@ SchemaCatalogEntry &Binder::BindCreateFunctionInfo(CreateInfo &info) {
 			BindLogicalType(function->return_type);
 		}
 
+		// Resolve user types in the declared RETURNS TABLE columns, recursively like parameter types
+		if (function->type == MacroType::LANGUAGE_TABLE_MACRO) {
+			D_ASSERT(info.type == CatalogType::TABLE_MACRO_ENTRY);
+			auto &table_member = function->Cast<LanguageTableMacroFunction>();
+			D_ASSERT(!table_member.column_names.empty());
+			for (auto &column_type : table_member.column_types) {
+				BindLogicalType(column_type);
+			}
+		}
+
 		// Resolve any user type arguments. BindLogicalType resolves recursively: a dialect may nest
 		// an unresolved type inside a concrete container, unlike the stock grammar's top-level
 		// UNBOUND wrapping
@@ -631,7 +642,7 @@ SchemaCatalogEntry &Binder::BindCreateFunctionInfo(CreateInfo &info) {
 
 		// bind it to verify the function was defined correctly
 		ErrorData error;
-		if (function->type == MacroType::LANGUAGE_MACRO) {
+		if (function->IsLanguageMember()) {
 			// language sources are validated by the language's binder below, when it is registered
 		} else if (info.type == CatalogType::MACRO_ENTRY) {
 			BoundSelectNode sel_node;

@@ -3,6 +3,9 @@ CreateMacroStmt <- MacroOrFunction IfNotExists? QualifiedName List(MacroDefiniti
 CreateLanguageFunctionStmt <- 'FUNCTION' IfNotExists? QualifiedName Parens(MacroParameters?) ReturnsType? 'LANGUAGE' Identifier 'AS' StringLiteral
 ReturnsType <- 'RETURNS' Type
 
+CreateLanguageTableFunctionStmt <- 'FUNCTION' IfNotExists? QualifiedName Parens(MacroParameters?) ReturnsTableType 'LANGUAGE' Identifier 'AS' StringLiteral
+ReturnsTableType <- 'RETURNS' 'TABLE' ColIdTypeList
+
 MacroOrFunction <- MacroKeyword / FunctionKeyword
 MacroKeyword <- 'MACRO'
 FunctionKeyword <- 'FUNCTION'

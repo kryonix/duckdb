@@ -1226,6 +1226,10 @@ public:
 	                                                                         GeneratedTransformProcess &process);
 	static arena_ptr<TransformResultValue>
 	FinalizeCreateLanguageFunctionStmtTrampoline(PEGTransformer &transformer, GeneratedTransformProcess &process);
+	static arena_ptr<TransformResultValue>
+	FinalizeCreateLanguageTableFunctionStmtTrampoline(PEGTransformer &transformer, GeneratedTransformProcess &process);
+	static arena_ptr<TransformResultValue> FinalizeReturnsTableTypeTrampoline(PEGTransformer &transformer,
+	                                                                          GeneratedTransformProcess &process);
 	static arena_ptr<TransformResultValue> FinalizeMacroKeywordTrampoline(PEGTransformer &transformer,
 	                                                                      GeneratedTransformProcess &process);
 	static arena_ptr<TransformResultValue> FinalizeFunctionKeywordTrampoline(PEGTransformer &transformer,
@@ -3082,6 +3086,15 @@ public:
 	    PEGTransformer &transformer, const optional<bool> &if_not_exists, const QualifiedName &qualified_name,
 	    optional<vector<MacroParameter>> macro_parameters, const optional<LogicalType> &returns_type,
 	    const Identifier &language, const string &source);
+	static unique_ptr<CreateStatement>
+	TransformCreateLanguageTableFunctionStmt(PEGTransformer &transformer, const optional<bool> &if_not_exists,
+	                                         const QualifiedName &qualified_name,
+	                                         optional<vector<MacroParameter>> macro_parameters,
+	                                         vector<pair<Identifier, unique_ptr<ParsedExpression>>> returns_table_type,
+	                                         const Identifier &language, const string &source);
+	static vector<pair<Identifier, unique_ptr<ParsedExpression>>>
+	TransformReturnsTableType(PEGTransformer &transformer,
+	                          vector<pair<Identifier, unique_ptr<ParsedExpression>>> col_id_type_list);
 	static bool TransformMacroKeyword(PEGTransformer &transformer);
 	static bool TransformFunctionKeyword(PEGTransformer &transformer);
 	static unique_ptr<MacroFunction> TransformMacroDefinition(PEGTransformer &transformer,
