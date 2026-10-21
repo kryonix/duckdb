@@ -460,7 +460,7 @@ struct FrozenMemberSignature {
 	vector<string> type_identities;
 	string return_identity;
 	//! For table members: the identities of the declared RETURNS TABLE column types
-	vector<string> column_type_identities;
+	vector<string> return_type_identities;
 };
 
 static FrozenMemberSignature FreezeMemberSignature(const MacroFunction &member) {
@@ -471,8 +471,8 @@ static FrozenMemberSignature FreezeMemberSignature(const MacroFunction &member) 
 	}
 	result.return_identity = FrozenTypeIdentity(member.return_type);
 	if (member.type == MacroType::LANGUAGE_TABLE_MACRO) {
-		for (auto &column_type : member.Cast<LanguageTableMacroFunction>().column_types) {
-			result.column_type_identities.push_back(FrozenTypeIdentity(column_type));
+		for (auto &column_type : member.Cast<LanguageTableMacroFunction>().return_types) {
+			result.return_type_identities.push_back(FrozenTypeIdentity(column_type));
 		}
 	}
 	return result;
@@ -518,12 +518,12 @@ static bool MacroSignatureEquals(const FrozenMemberSignature &frozen, const Macr
 		// the declared RETURNS TABLE columns are part of the resolved signature
 		auto &before_table = before.Cast<LanguageTableMacroFunction>();
 		auto &after_table = after.Cast<LanguageTableMacroFunction>();
-		if (before_table.column_names != after_table.column_names ||
-		    frozen.column_type_identities.size() != after_table.column_types.size()) {
+		if (before_table.return_names != after_table.return_names ||
+		    frozen.return_type_identities.size() != after_table.return_types.size()) {
 			return false;
 		}
-		for (idx_t col_idx = 0; col_idx < after_table.column_types.size(); col_idx++) {
-			if (frozen.column_type_identities[col_idx] != FrozenTypeIdentity(after_table.column_types[col_idx])) {
+		for (idx_t col_idx = 0; col_idx < after_table.return_types.size(); col_idx++) {
+			if (frozen.return_type_identities[col_idx] != FrozenTypeIdentity(after_table.return_types[col_idx])) {
 				return false;
 			}
 		}
@@ -706,12 +706,12 @@ SchemaCatalogEntry &Binder::BindCreateFunctionInfo(CreateInfo &info) {
 			BindLogicalType(function->return_type);
 		}
 
-		// Resolve user types in the declared RETURNS TABLE columns, recursively like parameter types
+		// Resolve user types in the declared RETURNS TABLE columns (empty while unresolved),
+		// recursively like parameter types
 		if (function->type == MacroType::LANGUAGE_TABLE_MACRO) {
 			D_ASSERT(info.type == CatalogType::TABLE_MACRO_ENTRY);
 			auto &table_member = function->Cast<LanguageTableMacroFunction>();
-			D_ASSERT(!table_member.column_names.empty());
-			for (auto &column_type : table_member.column_types) {
+			for (auto &column_type : table_member.return_types) {
 				BindLogicalType(column_type);
 			}
 		}

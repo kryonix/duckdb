@@ -73,16 +73,16 @@ void LanguageTableMacroFunction::Serialize(Serializer &serializer) const {
 	MacroFunction::Serialize(serializer);
 	serializer.WritePropertyWithDefault<string>(200, "language", language);
 	serializer.WritePropertyWithDefault<string>(201, "source", source);
-	serializer.WritePropertyWithDefault<vector<Identifier>>(202, "column_names", column_names);
-	serializer.WritePropertyWithDefault<vector<LogicalType>>(203, "column_types", column_types);
+	serializer.WritePropertyWithDefault<vector<Identifier>>(202, "return_names", return_names);
+	serializer.WritePropertyWithDefault<vector<LogicalType>>(203, "return_types", return_types);
 }
 
 unique_ptr<MacroFunction> LanguageTableMacroFunction::Deserialize(Deserializer &deserializer) {
 	auto result = duckdb::unique_ptr<LanguageTableMacroFunction>(new LanguageTableMacroFunction());
 	deserializer.ReadPropertyWithDefault<string>(200, "language", result->language);
 	deserializer.ReadPropertyWithDefault<string>(201, "source", result->source);
-	deserializer.ReadPropertyWithDefault<vector<Identifier>>(202, "column_names", result->column_names);
-	deserializer.ReadPropertyWithDefault<vector<LogicalType>>(203, "column_types", result->column_types);
+	deserializer.ReadPropertyWithDefault<vector<Identifier>>(202, "return_names", result->return_names);
+	deserializer.ReadPropertyWithDefault<vector<LogicalType>>(203, "return_types", result->return_types);
 	return std::move(result);
 }
 

@@ -444,9 +444,11 @@ struct TableMacroExtractor {
 	static Value GetReturnType(TableMacroCatalogEntry &entry, idx_t offset) {
 		auto &macro_entry = *entry.macros[offset];
 		if (macro_entry.type == MacroType::LANGUAGE_TABLE_MACRO) {
-			// the declared RETURNS TABLE columns are the fixed result shape
+			// the declared RETURNS TABLE columns are the fixed result shape, NULL while unresolved
 			auto &table_member = macro_entry.Cast<LanguageTableMacroFunction>();
-			return Value("TABLE(" + table_member.ColumnsToSQL() + ")");
+			if (!table_member.return_names.empty()) {
+				return Value("TABLE(" + table_member.ColumnsToSQL() + ")");
+			}
 		}
 		return Value();
 	}

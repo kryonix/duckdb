@@ -22,10 +22,11 @@ public:
 	LanguageTableMacroFunction(string language, string source);
 	LanguageTableMacroFunction();
 
-	//! The declared RETURNS TABLE column names, parallel to column_types
-	vector<Identifier> column_names;
-	//! The declared RETURNS TABLE column types
-	vector<LogicalType> column_types;
+	//! The declared or published result schema, empty while unresolved: an unresolved member binds
+	//! its schema at each call from the statement the language binder returns
+	vector<Identifier> return_names;
+	//! The result column types, parallel to return_names
+	vector<LogicalType> return_types;
 
 public:
 	unique_ptr<MacroFunction> Copy() const override;

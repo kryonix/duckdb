@@ -9106,13 +9106,19 @@ void PEGTransformerFactory::InitializeReturnsTableTypeTrampoline(PEGTransformer 
                                                                  GeneratedTransformProcess &process) {
 	auto &list_pr = process.parse_result.Cast<ListParseResult>();
 	process.ReserveChildSlots(1);
-	process.PushChild({transformer.GetRule(PEGRuleId::ColIdTypeList), list_pr.GetChild(2)}, 0);
+	auto &col_id_type_list_opt = list_pr.GetChild(2).Cast<OptionalParseResult>();
+	if (col_id_type_list_opt.HasResult()) {
+		process.PushChild({transformer.GetRule(PEGRuleId::ColIdTypeList), col_id_type_list_opt.GetResult()}, 0);
+	}
 }
 
 arena_ptr<TransformResultValue>
 PEGTransformerFactory::FinalizeReturnsTableTypeTrampoline(PEGTransformer &transformer,
                                                           GeneratedTransformProcess &process) {
-	auto col_id_type_list = process.TakeResult<vector<pair<Identifier, unique_ptr<ParsedExpression>>>>(0);
+	vector<pair<Identifier, unique_ptr<ParsedExpression>>> col_id_type_list;
+	if (process.child_results[0]) {
+		col_id_type_list = process.TakeResult<vector<pair<Identifier, unique_ptr<ParsedExpression>>>>(0);
+	}
 	auto result = TransformReturnsTableType(transformer, std::move(col_id_type_list));
 	return transformer.MakeResult<vector<pair<Identifier, unique_ptr<ParsedExpression>>>>(std::move(result));
 }
