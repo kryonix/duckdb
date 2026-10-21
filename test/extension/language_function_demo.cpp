@@ -167,5 +167,7 @@ DUCKDB_CPP_EXTENSION_ENTRY(language_function_demo, loader) {
 	loader.RegisterLanguage("testlang", make_shared_ptr<TestLangBinder>());
 	// an aliased collated type, so tests pin that signature rendering preserves type identity
 	loader.RegisterType("ci_text", LogicalType::VARCHAR_COLLATION("nocase").WithAlias("ci_text"));
+	// an alias that collides with a keyword, so tests pin that rendered signatures re-parse
+	loader.RegisterType("table", LogicalType(LogicalTypeId::SMALLINT).WithAlias("table"));
 }
 }
