@@ -49,6 +49,8 @@ public:
 	const string &MemberLanguage(idx_t member_idx) const;
 	//! One member's stored source
 	const string &MemberSource(idx_t member_idx) const;
+	//! Whether a member is the table-valued variant
+	bool MemberIsTableFunction(idx_t member_idx) const;
 	//! The number of parameters a member declares
 	idx_t MemberParameterCount(idx_t member_idx) const;
 	//! A parameter's declared name

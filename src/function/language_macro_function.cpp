@@ -46,11 +46,15 @@ string LanguageMacroFunction::ToSQL() const {
 }
 
 const string &LanguageFunctionCreateInfo::MemberLanguage(idx_t member_idx) const {
-	return members[member_idx]->Cast<LanguageMacroFunction>().language;
+	return LanguageMacroFunction::Get(*members[member_idx]).language;
 }
 
 const string &LanguageFunctionCreateInfo::MemberSource(idx_t member_idx) const {
-	return members[member_idx]->Cast<LanguageMacroFunction>().source;
+	return LanguageMacroFunction::Get(*members[member_idx]).source;
+}
+
+bool LanguageFunctionCreateInfo::MemberIsTableFunction(idx_t member_idx) const {
+	return members[member_idx]->type == MacroType::LANGUAGE_TABLE_MACRO;
 }
 
 idx_t LanguageFunctionCreateInfo::MemberParameterCount(idx_t member_idx) const {
@@ -74,7 +78,7 @@ LogicalType LanguageFunctionCreateInfo::MemberReturnType(idx_t member_idx) const
 }
 
 void LanguageFunctionCreateInfo::SetMemberSource(idx_t member_idx, string source) {
-	members[member_idx]->Cast<LanguageMacroFunction>().source = std::move(source);
+	LanguageMacroFunction::Get(*members[member_idx]).source = std::move(source);
 }
 
 } // namespace duckdb

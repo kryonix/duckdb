@@ -11,8 +11,10 @@
 #include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
+#include "duckdb/catalog/catalog_entry/language_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_macro_catalog_entry.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/function/language_table_macro_function.hpp"
 #include "duckdb/function/table_macro_function.hpp"
 
 namespace duckdb {
@@ -31,6 +33,18 @@ unique_ptr<QueryNode> Binder::BindTableMacro(FunctionExpression &function, Table
 		throw BinderException(function, bind_result.error);
 	}
 	auto &macro_def = *macro_func.macros[bind_result.function_idx.GetIndex()];
+
+	if (macro_def.type == MacroType::LANGUAGE_TABLE_MACRO) {
+		auto &language_member = macro_def.Cast<LanguageTableMacroFunction>();
+		// raises a MissingExtensionException naming the function and language when none is registered
+		LanguageCatalogEntry::GetBinder(context, language_member.language, macro_func.name.GetIdentifierName());
+		// PROVISIONAL: the table-call seam (LanguageFunctionBinder::BindTableCall) is built against the
+		// TVF follow-up design contract; until it lands a registered language cannot bind table calls
+		throw BinderException(function,
+		                      "Table function %s is a %s language function: binding language table "
+		                      "function calls is not supported yet",
+		                      macro_func.name, language_member.language);
+	}
 
 	auto new_macro_binding =
 	    MacroFunction::CreateDummyBinding(macro_def, macro_func.name, positional_arguments, named_arguments);
