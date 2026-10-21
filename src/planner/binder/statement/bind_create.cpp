@@ -638,6 +638,14 @@ SchemaCatalogEntry &Binder::BindCreateFunctionInfo(CreateInfo &info) {
 			has_plain_members = true;
 			continue;
 		}
+		// a language member's kind must match the entry kind: dispatch derives it from the members
+		const auto member_entry_type = function->type == MacroType::LANGUAGE_TABLE_MACRO
+		                                   ? CatalogType::TABLE_MACRO_ENTRY
+		                                   : CatalogType::MACRO_ENTRY;
+		if (info.type != member_entry_type) {
+			throw BinderException("Macro %s() cannot combine scalar and table language function members in one entry",
+			                      base.GetFunctionName());
+		}
 		auto &language_member = LanguageMacroFunction::Get(*function);
 		if (has_language_members && !StringUtil::CIEquals(language_member.language, entry_language)) {
 			throw BinderException("Macro %s() cannot mix members of languages \"%s\" and \"%s\"",
@@ -876,6 +884,33 @@ SchemaCatalogEntry &Binder::BindCreateFunctionInfo(CreateInfo &info) {
 				    "The language binder for \"%s\" changed the member count, a resolved signature, or the default "
 				    "parameters of %s() during validation, which is not allowed",
 				    entry_language, base.GetFunctionName());
+			}
+			// a schema published onto an unresolved table member must be as valid as a declared one
+			for (idx_t member_idx = 0; member_idx < base.macros.size(); member_idx++) {
+				if (base.macros[member_idx]->type != MacroType::LANGUAGE_TABLE_MACRO) {
+					continue;
+				}
+				if (!signatures[member_idx].member->Cast<LanguageTableMacroFunction>().return_names.empty()) {
+					// a declared schema is frozen and already checked above
+					continue;
+				}
+				auto &table_member = base.macros[member_idx]->Cast<LanguageTableMacroFunction>();
+				identifier_set_t published_names;
+				for (auto &name : table_member.return_names) {
+					if (!published_names.insert(name).second) {
+						throw InternalException("The language binder for \"%s\" published a result schema for %s() "
+						                        "with a duplicate column name %s, which is not allowed",
+						                        entry_language, base.GetFunctionName(), name);
+					}
+				}
+				for (auto &type : table_member.return_types) {
+					if (type.id() == LogicalTypeId::UNKNOWN || type.id() == LogicalTypeId::UNBOUND ||
+					    type.id() == LogicalTypeId::INVALID) {
+						throw InternalException("The language binder for \"%s\" published a result schema for %s() "
+						                        "with an unresolved column type, which is not allowed",
+						                        entry_language, base.GetFunctionName());
+					}
+				}
 			}
 		}
 	}

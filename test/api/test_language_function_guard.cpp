@@ -17,6 +17,7 @@
 #include "duckdb/parser/expression/type_expression.hpp"
 #include "duckdb/parser/parsed_data/create_language_info.hpp"
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression_binder.hpp"
 #include "test_helpers.hpp"
@@ -154,6 +155,78 @@ TEST_CASE("ValidateCreate guard rejects a declared table schema mutation", "[api
 	auto result = con.Query("CREATE FUNCTION mutated_tf() RETURNS TABLE(a INTEGER) LANGUAGE tablemutlang AS 'x'");
 	REQUIRE_FAIL(result);
 	REQUIRE(StringUtil::Contains(result->GetError(), "changed the member count, a resolved signature"));
+
+	// a same-length rename is caught too, not only a size change
+	RegisterTestLanguage(*db.instance, "tablerenamelang", make_shared_ptr<MutatingBinder>([](CreateMacroInfo &info) {
+		info.macros[0]->Cast<LanguageTableMacroFunction>().return_names[0] = Identifier("renamed");
+	}));
+	result = con.Query("CREATE FUNCTION renamed_tf() RETURNS TABLE(a INTEGER) LANGUAGE tablerenamelang AS 'x'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "changed the member count, a resolved signature"));
+}
+
+TEST_CASE("ValidateCreate guard rejects an invalid published schema", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	// a published schema must be as valid as a declared one: unique names, resolved types
+	RegisterTestLanguage(*db.instance, "duplang", make_shared_ptr<MutatingBinder>([](CreateMacroInfo &info) {
+		auto &member = info.macros[0]->Cast<LanguageTableMacroFunction>();
+		member.return_names = {Identifier("x"), Identifier("x")};
+		member.return_types = {LogicalType::INTEGER, LogicalType::INTEGER};
+	}));
+	auto result = con.Query("CREATE FUNCTION dup_published() RETURNS TABLE LANGUAGE duplang AS 'x'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "duplicate column name"));
+
+	RegisterTestLanguage(*db.instance, "unknownlang", make_shared_ptr<MutatingBinder>([](CreateMacroInfo &info) {
+		auto &member = info.macros[0]->Cast<LanguageTableMacroFunction>();
+		member.return_names = {Identifier("x")};
+		member.return_types = {LogicalType::UNKNOWN};
+	}));
+	result = con.Query("CREATE FUNCTION unknown_published() RETURNS TABLE LANGUAGE unknownlang AS 'x'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "unresolved column type"));
+}
+
+TEST_CASE("ValidateCreate guard rejects a language version change", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	RegisterTestLanguage(*db.instance, "verlang", make_shared_ptr<MutatingBinder>([](CreateMacroInfo &info) {
+		LanguageMacroFunction::Get(*info.macros[0]).language_version = "verlang 2";
+	}));
+
+	// publish-once: a definition arriving with a version must keep it (only constructible via the API)
+	auto info = make_uniq<CreateMacroInfo>(CatalogType::MACRO_ENTRY);
+	info->SetFunctionName(Identifier("versioned_fun"));
+	auto member = make_uniq<LanguageMacroFunction>("verlang", "x");
+	member->language_version = "verlang 1";
+	info->macros.push_back(std::move(member));
+	auto statement = make_uniq<CreateStatement>();
+	statement->info = std::move(info);
+	auto result = con.Query(std::move(statement));
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "changed the member count, a resolved signature"));
+}
+
+TEST_CASE("Mixed scalar and table language members are rejected at CREATE", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	// only constructible via the API: the SQL grammar produces homogeneous member kinds
+	auto info = make_uniq<CreateMacroInfo>(CatalogType::TABLE_MACRO_ENTRY);
+	info->SetFunctionName(Identifier("mixed_kinds"));
+	auto table_member = make_uniq<LanguageTableMacroFunction>("missinglang", "table source");
+	table_member->return_names.emplace_back("i");
+	table_member->return_types.emplace_back(LogicalType::INTEGER);
+	info->macros.push_back(std::move(table_member));
+	auto scalar_member = make_uniq<LanguageMacroFunction>("missinglang", "scalar source");
+	scalar_member->parameters.push_back(make_uniq<ColumnRefExpression>(Identifier("x")));
+	scalar_member->types.push_back(LogicalType::INTEGER);
+	info->macros.push_back(std::move(scalar_member));
+	auto statement = make_uniq<CreateStatement>();
+	statement->info = std::move(info);
+	auto result = con.Query(std::move(statement));
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "cannot combine scalar and table language function members"));
 }
 
 TEST_CASE("ValidateCreate guard accepts a publish-once schema and language version", "[api]") {
