@@ -510,14 +510,26 @@ static bool MacroSignatureEquals(const FrozenMemberSignature &frozen, const Macr
 			return false;
 		}
 	}
-	if (before.IsLanguageMember() && !StringUtil::CIEquals(LanguageMacroFunction::Get(before).language,
-	                                                       LanguageMacroFunction::Get(after).language)) {
-		return false;
+	if (before.IsLanguageMember()) {
+		auto &before_language = LanguageMacroFunction::Get(before);
+		auto &after_language = LanguageMacroFunction::Get(after);
+		if (!StringUtil::CIEquals(before_language.language, after_language.language)) {
+			return false;
+		}
+		// publish-once: an empty language_version may be set during ValidateCreate, never changed
+		if (!before_language.language_version.empty() &&
+		    before_language.language_version != after_language.language_version) {
+			return false;
+		}
 	}
 	if (before.type == MacroType::LANGUAGE_TABLE_MACRO) {
 		// the declared RETURNS TABLE columns are part of the resolved signature
 		auto &before_table = before.Cast<LanguageTableMacroFunction>();
 		auto &after_table = after.Cast<LanguageTableMacroFunction>();
+		if (before_table.return_names.empty()) {
+			// publish-once: an unresolved schema may be set during ValidateCreate, never changed
+			return after_table.return_names.size() == after_table.return_types.size();
+		}
 		if (before_table.return_names != after_table.return_names ||
 		    frozen.return_type_identities.size() != after_table.return_types.size()) {
 			return false;

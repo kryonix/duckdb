@@ -3,6 +3,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
 #include "duckdb/function/language_macro_function.hpp"
+#include "duckdb/function/language_table_macro_function.hpp"
 #include "duckdb/main/language_function_binder.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/common/extension_type_info.hpp"
@@ -138,6 +139,41 @@ TEST_CASE("ValidateCreate guard rejects an extension metadata mutation on a para
 	auto result = con.Query("CREATE FUNCTION ext_mutated(x INTEGER) LANGUAGE extlang AS 'arg:0'");
 	REQUIRE_FAIL(result);
 	REQUIRE(StringUtil::Contains(result->GetError(), "changed the member count, a resolved signature"));
+}
+
+TEST_CASE("ValidateCreate guard rejects a declared table schema mutation", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	// publish-once only covers an EMPTY schema: a declared RETURNS TABLE shape is frozen
+	RegisterTestLanguage(*db.instance, "tablemutlang", make_shared_ptr<MutatingBinder>([](CreateMacroInfo &info) {
+		auto &member = info.macros[0]->Cast<LanguageTableMacroFunction>();
+		member.return_names.emplace_back("extra");
+		member.return_types.emplace_back(LogicalType::INTEGER);
+	}));
+
+	auto result = con.Query("CREATE FUNCTION mutated_tf() RETURNS TABLE(a INTEGER) LANGUAGE tablemutlang AS 'x'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "changed the member count, a resolved signature"));
+}
+
+TEST_CASE("ValidateCreate guard accepts a publish-once schema and language version", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	RegisterTestLanguage(*db.instance, "publang", make_shared_ptr<MutatingBinder>([](CreateMacroInfo &info) {
+		auto &member = info.macros[0]->Cast<LanguageTableMacroFunction>();
+		if (member.return_names.empty()) {
+			member.return_names.emplace_back("published");
+			member.return_types.emplace_back(LogicalType::INTEGER);
+		}
+		member.language_version = "publang 7";
+	}));
+
+	// the bare RETURNS TABLE form stores an unresolved schema the binder may publish once
+	REQUIRE_NO_FAIL(con.Query("CREATE FUNCTION published_tf() RETURNS TABLE LANGUAGE publang AS 'x'"));
+	auto result = con.Query(
+	    "SELECT return_type, language_version FROM duckdb_functions() WHERE function_name = 'published_tf'");
+	REQUIRE(CHECK_COLUMN(result, 0, {"TABLE(published INTEGER)"}));
+	REQUIRE(CHECK_COLUMN(result, 1, {"publang 7"}));
 }
 
 TEST_CASE("Member mutations respect internal entry protection", "[api]") {

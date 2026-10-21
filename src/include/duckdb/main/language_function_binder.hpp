@@ -38,7 +38,9 @@ public:
 	//! member sources and publish documentation, but must not change the member count, the resolved
 	//! signatures (parameters, types, return type, language), or the default parameters. The
 	//! frozen types compare by representation: signature types must not be reassigned or mutated
-	//! in place, even to equivalent values.
+	//! in place, even to equivalent values. Two publish-once exceptions: a table member's
+	//! unresolved result schema (empty return_names/return_types) and an empty language_version
+	//! may be set during validation, never changed.
 	//! Published documentation must carry a member's parameter types, with ANY for untyped
 	//! parameters: documentation in any other shape is not released when its member is replaced or
 	//! dropped.
