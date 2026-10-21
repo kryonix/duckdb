@@ -368,6 +368,8 @@ enum class LogicalTypeInfoType : uint8_t;
 
 enum class LookupResultType : uint8_t;
 
+enum class MacroBindPolicy : uint8_t;
+
 enum class MacroType : uint8_t;
 
 enum class MapInvalidReason : uint8_t;
@@ -1194,6 +1196,9 @@ const char* EnumUtil::ToChars<LogicalTypeInfoType>(LogicalTypeInfoType value);
 
 template<>
 const char* EnumUtil::ToChars<LookupResultType>(LookupResultType value);
+
+template<>
+const char* EnumUtil::ToChars<MacroBindPolicy>(MacroBindPolicy value);
 
 template<>
 const char* EnumUtil::ToChars<MacroType>(MacroType value);
@@ -2182,6 +2187,9 @@ LogicalTypeInfoType EnumUtil::FromString<LogicalTypeInfoType>(const char *value)
 
 template<>
 LookupResultType EnumUtil::FromString<LookupResultType>(const char *value);
+
+template<>
+MacroBindPolicy EnumUtil::FromString<MacroBindPolicy>(const char *value);
 
 template<>
 MacroType EnumUtil::FromString<MacroType>(const char *value);

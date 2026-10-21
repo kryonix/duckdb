@@ -30,6 +30,7 @@ const LanguageMacroFunction &LanguageMacroFunction::Get(const MacroFunction &mem
 
 unique_ptr<MacroFunction> LanguageMacroFunction::Copy() const {
 	auto result = make_uniq<LanguageMacroFunction>(language, source);
+	result->language_version = language_version;
 	CopyProperties(*result);
 	return std::move(result);
 }

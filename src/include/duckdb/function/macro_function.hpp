@@ -27,6 +27,11 @@ enum class MacroType : uint8_t {
 	LANGUAGE_TABLE_MACRO = 4
 };
 
+//! How a member's typed parameters take part in overload selection. IMPLICIT is the macro rule
+//! (arguments must cast implicitly); BOUNDARY declares the types as explicit boundary casts.
+//! Only the storage plumbing exists so far, selection semantics follow separately.
+enum class MacroBindPolicy : uint8_t { IMPLICIT = 0, BOUNDARY = 1 };
+
 struct MacroBindResult {
 	explicit MacroBindResult(string error_p) : error(std::move(error_p)) {
 	}
@@ -51,6 +56,10 @@ public:
 	vector<LogicalType> types;
 	//! The declared return type, UNKNOWN when none was declared: the member's result is cast to it
 	LogicalType return_type = LogicalType::UNKNOWN;
+	//! How typed parameters take part in overload selection (storage plumbing only so far)
+	MacroBindPolicy bind_policy = MacroBindPolicy::IMPLICIT;
+	//! Indexes of parameters a language declares as relations (TABLE(col TYPE, ...) parameters)
+	vector<idx_t> relation_parameters;
 
 public:
 	virtual ~MacroFunction() {

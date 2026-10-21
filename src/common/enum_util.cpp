@@ -3996,6 +3996,24 @@ LookupResultType EnumUtil::FromString<LookupResultType>(const char *value) {
 	return static_cast<LookupResultType>(StringUtil::StringToEnum(GetLookupResultTypeValues(), 3, "LookupResultType", value));
 }
 
+const StringUtil::EnumStringLiteral *GetMacroBindPolicyValues() {
+	static constexpr StringUtil::EnumStringLiteral values[] {
+		{ static_cast<uint32_t>(MacroBindPolicy::IMPLICIT), "IMPLICIT" },
+		{ static_cast<uint32_t>(MacroBindPolicy::BOUNDARY), "BOUNDARY" }
+	};
+	return values;
+}
+
+template<>
+const char* EnumUtil::ToChars<MacroBindPolicy>(MacroBindPolicy value) {
+	return StringUtil::EnumToString(GetMacroBindPolicyValues(), 2, "MacroBindPolicy", static_cast<uint32_t>(value));
+}
+
+template<>
+MacroBindPolicy EnumUtil::FromString<MacroBindPolicy>(const char *value) {
+	return static_cast<MacroBindPolicy>(StringUtil::StringToEnum(GetMacroBindPolicyValues(), 2, "MacroBindPolicy", value));
+}
+
 const StringUtil::EnumStringLiteral *GetMacroTypeValues() {
 	static constexpr StringUtil::EnumStringLiteral values[] {
 		{ static_cast<uint32_t>(MacroType::VOID_MACRO), "VOID_MACRO" },

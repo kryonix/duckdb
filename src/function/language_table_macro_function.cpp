@@ -15,6 +15,7 @@ LanguageTableMacroFunction::LanguageTableMacroFunction() : LanguageMacroFunction
 
 unique_ptr<MacroFunction> LanguageTableMacroFunction::Copy() const {
 	auto result = make_uniq<LanguageTableMacroFunction>(language, source);
+	result->language_version = language_version;
 	CopyProperties(*result);
 	result->return_names = return_names;
 	result->return_types = return_types;
