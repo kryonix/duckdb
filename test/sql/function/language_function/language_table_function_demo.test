@@ -24,21 +24,114 @@ CREATE FUNCTION malformed_tf() RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'no
 ----
 <REGEX>:.*testlang: the source of table function "malformed_tf" must have the form 'rows:<n>'.*
 
+# a testlang table function emits the rows its source denotes, renamed and cast to the declared schema
 statement ok
 CREATE FUNCTION numbers(n INTEGER) RETURNS TABLE(i INTEGER, tag VARCHAR) LANGUAGE testlang AS 'rows:3';
 
-# PROVISIONAL (phase 2 wires LanguageFunctionBinder::BindTableCall): a registered language
-# cannot bind table calls yet, but the error is the seam's, not a missing-extension error
-statement error
-SELECT * FROM numbers(3);
+query IT
+SELECT i, tag FROM numbers(1);
 ----
-<REGEX>:.*binding language table function calls is not supported yet.*
+0	0
+1	1
+2	2
 
-# argument resolution errors surface before the seam error
+# the declared schema is authoritative for the result types
+query TT
+SELECT typeof(i), typeof(tag) FROM numbers(1) LIMIT 1;
+----
+INTEGER	VARCHAR
+
+# argument resolution errors surface before the language binder runs
 statement error
 SELECT * FROM numbers();
 ----
 <REGEX>:.*Binder Error.*
+
+# 'rows:arg:<i>' takes the row count from the i-th UNEVALUATED argument: arbitrary expressions work
+statement ok
+CREATE FUNCTION arg_rows(n) RETURNS TABLE(i BIGINT) LANGUAGE testlang AS 'rows:arg:0';
+
+query I
+SELECT count(*) FROM arg_rows(1 + 2);
+----
+3
+
+# ... including correlated (lateral) arguments: the seam runs before argument evaluation
+statement ok
+CREATE TABLE t(x INTEGER);
+
+statement ok
+INSERT INTO t VALUES (1), (2), (0);
+
+query II
+SELECT t.x, r.i FROM t, arg_rows(t.x) r ORDER BY t.x, r.i;
+----
+1	0
+2	0
+2	1
+
+query II
+SELECT t.x, r.i FROM t, LATERAL arg_rows(t.x) r ORDER BY t.x, r.i;
+----
+1	0
+2	0
+2	1
+
+# default parameters are filled in before the language binder sees the arguments
+statement ok
+CREATE FUNCTION defaulted_rows(n := 2) RETURNS TABLE(i BIGINT) LANGUAGE testlang AS 'rows:arg:0';
+
+query I
+SELECT count(*) FROM defaulted_rows();
+----
+2
+
+query I
+SELECT count(*) FROM defaulted_rows(n := 4);
+----
+4
+
+# the declared column types are enforced with standard CAST semantics at runtime
+statement ok
+CREATE FUNCTION narrow() RETURNS TABLE(i TINYINT) LANGUAGE testlang AS 'rows:300';
+
+statement error
+SELECT max(i) FROM narrow();
+----
+<REGEX>:.*Conversion Error.*
+
+# a binder returning a different column count than declared is rejected with both sides named
+statement ok
+CREATE FUNCTION wide() RETURNS TABLE(i BIGINT) LANGUAGE testlang AS 'rows:1:wide';
+
+statement error
+SELECT * FROM wide();
+----
+<REGEX>:.*declares 1 result columns.*returned a statement with 2 columns.*
+
+# a self-referencing language table function is caught by the recursion guard
+statement ok
+CREATE FUNCTION recursive_tf() RETURNS TABLE(i BIGINT) LANGUAGE testlang AS 'rows:self';
+
+statement error
+SELECT * FROM recursive_tf();
+----
+<REGEX>:.*infinite recursion detected.*
+
+# the bare RETURNS TABLE form stores an unresolved schema the binder publishes at CREATE
+statement ok
+CREATE FUNCTION inferred() RETURNS TABLE LANGUAGE testlang AS 'rows:2';
+
+query TT
+SELECT return_type, language_version FROM duckdb_functions() WHERE function_name = 'inferred';
+----
+TABLE(i BIGINT)	testlang 1.0
+
+query I
+SELECT i FROM inferred() ORDER BY i;
+----
+0
+1
 
 # binder-published descriptions carry the member's signature and survive member mutations
 statement ok
@@ -72,6 +165,13 @@ statement ok
 DROP FUNCTION numbers;
 
 # an extension-registered aliased type keeps its identity in the declared columns through EXPORT
+# (a fresh database, so the import does not collide with this test's other entries)
+statement ok
+ATTACH ':memory:' AS aex;
+
+statement ok
+USE aex;
+
 statement ok
 CREATE FUNCTION aliased_tf(x ci_text) RETURNS TABLE(c ci_text) LANGUAGE testlang AS 'rows:1';
 
@@ -97,6 +197,12 @@ SELECT parameter_types, return_type FROM duckdb_functions() WHERE function_name 
 statement ok
 DROP FUNCTION aliased_tf;
 
+statement ok
+USE memory;
+
+statement ok
+DETACH aex;
+
 # scalar language functions keep working with table members around (shared machinery)
 statement ok
 CREATE FUNCTION scalar_twin() RETURNS INTEGER LANGUAGE testlang AS '42';
@@ -109,8 +215,25 @@ SELECT scalar_twin();
 ----
 42
 
+query I
+SELECT i FROM scalar_twin();
+----
+0
+
 statement ok
 DROP MACRO TABLE scalar_twin;
 
 statement ok
 DROP FUNCTION scalar_twin;
+
+# views over language table functions re-bind through the seam
+statement ok
+CREATE FUNCTION viewed(n INTEGER) RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:arg:0';
+
+statement ok
+CREATE VIEW v AS SELECT * FROM viewed(2);
+
+query I
+SELECT count(*) FROM v;
+----
+2
