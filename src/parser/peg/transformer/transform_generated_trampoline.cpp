@@ -704,6 +704,12 @@ static const TransformFrameOps CREATE_LANGUAGE_FUNCTION_STMT_OPS = {
 static const TransformFrameOps RETURNS_TYPE_OPS = {"ReturnsType",
                                                    &PEGTransformerFactory::InitializeReturnsTypeTrampoline,
                                                    &PEGTransformerFactory::FinalizeReturnsTypeTrampoline};
+static const TransformFrameOps CREATE_LANGUAGE_TABLE_FUNCTION_STMT_OPS = {
+    "CreateLanguageTableFunctionStmt", &PEGTransformerFactory::InitializeCreateLanguageTableFunctionStmtTrampoline,
+    &PEGTransformerFactory::FinalizeCreateLanguageTableFunctionStmtTrampoline};
+static const TransformFrameOps RETURNS_TABLE_TYPE_OPS = {"ReturnsTableType",
+                                                         &PEGTransformerFactory::InitializeReturnsTableTypeTrampoline,
+                                                         &PEGTransformerFactory::FinalizeReturnsTableTypeTrampoline};
 static const TransformFrameOps MACRO_OR_FUNCTION_OPS = {"MacroOrFunction",
                                                         &PEGTransformerFactory::InitializeMacroOrFunctionTrampoline,
                                                         &PEGTransformerFactory::FinalizeMacroOrFunctionTrampoline};
@@ -3528,6 +3534,8 @@ const case_insensitive_map_t<const TransformFrameOps *> &PEGTransformerFactory::
 	    {"CreateMacroStmt", &CREATE_MACRO_STMT_OPS},
 	    {"CreateLanguageFunctionStmt", &CREATE_LANGUAGE_FUNCTION_STMT_OPS},
 	    {"ReturnsType", &RETURNS_TYPE_OPS},
+	    {"CreateLanguageTableFunctionStmt", &CREATE_LANGUAGE_TABLE_FUNCTION_STMT_OPS},
+	    {"ReturnsTableType", &RETURNS_TABLE_TYPE_OPS},
 	    {"MacroOrFunction", &MACRO_OR_FUNCTION_OPS},
 	    {"MacroKeyword", &MACRO_KEYWORD_OPS},
 	    {"FunctionKeyword", &FUNCTION_KEYWORD_OPS},
@@ -9056,6 +9064,59 @@ PEGTransformerFactory::FinalizeReturnsTypeTrampoline(PEGTransformer &transformer
 	return transformer.MakeResult<LogicalType>(result);
 }
 
+void PEGTransformerFactory::InitializeCreateLanguageTableFunctionStmtTrampoline(PEGTransformer &transformer,
+                                                                                GeneratedTransformProcess &process) {
+	auto &list_pr = process.parse_result.Cast<ListParseResult>();
+	process.ReserveChildSlots(4);
+	process.PushChild({transformer.GetRule(PEGRuleId::ReturnsTableType), list_pr.GetChild(4)}, 3);
+	auto &macro_parameters_opt = ExtractResultFromParens(list_pr.GetChild(3)).Cast<OptionalParseResult>();
+	if (macro_parameters_opt.HasResult()) {
+		process.PushChild({transformer.GetRule(PEGRuleId::MacroParameters), macro_parameters_opt.GetResult()}, 2);
+	}
+	process.PushChild({transformer.GetRule(PEGRuleId::QualifiedName), list_pr.GetChild(2)}, 1);
+	auto &if_not_exists_opt = list_pr.GetChild(1).Cast<OptionalParseResult>();
+	if (if_not_exists_opt.HasResult()) {
+		process.PushChild({transformer.GetRule(PEGRuleId::IfNotExists), if_not_exists_opt.GetResult()}, 0);
+	}
+}
+
+arena_ptr<TransformResultValue>
+PEGTransformerFactory::FinalizeCreateLanguageTableFunctionStmtTrampoline(PEGTransformer &transformer,
+                                                                         GeneratedTransformProcess &process) {
+	auto &list_pr = process.parse_result.Cast<ListParseResult>();
+	optional<bool> if_not_exists {};
+	if (process.child_results[0]) {
+		if_not_exists = process.TakeResult<bool>(0);
+	}
+	auto qualified_name = process.TakeResult<QualifiedName>(1);
+	optional<vector<MacroParameter>> macro_parameters {};
+	if (process.child_results[2]) {
+		macro_parameters = process.TakeResult<vector<MacroParameter>>(2);
+	}
+	auto returns_table_type = process.TakeResult<vector<pair<Identifier, unique_ptr<ParsedExpression>>>>(3);
+	auto identifier = list_pr.GetChild(6).Cast<IdentifierParseResult>().identifier;
+	auto string_literal = TransformStringLiteral(transformer, list_pr.GetChild(8));
+	auto result = TransformCreateLanguageTableFunctionStmt(transformer, if_not_exists, qualified_name,
+	                                                       std::move(macro_parameters), std::move(returns_table_type),
+	                                                       identifier, string_literal);
+	return transformer.MakeResult<unique_ptr<CreateStatement>>(std::move(result));
+}
+
+void PEGTransformerFactory::InitializeReturnsTableTypeTrampoline(PEGTransformer &transformer,
+                                                                 GeneratedTransformProcess &process) {
+	auto &list_pr = process.parse_result.Cast<ListParseResult>();
+	process.ReserveChildSlots(1);
+	process.PushChild({transformer.GetRule(PEGRuleId::ColIdTypeList), list_pr.GetChild(2)}, 0);
+}
+
+arena_ptr<TransformResultValue>
+PEGTransformerFactory::FinalizeReturnsTableTypeTrampoline(PEGTransformer &transformer,
+                                                          GeneratedTransformProcess &process) {
+	auto col_id_type_list = process.TakeResult<vector<pair<Identifier, unique_ptr<ParsedExpression>>>>(0);
+	auto result = TransformReturnsTableType(transformer, std::move(col_id_type_list));
+	return transformer.MakeResult<vector<pair<Identifier, unique_ptr<ParsedExpression>>>>(std::move(result));
+}
+
 void PEGTransformerFactory::InitializeMacroOrFunctionTrampoline(PEGTransformer &transformer,
                                                                 GeneratedTransformProcess &process) {
 	auto &list_pr = process.parse_result.Cast<ListParseResult>();
@@ -12925,7 +12986,13 @@ void PEGTransformerFactory::InitializeDropTableFunctionTrampoline(PEGTransformer
 	auto &list_pr = process.parse_result.Cast<ListParseResult>();
 	auto list_items = ExtractParseResultsFromList(list_pr.GetChild(2));
 	auto dynamic_child_count = list_items.size();
-	process.ReserveChildSlots(3 + dynamic_child_count - 1);
+	process.ReserveChildSlots(4 + dynamic_child_count - 1);
+	auto &drop_function_signature_opt = list_pr.GetChild(3).Cast<OptionalParseResult>();
+	if (drop_function_signature_opt.HasResult()) {
+		process.PushChild(
+		    {transformer.GetRule(PEGRuleId::DropFunctionSignature), drop_function_signature_opt.GetResult()},
+		    3 + dynamic_child_count - 1);
+	}
 	for (idx_t i = list_items.size(); i > 0; i--) {
 		auto child_idx = i - 1;
 		process.PushChild({transformer.GetRule(PEGRuleId::QualifiedTableFunction), list_items[child_idx].get()},
@@ -12954,7 +13021,12 @@ PEGTransformerFactory::FinalizeDropTableFunctionTrampoline(PEGTransformer &trans
 	for (idx_t i = 2; i < 2 + dynamic_child_count; i++) {
 		qualified_table_function.push_back(process.TakeResult<QualifiedName>(i));
 	}
-	auto result = TransformDropTableFunction(transformer, comment_macro_table, if_exists, qualified_table_function);
+	optional<vector<LogicalType>> drop_function_signature {};
+	if (process.child_results[3 + dynamic_child_count - 1]) {
+		drop_function_signature = process.TakeResult<vector<LogicalType>>(3 + dynamic_child_count - 1);
+	}
+	auto result = TransformDropTableFunction(transformer, comment_macro_table, if_exists, qualified_table_function,
+	                                         drop_function_signature);
 	return transformer.MakeResult<unique_ptr<DropStatement>>(std::move(result));
 }
 

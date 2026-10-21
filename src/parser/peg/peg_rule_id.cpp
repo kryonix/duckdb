@@ -270,6 +270,8 @@ static const char *const PEG_RULE_NAMES[] = {
     "CreateMacroStmt",
     "CreateLanguageFunctionStmt",
     "ReturnsType",
+    "CreateLanguageTableFunctionStmt",
+    "ReturnsTableType",
     "MacroOrFunction",
     "MacroKeyword",
     "FunctionKeyword",

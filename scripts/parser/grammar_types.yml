@@ -186,6 +186,7 @@ CreateStatement:
     - CreateIndexStmt
     - CreateMacroStmt
     - CreateLanguageFunctionStmt
+    - CreateLanguageTableFunctionStmt
     - CreateTypeStmt
     - CreateViewStmt
     - CreateTriggerStmt
@@ -1660,6 +1661,10 @@ overrides:
     type: "pair<Identifier, unique_ptr<ParsedExpression>>"
     by_value: true
   ColIdTypeList:
+    type: "vector<pair<Identifier, unique_ptr<ParsedExpression>>>"
+    by_value: true
+  # create_macro.gram
+  ReturnsTableType:
     type: "vector<pair<Identifier, unique_ptr<ParsedExpression>>>"
     by_value: true
   # create_index.gram

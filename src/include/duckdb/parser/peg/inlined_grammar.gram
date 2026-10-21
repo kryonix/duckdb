@@ -1286,6 +1286,9 @@ CreateMacroStmt <- MacroOrFunction IfNotExists? QualifiedName List(MacroDefiniti
 CreateLanguageFunctionStmt <- 'FUNCTION' IfNotExists? QualifiedName Parens(MacroParameters?) ReturnsType? 'LANGUAGE' Identifier 'AS' StringLiteral
 ReturnsType <- 'RETURNS' Type
 
+CreateLanguageTableFunctionStmt <- 'FUNCTION' IfNotExists? QualifiedName Parens(MacroParameters?) ReturnsTableType 'LANGUAGE' Identifier 'AS' StringLiteral
+ReturnsTableType <- 'RETURNS' 'TABLE' ColIdTypeList
+
 MacroOrFunction <- MacroKeyword / FunctionKeyword
 MacroKeyword <- 'MACRO'
 FunctionKeyword <- 'FUNCTION'
@@ -1333,7 +1336,7 @@ MinValue <- 'MINVALUE'
 MaxValue <- 'MAXVALUE'
 
 CreateStatement <- 'CREATE' OrReplace? Temporary? CreateStatementVariation
-CreateStatementVariation <- CreateTableStmt / CreateLanguageFunctionStmt / CreateMacroStmt / CreateSequenceStmt / CreateTypeStmt / CreateSchemaStmt / CreateViewStmt / CreateIndexStmt / CreateSecretStmt / CreateTriggerStmt
+CreateStatementVariation <- CreateTableStmt / CreateLanguageTableFunctionStmt / CreateLanguageFunctionStmt / CreateMacroStmt / CreateSequenceStmt / CreateTypeStmt / CreateSchemaStmt / CreateViewStmt / CreateIndexStmt / CreateSecretStmt / CreateTriggerStmt
 OrReplace <- 'OR' 'REPLACE'
 Temporary <- Persistent / TempPersistent / TemporaryPersistent
 Persistent <- 'PERSISTENT'
@@ -1549,7 +1552,7 @@ DropEntries <-
 DropTrigger <- 'TRIGGER' IfExists? TriggerName 'ON' BaseTableName
 
 DropTable <- TableOrView IfExists? List(BaseTableName)
-DropTableFunction <- CommentMacroTable IfExists? List(QualifiedTableFunction)
+DropTableFunction <- CommentMacroTable IfExists? List(QualifiedTableFunction) DropFunctionSignature?
 DropFunction <- FunctionTypeMacro IfExists? List(FunctionIdentifier) DropFunctionSignature?
 DropFunctionSignature <- Parens(List(Type)?)
 DropSchema <- 'SCHEMA' IfExists? List(QualifiedName)

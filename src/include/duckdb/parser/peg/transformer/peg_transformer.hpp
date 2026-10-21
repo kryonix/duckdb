@@ -1500,6 +1500,13 @@ public:
 	static void InitializeReturnsTypeTrampoline(PEGTransformer &transformer, GeneratedTransformProcess &process);
 	static arena_ptr<TransformResultValue> FinalizeReturnsTypeTrampoline(PEGTransformer &transformer,
 	                                                                     GeneratedTransformProcess &process);
+	static void InitializeCreateLanguageTableFunctionStmtTrampoline(PEGTransformer &transformer,
+	                                                                GeneratedTransformProcess &process);
+	static arena_ptr<TransformResultValue>
+	FinalizeCreateLanguageTableFunctionStmtTrampoline(PEGTransformer &transformer, GeneratedTransformProcess &process);
+	static void InitializeReturnsTableTypeTrampoline(PEGTransformer &transformer, GeneratedTransformProcess &process);
+	static arena_ptr<TransformResultValue> FinalizeReturnsTableTypeTrampoline(PEGTransformer &transformer,
+	                                                                          GeneratedTransformProcess &process);
 	static void InitializeMacroOrFunctionTrampoline(PEGTransformer &transformer, GeneratedTransformProcess &process);
 	static arena_ptr<TransformResultValue> FinalizeMacroOrFunctionTrampoline(PEGTransformer &transformer,
 	                                                                         GeneratedTransformProcess &process);
@@ -4788,6 +4795,14 @@ public:
 	    PEGTransformer &transformer, const optional<bool> &if_not_exists, const QualifiedName &qualified_name,
 	    optional<vector<MacroParameter>> macro_parameters, const optional<LogicalType> &returns_type,
 	    const Identifier &language, const string &source);
+	static unique_ptr<CreateStatement> TransformCreateLanguageTableFunctionStmt(
+	    PEGTransformer &transformer, const optional<bool> &if_not_exists, const QualifiedName &qualified_name,
+	    optional<vector<MacroParameter>> macro_parameters,
+	    vector<pair<Identifier, unique_ptr<ParsedExpression>>> returns_table_type, const Identifier &language,
+	    const string &source);
+	static vector<pair<Identifier, unique_ptr<ParsedExpression>>>
+	TransformReturnsTableType(PEGTransformer &transformer,
+	                          vector<pair<Identifier, unique_ptr<ParsedExpression>>> col_id_type_list);
 	static bool TransformMacroKeyword(PEGTransformer &transformer);
 	static bool TransformFunctionKeyword(PEGTransformer &transformer);
 	static unique_ptr<MacroFunction> TransformMacroDefinition(PEGTransformer &transformer,
@@ -5068,10 +5083,10 @@ public:
 	static unique_ptr<DropStatement> TransformDropTable(PEGTransformer &transformer, const CatalogType &table_or_view,
 	                                                    const optional<bool> &if_exists,
 	                                                    vector<unique_ptr<BaseTableRef>> base_table_name);
-	static unique_ptr<DropStatement> TransformDropTableFunction(PEGTransformer &transformer,
-	                                                            const CatalogType &comment_macro_table,
-	                                                            const optional<bool> &if_exists,
-	                                                            const vector<QualifiedName> &table_function_name);
+	static unique_ptr<DropStatement>
+	TransformDropTableFunction(PEGTransformer &transformer, const CatalogType &comment_macro_table,
+	                           const optional<bool> &if_exists, const vector<QualifiedName> &table_function_name,
+	                           const optional<vector<LogicalType>> &drop_function_signature);
 	static unique_ptr<DropStatement>
 	TransformDropFunction(PEGTransformer &transformer, const bool &function_type_macro, const optional<bool> &if_exists,
 	                      const vector<QualifiedName> &function_identifier,
