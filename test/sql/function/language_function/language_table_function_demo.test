@@ -267,6 +267,26 @@ DROP MACRO TABLE scalar_twin;
 statement ok
 DROP FUNCTION scalar_twin;
 
+# overload selection picks table members by nested user types, like the scalar path
+statement ok
+CREATE TYPE dmood AS ENUM ('d1');
+
+statement ok
+CREATE FUNCTION pick(x dmood[]) RETURNS TABLE(i BIGINT) LANGUAGE testlang AS 'rows:1';
+
+statement ok
+CREATE FUNCTION pick(x VARCHAR[]) RETURNS TABLE(i BIGINT) LANGUAGE testlang AS 'rows:2';
+
+query I
+SELECT count(*) FROM pick(['d1'::dmood]);
+----
+1
+
+query I
+SELECT count(*) FROM pick(['a']);
+----
+2
+
 # views over language table functions re-bind through the seam
 statement ok
 CREATE FUNCTION viewed(n INTEGER) RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:arg:0';

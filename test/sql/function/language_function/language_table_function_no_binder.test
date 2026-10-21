@@ -105,6 +105,25 @@ true
 statement ok
 DROP FUNCTION moods;
 
+# user types nested inside concrete containers resolve in parameter and column types, and the
+# resolved nested signature is a distinct overload identity
+statement ok
+CREATE FUNCTION nested_cols(x mood[]) RETURNS TABLE(c STRUCT(m mood)) LANGUAGE testlang AS 'rows:1';
+
+statement ok
+CREATE FUNCTION nested_cols(x VARCHAR[]) RETURNS TABLE(c INTEGER) LANGUAGE testlang AS 'rows:2';
+
+query TT
+SELECT parameter_types[1] LIKE 'ENUM%[]', return_type LIKE 'TABLE(c STRUCT(m ENUM%' FROM duckdb_functions() WHERE function_name = 'nested_cols' AND macro_definition = 'rows:1';
+----
+true	true
+
+statement ok
+DROP FUNCTION nested_cols(mood[]);
+
+statement ok
+DROP FUNCTION nested_cols(VARCHAR[]);
+
 statement ok
 DROP TYPE mood;
 
