@@ -430,6 +430,10 @@ BoundStatement Binder::Bind(TableFunctionRef &ref) {
 		if (!func_catalog.ParentCatalog().IsSystemCatalog()) {
 			GetStatementProperties().RegisterDBRead(func_catalog.ParentCatalog(), context);
 		}
+		if (!macro_func.macros.empty() && macro_func.macros[0]->type == MacroType::LANGUAGE_TABLE_MACRO) {
+			// the language's binder compiles the call, before any argument evaluation
+			return BindLanguageTableMacro(ref, fexpr, macro_func);
+		}
 		auto query_node = BindTableMacro(fexpr, macro_func, 0);
 		D_ASSERT(query_node);
 
