@@ -9,6 +9,7 @@
 #include "duckdb/catalog/catalog_entry/table_macro_catalog_entry.hpp"
 #include "duckdb/function/table_macro_function.hpp"
 #include "duckdb/function/language_macro_function.hpp"
+#include "duckdb/function/language_table_macro_function.hpp"
 #include "duckdb/function/scalar_macro_function.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/pragma_function_catalog_entry.hpp"
@@ -441,6 +442,12 @@ struct TableMacroExtractor {
 	}
 
 	static Value GetReturnType(TableMacroCatalogEntry &entry, idx_t offset) {
+		auto &macro_entry = *entry.macros[offset];
+		if (macro_entry.type == MacroType::LANGUAGE_TABLE_MACRO) {
+			// the declared RETURNS TABLE columns are the fixed result shape
+			auto &table_member = macro_entry.Cast<LanguageTableMacroFunction>();
+			return Value("TABLE(" + table_member.ColumnsToSQL() + ")");
+		}
 		return Value();
 	}
 
@@ -480,6 +487,10 @@ struct TableMacroExtractor {
 
 	static Value GetMacroDefinition(TableMacroCatalogEntry &entry, idx_t offset) {
 		auto &macro_entry = *entry.macros[offset];
+		if (macro_entry.type == MacroType::LANGUAGE_TABLE_MACRO) {
+			// the verbatim source of a language member
+			return Value(macro_entry.Cast<LanguageTableMacroFunction>().source);
+		}
 		if (macro_entry.type == MacroType::TABLE_MACRO) {
 			auto &func = macro_entry.Cast<TableMacroFunction>();
 			return func.query_node->ToString();
@@ -492,6 +503,10 @@ struct TableMacroExtractor {
 	}
 
 	static Value GetLanguage(TableMacroCatalogEntry &entry, idx_t offset) {
+		auto &macro_entry = *entry.macros[offset];
+		if (macro_entry.type == MacroType::LANGUAGE_TABLE_MACRO) {
+			return Value(macro_entry.Cast<LanguageTableMacroFunction>().language);
+		}
 		return Value();
 	}
 

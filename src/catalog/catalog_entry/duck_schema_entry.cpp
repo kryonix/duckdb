@@ -240,12 +240,12 @@ optional_ptr<CatalogEntry> DuckSchemaEntry::CreateFunction(CatalogTransaction tr
 	case CatalogType::MACRO_ENTRY:
 	case CatalogType::TABLE_MACRO_ENTRY: {
 		auto &macro_info = info.Cast<CreateMacroInfo>();
-		if (macro_info.macros.size() == 1 && macro_info.macros[0]->type == MacroType::LANGUAGE_MACRO) {
+		if (macro_info.macros.size() == 1 && macro_info.macros[0]->IsLanguageMember()) {
 			auto &catalog_set = GetCatalogSet(info.type);
 			auto existing_entry = catalog_set.GetEntry(transaction, info.GetFunctionName());
-			if (existing_entry && existing_entry->type == CatalogType::MACRO_ENTRY) {
+			if (existing_entry && existing_entry->type == info.type) {
 				auto &existing_macro = existing_entry->Cast<MacroCatalogEntry>();
-				if (!existing_macro.macros.empty() && existing_macro.macros[0]->type == MacroType::LANGUAGE_MACRO) {
+				if (!existing_macro.macros.empty() && existing_macro.macros[0]->IsLanguageMember()) {
 					// adding one member to an existing overload set follows the overload identity rules
 					return AddLanguageFunctionMember(transaction, macro_info, existing_macro);
 				}
@@ -292,14 +292,16 @@ static void RemoveMemberDescriptions(vector<FunctionDescription> &descriptions, 
 optional_ptr<CatalogEntry> DuckSchemaEntry::AddLanguageFunctionMember(CatalogTransaction transaction,
                                                                       CreateMacroInfo &info,
                                                                       MacroCatalogEntry &existing) {
-	D_ASSERT(info.macros.size() == 1 && info.macros[0]->type == MacroType::LANGUAGE_MACRO);
-	auto &new_member = info.macros[0]->Cast<LanguageMacroFunction>();
+	D_ASSERT(info.macros.size() == 1 && info.macros[0]->IsLanguageMember());
+	// the entry lookup ran in the catalog set of info.type, so the member variants match
+	D_ASSERT(info.macros[0]->type == existing.macros[0]->type);
+	auto &new_member = LanguageMacroFunction::Get(*info.macros[0]);
 	auto &name = info.GetFunctionName();
 	if (existing.internal && !info.internal) {
 		// the member rewrite is a drop+create: an internal entry's protection applies to it too
 		throw CatalogException("function %s is an internal system entry: its overloads cannot be modified", name);
 	}
-	auto &existing_language = existing.macros[0]->Cast<LanguageMacroFunction>().language;
+	auto &existing_language = LanguageMacroFunction::Get(*existing.macros[0]).language;
 	if (!StringUtil::CIEquals(existing_language, new_member.language)) {
 		throw CatalogException("Cannot create function %s in language \"%s\": the name already belongs to a "
 		                       "function in language \"%s\", overloads of one name share one language",
@@ -497,10 +499,9 @@ void DuckSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 
 	if (info.extra_drop_info && info.extra_drop_info->info_type == ExtraDropInfoType::FUNCTION_SIGNATURE_INFO) {
 		bool language_function = false;
-		if (existing_entry->type == CatalogType::MACRO_ENTRY) {
+		if (existing_entry->type == CatalogType::MACRO_ENTRY || existing_entry->type == CatalogType::TABLE_MACRO_ENTRY) {
 			auto &existing_macro = existing_entry->Cast<MacroCatalogEntry>();
-			language_function =
-			    !existing_macro.macros.empty() && existing_macro.macros[0]->type == MacroType::LANGUAGE_MACRO;
+			language_function = !existing_macro.macros.empty() && existing_macro.macros[0]->IsLanguageMember();
 		}
 		if (!language_function) {
 			throw CatalogException("Cannot drop %s with a parameter type list: dropping a single overload is only "
