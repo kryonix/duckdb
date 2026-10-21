@@ -272,6 +272,8 @@ enum class PEGRuleId : uint32_t {
 	CreateMacroStmt,
 	CreateLanguageFunctionStmt,
 	ReturnsType,
+	CreateLanguageTableFunctionStmt,
+	ReturnsTableType,
 	MacroOrFunction,
 	MacroKeyword,
 	FunctionKeyword,

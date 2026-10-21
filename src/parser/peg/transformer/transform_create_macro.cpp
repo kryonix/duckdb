@@ -1,6 +1,7 @@
 #include "duckdb/parser/peg/ast/macro_parameter.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/function/language_macro_function.hpp"
+#include "duckdb/function/language_table_macro_function.hpp"
 #include "duckdb/function/table_macro_function.hpp"
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
 #include "duckdb/parser/peg/transformer/peg_transformer.hpp"
@@ -83,6 +84,45 @@ unique_ptr<CreateStatement> PEGTransformerFactory::TransformCreateLanguageFuncti
 	result->info = std::move(info);
 	transformer.PivotEntryCheck("macro");
 	return result;
+}
+
+unique_ptr<CreateStatement> PEGTransformerFactory::TransformCreateLanguageTableFunctionStmt(
+    PEGTransformer &transformer, const optional<bool> &if_not_exists, const QualifiedName &qualified_name,
+    optional<vector<MacroParameter>> macro_parameters,
+    vector<pair<Identifier, unique_ptr<ParsedExpression>>> returns_table_type, const Identifier &language,
+    const string &source) {
+	auto result = make_uniq<CreateStatement>();
+	auto info = make_uniq<CreateMacroInfo>(CatalogType::TABLE_MACRO_ENTRY);
+
+	info->SetQualifiedName(qualified_name);
+	info->on_conflict = if_not_exists ? OnCreateConflict::IGNORE_ON_CONFLICT : OnCreateConflict::ERROR_ON_CONFLICT;
+
+	auto member = make_uniq<LanguageTableMacroFunction>();
+	member->language = language.GetIdentifierName();
+	member->source = source;
+	for (auto &column : returns_table_type) {
+		member->column_names.push_back(column.first);
+		member->column_types.push_back(LogicalType::UNBOUND(std::move(column.second)));
+	}
+	if (macro_parameters) {
+		AddMacroParameters(*member, *macro_parameters);
+	}
+	info->macros.push_back(std::move(member));
+
+	result->info = std::move(info);
+	transformer.PivotEntryCheck("macro");
+	return result;
+}
+
+vector<pair<Identifier, unique_ptr<ParsedExpression>>> PEGTransformerFactory::TransformReturnsTableType(
+    PEGTransformer &transformer, vector<pair<Identifier, unique_ptr<ParsedExpression>>> col_id_type_list) {
+	identifier_set_t column_names;
+	for (auto &column : col_id_type_list) {
+		if (!column_names.insert(column.first).second) {
+			throw ParserException("Duplicate column name %s in RETURNS TABLE definition", column.first);
+		}
+	}
+	return col_id_type_list;
 }
 
 bool PEGTransformerFactory::TransformMacroKeyword(PEGTransformer &transformer) {

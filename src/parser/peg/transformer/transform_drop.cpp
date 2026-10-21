@@ -45,10 +45,9 @@ bool PEGTransformerFactory::TransformFunctionTypeFunction(PEGTransformer &transf
 	return false;
 }
 
-unique_ptr<DropStatement>
-PEGTransformerFactory::TransformDropTableFunction(PEGTransformer &transformer, const CatalogType &comment_macro_table,
-                                                  const optional<bool> &if_exists,
-                                                  const vector<QualifiedName> &table_function_name) {
+unique_ptr<DropStatement> PEGTransformerFactory::TransformDropTableFunction(
+    PEGTransformer &transformer, const CatalogType &comment_macro_table, const optional<bool> &if_exists,
+    const vector<QualifiedName> &table_function_name, const optional<vector<LogicalType>> &drop_function_signature) {
 	auto result = make_uniq<DropStatement>();
 	auto info = make_uniq<DropInfo>();
 	if (table_function_name.size() > 1) {
@@ -57,6 +56,12 @@ PEGTransformerFactory::TransformDropTableFunction(PEGTransformer &transformer, c
 	info->SetQualifiedName(table_function_name[0]);
 	info->type = comment_macro_table;
 	info->if_not_found = if_exists ? OnEntryNotFound::RETURN_NULL : OnEntryNotFound::THROW_EXCEPTION;
+	if (drop_function_signature) {
+		// a parameter type list identifies a single overload member instead of the whole entry
+		auto extra_info = make_uniq<ExtraDropFunctionSignatureInfo>();
+		extra_info->signature = *drop_function_signature;
+		info->extra_drop_info = std::move(extra_info);
+	}
 	result->info = std::move(info);
 	return result;
 }
