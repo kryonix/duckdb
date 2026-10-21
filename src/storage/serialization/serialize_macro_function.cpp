@@ -9,6 +9,7 @@
 #include "duckdb/function/scalar_macro_function.hpp"
 #include "duckdb/function/table_macro_function.hpp"
 #include "duckdb/function/language_macro_function.hpp"
+#include "duckdb/function/language_table_macro_function.hpp"
 
 namespace duckdb {
 
@@ -34,6 +35,9 @@ unique_ptr<MacroFunction> MacroFunction::Deserialize(Deserializer &deserializer)
 	switch (type) {
 	case MacroType::LANGUAGE_MACRO:
 		result = LanguageMacroFunction::Deserialize(deserializer);
+		break;
+	case MacroType::LANGUAGE_TABLE_MACRO:
+		result = LanguageTableMacroFunction::Deserialize(deserializer);
 		break;
 	case MacroType::SCALAR_MACRO:
 		result = ScalarMacroFunction::Deserialize(deserializer);
@@ -62,6 +66,23 @@ unique_ptr<MacroFunction> LanguageMacroFunction::Deserialize(Deserializer &deser
 	auto result = duckdb::unique_ptr<LanguageMacroFunction>(new LanguageMacroFunction());
 	deserializer.ReadPropertyWithDefault<string>(200, "language", result->language);
 	deserializer.ReadPropertyWithDefault<string>(201, "source", result->source);
+	return std::move(result);
+}
+
+void LanguageTableMacroFunction::Serialize(Serializer &serializer) const {
+	MacroFunction::Serialize(serializer);
+	serializer.WritePropertyWithDefault<string>(200, "language", language);
+	serializer.WritePropertyWithDefault<string>(201, "source", source);
+	serializer.WritePropertyWithDefault<vector<Identifier>>(202, "column_names", column_names);
+	serializer.WritePropertyWithDefault<vector<LogicalType>>(203, "column_types", column_types);
+}
+
+unique_ptr<MacroFunction> LanguageTableMacroFunction::Deserialize(Deserializer &deserializer) {
+	auto result = duckdb::unique_ptr<LanguageTableMacroFunction>(new LanguageTableMacroFunction());
+	deserializer.ReadPropertyWithDefault<string>(200, "language", result->language);
+	deserializer.ReadPropertyWithDefault<string>(201, "source", result->source);
+	deserializer.ReadPropertyWithDefault<vector<Identifier>>(202, "column_names", result->column_names);
+	deserializer.ReadPropertyWithDefault<vector<LogicalType>>(203, "column_types", result->column_types);
 	return std::move(result);
 }
 

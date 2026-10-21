@@ -19,7 +19,13 @@ class FunctionExpression;
 
 class ScalarMacroFunction;
 
-enum class MacroType : uint8_t { VOID_MACRO = 0, TABLE_MACRO = 1, SCALAR_MACRO = 2, LANGUAGE_MACRO = 3 };
+enum class MacroType : uint8_t {
+	VOID_MACRO = 0,
+	TABLE_MACRO = 1,
+	SCALAR_MACRO = 2,
+	LANGUAGE_MACRO = 3,
+	LANGUAGE_TABLE_MACRO = 4
+};
 
 struct MacroBindResult {
 	explicit MacroBindResult(string error_p) : error(std::move(error_p)) {
@@ -68,6 +74,8 @@ public:
 	                   InsertionOrderPreservingMap<unique_ptr<ParsedExpression>, Identifier, identifier_map_t<idx_t>>
 	                       &named_arguments);
 
+	//! Whether this member is a language member (the scalar or the table variant)
+	bool IsLanguageMember() const;
 	//! Whether any parameter is untyped
 	bool HasUntypedParameter() const;
 	//! Whether this member's parameter types equal the given type list exactly (untyped members never match)
@@ -78,6 +86,10 @@ public:
 	string SignatureToString() const;
 
 	virtual string ToSQL() const;
+	//! The parameter list as it renders in CREATE statements: "(name TYPE := default, ...)"
+	string ParametersToSQL() const;
+	//! A type as it renders in macro signatures: aliases and top-level collations round-trip
+	static string TypeToSQL(const LogicalType &type);
 
 	virtual void Serialize(Serializer &serializer) const;
 	static unique_ptr<MacroFunction> Deserialize(Deserializer &deserializer);
