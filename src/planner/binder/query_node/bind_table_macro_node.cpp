@@ -13,6 +13,9 @@
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/catalog/catalog_entry/language_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_macro_catalog_entry.hpp"
+#include "duckdb/main/language_function_binder.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/function/language_table_macro_function.hpp"
 #include "duckdb/function/table_macro_function.hpp"
@@ -34,18 +37,6 @@ unique_ptr<QueryNode> Binder::BindTableMacro(FunctionExpression &function, Table
 	}
 	auto &macro_def = *macro_func.macros[bind_result.function_idx.GetIndex()];
 
-	if (macro_def.type == MacroType::LANGUAGE_TABLE_MACRO) {
-		auto &language_member = macro_def.Cast<LanguageTableMacroFunction>();
-		// raises a MissingExtensionException naming the function and language when none is registered
-		LanguageCatalogEntry::GetBinder(context, language_member.language, macro_func.name.GetIdentifierName());
-		// PROVISIONAL: the table-call seam (LanguageFunctionBinder::BindTableCall) is built against the
-		// TVF follow-up design contract; until it lands a registered language cannot bind table calls
-		throw BinderException(function,
-		                      "Table function %s is a %s language function: binding language table "
-		                      "function calls is not supported yet",
-		                      macro_func.name, language_member.language);
-	}
-
 	auto new_macro_binding =
 	    MacroFunction::CreateDummyBinding(macro_def, macro_func.name, positional_arguments, named_arguments);
 	new_macro_binding->arguments = &positional_arguments;
@@ -61,6 +52,77 @@ unique_ptr<QueryNode> Binder::BindTableMacro(FunctionExpression &function, Table
 	    *node, [&](unique_ptr<ParsedExpression> &child) { eb.ReplaceMacroParameters(child, lambda_params); });
 
 	return node;
+}
+
+BoundStatement Binder::BindLanguageTableMacro(TableFunctionRef &ref, FunctionExpression &function,
+                                              TableMacroCatalogEntry &macro_func) {
+	context.InterruptCheck();
+	// select the member: core resolves the overload, named arguments, defaults, and parameter casts
+	vector<unique_ptr<ParsedExpression>> positional_arguments;
+	InsertionOrderPreservingMap<unique_ptr<ParsedExpression>, Identifier, identifier_map_t<idx_t>> named_arguments;
+	auto bind_result = MacroFunction::BindMacroFunction(*this, macro_func.macros, macro_func.name, function,
+	                                                    positional_arguments, named_arguments, 0);
+	if (!bind_result.error.empty()) {
+		throw BinderException(function, bind_result.error);
+	}
+	auto &member = macro_func.macros[bind_result.function_idx.GetIndex()]->Cast<LanguageTableMacroFunction>();
+
+	// flatten the arguments into parameter declaration order, defaults were already filled in.
+	// the expressions stay unevaluated, so correlated (lateral) arguments pass through
+	auto arguments = std::move(positional_arguments);
+	for (idx_t i = arguments.size(); i < member.parameters.size(); i++) {
+		auto &param_name = member.parameters[i]->Cast<ColumnRefExpression>().GetColumnName();
+		auto named_it = named_arguments.find(param_name);
+		D_ASSERT(named_it != named_arguments.end());
+		arguments.push_back(std::move(named_it->second));
+	}
+	for (auto &argument : arguments) {
+		// drop named-argument and default bookkeeping aliases: a spliced argument must not turn
+		// into a named argument of whatever call the language binder builds around it
+		argument->ClearAlias();
+	}
+
+	// raises a MissingExtensionException naming the function and language when none is registered
+	auto language_binder =
+	    LanguageCatalogEntry::GetBinder(context, member.language, macro_func.name.GetIdentifierName());
+	auto statement = language_binder->BindTableCall(*this, macro_func, member, std::move(arguments));
+	if (!statement || !statement->node) {
+		throw InternalException("The language binder for \"%s\" returned no statement for table function %s",
+		                        member.language, macro_func.name);
+	}
+
+	// bind the returned statement in a correlated child binder, like a table macro expansion
+	auto binder = Binder::CreateBinder(context, this);
+	binder->SetCanContainNulls(true);
+	binder->AddBoundTableMacro(macro_func);
+	binder->alias = ref.alias.empty() ? "unnamed_query" : ref.alias;
+	BoundStatement query;
+	try {
+		query = binder->BindNode(*statement->node);
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		error.AddQueryLocation(ref);
+		error.Throw();
+	}
+
+	// a declared or published schema is enforced column-wise, like the scalar RETURNS cast
+	if (!member.return_names.empty()) {
+		if (query.types.size() != member.return_types.size()) {
+			throw BinderException(function,
+			                      "Table function %s declares %llu result columns, but its %s binder returned a "
+			                      "statement with %llu columns",
+			                      macro_func.name, member.return_types.size(), member.language, query.types.size());
+		}
+		query.plan = CastLogicalOperatorToTypes(query.types, member.return_types, std::move(query.plan));
+		query.types = member.return_types;
+		query.names = member.return_names;
+	}
+
+	auto bind_index = query.plan->GetRootIndex();
+	string alias = (ref.alias.empty() ? "unnamed_query" + to_string(bind_index.index) : ref.alias.GetIdentifierName());
+	bind_context.AddSubquery(bind_index, Identifier(alias), ref, query);
+	MoveCorrelatedExpressions(*binder);
+	return query;
 }
 
 } // namespace duckdb

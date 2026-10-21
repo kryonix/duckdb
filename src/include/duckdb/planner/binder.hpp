@@ -536,6 +536,10 @@ private:
 	                             virtual_column_map_t virtual_columns = virtual_column_map_t());
 
 	unique_ptr<QueryNode> BindTableMacro(FunctionExpression &function, TableMacroCatalogEntry &macro_func, idx_t depth);
+	//! Bind a call to a language table function: dispatch to the language's BindTableCall and bind
+	//! the returned statement in a correlated child binder, like a table macro expansion
+	BoundStatement BindLanguageTableMacro(TableFunctionRef &ref, FunctionExpression &function,
+	                                      TableMacroCatalogEntry &macro_func);
 
 	BoundStatement BindCTE(const Identifier &ctename, CommonTableExpressionInfo &info);
 

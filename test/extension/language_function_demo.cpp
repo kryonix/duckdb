@@ -1,12 +1,19 @@
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_macro_catalog_entry.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/language_macro_function.hpp"
+#include "duckdb/function/language_table_macro_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/language_function_binder.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression_binder.hpp"
 
@@ -77,6 +84,52 @@ public:
 		// otherwise the compiled form is the constant the source denotes, core applies the
 		// declared RETURNS cast
 		return BindResult(make_uniq<BoundConstantExpression>(Value(member.source)));
+	}
+
+	unique_ptr<SelectStatement> BindTableCall(Binder &binder, TableMacroCatalogEntry &entry,
+	                                          LanguageTableMacroFunction &member,
+	                                          vector<unique_ptr<ParsedExpression>> arguments) override {
+		// the source 'rows:<n>' compiles to a query emitting n rows; 'rows:arg:<i>' takes the row
+		// count from the i-th UNEVALUATED argument expression, so correlated (lateral) arguments
+		// exercise the seam placement before argument evaluation
+		if (!StringUtil::StartsWith(member.source, "rows:")) {
+			throw BinderException("testlang: the source of table function \"%s\" is not a 'rows:<n>' spec",
+			                      entry.name.GetIdentifierName());
+		}
+		const auto spec = member.source.substr(5);
+		unique_ptr<ParsedExpression> count_expr;
+		if (StringUtil::StartsWith(spec, "arg:")) {
+			idx_t argument_idx;
+			const auto index_text = spec.substr(4);
+			if (index_text.empty() || !TryCast::Operation<string_t, idx_t>(string_t(index_text), argument_idx)) {
+				throw BinderException("testlang: malformed argument index \"%s\"", index_text);
+			}
+			if (argument_idx >= arguments.size()) {
+				throw BinderException("testlang: argument index %llu is out of range", argument_idx);
+			}
+			count_expr = std::move(arguments[argument_idx]);
+		} else {
+			idx_t row_count;
+			if (spec.empty() || !TryCast::Operation<string_t, idx_t>(string_t(spec), row_count)) {
+				throw BinderException("testlang: malformed row count \"%s\"", spec);
+			}
+			count_expr = ConstantExpression::FromValue(Value::BIGINT(NumericCast<int64_t>(row_count)));
+		}
+		// compile to SELECT range [, range ...] FROM range(count): core binds the statement in a
+		// correlated child binder and renames/casts the columns to the declared schema
+		auto select = make_uniq<SelectNode>();
+		const idx_t column_count = member.return_names.empty() ? 1 : member.return_names.size();
+		for (idx_t i = 0; i < column_count; i++) {
+			select->select_list.push_back(make_uniq<ColumnRefExpression>("range"));
+		}
+		vector<unique_ptr<ParsedExpression>> range_arguments;
+		range_arguments.push_back(std::move(count_expr));
+		auto range_ref = make_uniq<TableFunctionRef>();
+		range_ref->function = make_uniq<FunctionExpression>("range", std::move(range_arguments));
+		select->from_table = std::move(range_ref);
+		auto statement = make_uniq<SelectStatement>();
+		statement->node = std::move(select);
+		return statement;
 	}
 };
 

@@ -13,12 +13,16 @@
 
 namespace duckdb {
 
+class Binder;
 class ClientContext;
 class ExpressionBinder;
 class FunctionExpression;
 class LanguageMacroFunction;
+class LanguageTableMacroFunction;
 class ParsedExpression;
 class ScalarMacroCatalogEntry;
+class SelectStatement;
+class TableMacroCatalogEntry;
 struct BindResult;
 struct CreateMacroInfo;
 
@@ -46,6 +50,17 @@ public:
 	virtual BindResult BindScalarCall(ExpressionBinder &binder, ScalarMacroCatalogEntry &entry,
 	                                  LanguageMacroFunction &member, vector<unique_ptr<ParsedExpression>> arguments,
 	                                  idx_t depth) = 0;
+
+	//! Compile a call to the already-selected table member into a query. Core has resolved the
+	//! overload, named arguments, defaults, and declared-type boundary casts: arguments holds one
+	//! UNBOUND expression per member parameter, in declaration order, so correlated (lateral)
+	//! arguments pass through. The returned statement is bound by core in a child binder of the
+	//! caller with correlation enabled, exactly like a table macro expansion, and its result is
+	//! cast column-wise to the member's return schema when one is declared. The default raises a
+	//! BinderException: a language that registers no table support rejects table calls cleanly.
+	virtual unique_ptr<SelectStatement> BindTableCall(Binder &binder, TableMacroCatalogEntry &entry,
+	                                                  LanguageTableMacroFunction &member,
+	                                                  vector<unique_ptr<ParsedExpression>> arguments);
 };
 
 } // namespace duckdb
