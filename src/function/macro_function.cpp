@@ -424,9 +424,15 @@ string MacroFunction::SignatureToString() const {
 }
 
 string MacroFunction::TypeToSQL(const LogicalType &type) {
-	// an aliased type (e.g. an extension-registered type) carries its own identity: render it as-is
+	// an aliased type (e.g. an extension-registered type) carries its own identity: render it as-is,
+	// quoting the alias when required so e.g. an alias named TABLE re-parses as a type name
 	if (type.HasAlias()) {
-		return type.ToString();
+		auto text = type.ToString();
+		auto alias = type.GetAlias();
+		if (KeywordHelper::RequiresQuotes(alias) && StringUtil::StartsWith(text, alias)) {
+			return KeywordHelper::WriteOptionallyQuoted(alias) + text.substr(alias.size());
+		}
+		return text;
 	}
 	// render a top-level collation in the VARCHAR constructor form, which parses in type position
 	auto &type_info = type.GetTypeInfo();
