@@ -21,6 +21,12 @@ public:
 				throw BinderException("testlang: the source of %s may not contain the word \"invalid\"",
 				                      info.GetFunctionName());
 			}
+			if (info.MemberIsTableFunction(member_idx) &&
+			    !StringUtil::StartsWith(info.MemberSource(member_idx), "rows:")) {
+				// a testlang table function emits the rows its 'rows:<n>' source denotes
+				throw BinderException("testlang: the source of table function %s must have the form 'rows:<n>'",
+				                      info.GetFunctionName());
+			}
 		}
 		// publish per-member documentation: function metadata must survive member mutations
 		for (idx_t member_idx = 0; member_idx < info.MemberCount(); member_idx++) {
