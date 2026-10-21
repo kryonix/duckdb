@@ -43,6 +43,42 @@ statement error
 CREATE FUNCTION bad_column() RETURNS TABLE(x THIS_TYPE_DOES_NOT_EXIST) LANGUAGE testlang AS 'rows:1';
 ----
 
+# the bare RETURNS TABLE form stores an unresolved schema (no language registered to publish one)
+statement ok
+ATTACH ':memory:' AS unres;
+
+statement ok
+USE unres;
+
+statement ok
+CREATE FUNCTION unresolved_tf() RETURNS TABLE LANGUAGE testlang AS 'rows:2';
+
+query TTT
+SELECT return_type, language, macro_definition FROM duckdb_functions() WHERE function_name = 'unresolved_tf';
+----
+NULL	testlang	rows:2
+
+# ... and round-trips through EXPORT in the bare form
+statement ok
+EXPORT DATABASE '{TEST_DIR}/language_table_function_unresolved_export';
+
+statement ok
+DROP FUNCTION unresolved_tf;
+
+statement ok
+IMPORT DATABASE '{TEST_DIR}/language_table_function_unresolved_export';
+
+query TT
+SELECT return_type, macro_definition FROM duckdb_functions() WHERE function_name = 'unresolved_tf';
+----
+NULL	rows:2
+
+statement ok
+USE memory;
+
+statement ok
+DETACH unres;
+
 # duplicate column names are rejected at parse time
 statement error
 CREATE FUNCTION dup_column() RETURNS TABLE(x INTEGER, x VARCHAR) LANGUAGE testlang AS 'rows:1';
@@ -120,6 +156,19 @@ statement error
 CREATE OR REPLACE FUNCTION numbers(n, m) RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:8';
 ----
 <REGEX>:.*conflicts with several existing overloads.*
+
+# a member occupies its default arity range: a new member inside that range conflicts
+statement error
+CREATE FUNCTION numbers(n INTEGER, m VARCHAR, o VARCHAR := 'x') RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:9';
+----
+<REGEX>:.*already exists: it conflicts with the existing overload.*
+
+# ... while a disjoint range or a different shared prefix coexists
+statement ok
+CREATE FUNCTION numbers(n VARCHAR, m VARCHAR := 'x') RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:10';
+
+statement ok
+DROP FUNCTION numbers(VARCHAR, VARCHAR);
 
 # member-granular drop by signature
 statement ok
