@@ -1,0 +1,318 @@
+# name: test/sql/function/language_function/language_table_function_no_binder.test
+# description: Language table functions are stored opaquely and callable only once a binder is registered
+# group: [language_function]
+
+# Language function tests manage their own storage version (persistent entries need v2.1.0+)
+require noforcestorage
+
+# the testlang extension is deliberately NOT loaded here
+
+statement ok
+CREATE FUNCTION numbers(n INTEGER) RETURNS TABLE(i INTEGER, tag VARCHAR) LANGUAGE testlang AS 'rows:3';
+
+# the definition is stored opaquely as a table-macro-family entry
+query TTTTT
+SELECT function_name, function_type, language, return_type, macro_definition FROM duckdb_functions() WHERE function_name = 'numbers';
+----
+numbers	table_macro	testlang	TABLE(i INTEGER, tag VARCHAR)	rows:3
+
+query TT
+SELECT parameters, parameter_types FROM duckdb_functions() WHERE function_name = 'numbers';
+----
+[n]	[INTEGER]
+
+# calling it requires the language's binder
+statement error
+SELECT * FROM numbers(1);
+----
+<REGEX>:.*Missing Extension Error.*numbers.*testlang.*no binder for that language is registered.*
+
+# a language table function is not a scalar function
+statement error
+SELECT numbers(1);
+----
+<REGEX>:.*is a table function but it was used as a scalar function.*
+
+# the parameter types must resolve
+statement error
+CREATE FUNCTION bad_param(a THIS_TYPE_DOES_NOT_EXIST) RETURNS TABLE(x INTEGER) LANGUAGE testlang AS 'rows:1';
+----
+
+# ... and so must the declared column types
+statement error
+CREATE FUNCTION bad_column() RETURNS TABLE(x THIS_TYPE_DOES_NOT_EXIST) LANGUAGE testlang AS 'rows:1';
+----
+
+# duplicate column names are rejected at parse time
+statement error
+CREATE FUNCTION dup_column() RETURNS TABLE(x INTEGER, x VARCHAR) LANGUAGE testlang AS 'rows:1';
+----
+<REGEX>:.*Duplicate column name.*
+
+# an empty column list does not parse
+statement error
+CREATE FUNCTION no_columns() RETURNS TABLE() LANGUAGE testlang AS 'rows:1';
+----
+
+# a user type in the column list is resolved at CREATE time
+statement ok
+CREATE TYPE mood AS ENUM ('happy', 'sad');
+
+statement ok
+CREATE FUNCTION moods() RETURNS TABLE(m mood) LANGUAGE testlang AS 'rows:2';
+
+query T
+SELECT return_type LIKE 'TABLE(m ENUM%' FROM duckdb_functions() WHERE function_name = 'moods';
+----
+true
+
+statement ok
+DROP FUNCTION moods;
+
+statement ok
+DROP TYPE mood;
+
+# overloads share the language: a second language is rejected at member granularity
+statement error
+CREATE FUNCTION numbers(n INTEGER, m INTEGER) RETURNS TABLE(i INTEGER) LANGUAGE otherlang AS 'rows:1';
+----
+<REGEX>:.*already belongs to a function in language "testlang".*
+
+# a conflicting signature errors and names the existing overload
+statement error
+CREATE FUNCTION numbers(n INTEGER) RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:9';
+----
+<REGEX>:.*An overload of function "numbers" with signature \(n INTEGER\) already exists.*
+
+# IF NOT EXISTS skips at member granularity
+statement ok
+CREATE FUNCTION IF NOT EXISTS numbers(n INTEGER) RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:9';
+
+query T
+SELECT macro_definition FROM duckdb_functions() WHERE function_name = 'numbers';
+----
+rows:3
+
+# OR REPLACE replaces the single conflicting member
+statement ok
+CREATE OR REPLACE FUNCTION numbers(n INTEGER) RETURNS TABLE(i INTEGER, tag VARCHAR) LANGUAGE testlang AS 'rows:5';
+
+query T
+SELECT macro_definition FROM duckdb_functions() WHERE function_name = 'numbers';
+----
+rows:5
+
+# an overload with a different signature is added to the entry
+statement ok
+CREATE FUNCTION numbers(n INTEGER, m VARCHAR) RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:7';
+
+query TT rowsort
+SELECT parameter_types, macro_definition FROM duckdb_functions() WHERE function_name = 'numbers';
+----
+[INTEGER, VARCHAR]	rows:7
+[INTEGER]	rows:5
+
+# an untyped member occupies its whole arity, so OR REPLACE over several conflicts is rejected
+statement ok
+CREATE FUNCTION numbers(n INTEGER, m INTEGER) RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:6';
+
+statement error
+CREATE OR REPLACE FUNCTION numbers(n, m) RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:8';
+----
+<REGEX>:.*conflicts with several existing overloads.*
+
+# member-granular drop by signature
+statement ok
+DROP FUNCTION numbers(INTEGER, INTEGER);
+
+statement ok
+DROP FUNCTION numbers(INTEGER, VARCHAR);
+
+query T
+SELECT macro_definition FROM duckdb_functions() WHERE function_name = 'numbers';
+----
+rows:5
+
+# DROP MACRO TABLE accepts the same signature list
+statement ok
+CREATE FUNCTION numbers() RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:0';
+
+statement ok
+DROP MACRO TABLE numbers();
+
+query T
+SELECT macro_definition FROM duckdb_functions() WHERE function_name = 'numbers';
+----
+rows:5
+
+# IF EXISTS applies at member granularity
+statement ok
+DROP FUNCTION IF EXISTS numbers(VARCHAR);
+
+statement error
+DROP FUNCTION numbers(VARCHAR);
+----
+<REGEX>:.*has no overload with signature \(VARCHAR\).*
+
+# dropping the last member drops the entry
+statement ok
+DROP FUNCTION numbers(INTEGER);
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'numbers';
+----
+0
+
+# a scalar and a table language function of the same name coexist (separate namespaces)
+statement ok
+CREATE FUNCTION twin() RETURNS INTEGER LANGUAGE testlang AS '42';
+
+statement ok
+CREATE FUNCTION twin() RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:1';
+
+query TT rowsort
+SELECT function_type, macro_definition FROM duckdb_functions() WHERE function_name = 'twin';
+----
+macro	42
+table_macro	rows:1
+
+# DROP FUNCTION resolves the scalar entry first, like DROP MACRO
+statement ok
+DROP FUNCTION twin;
+
+query T
+SELECT function_type FROM duckdb_functions() WHERE function_name = 'twin';
+----
+table_macro
+
+statement ok
+DROP FUNCTION twin;
+
+# a plain table macro cannot merge into a language entry: entry-level conflict semantics apply
+statement ok
+CREATE FUNCTION entry_swap() RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:1';
+
+statement error
+CREATE MACRO entry_swap() AS TABLE SELECT 1 AS x;
+----
+<REGEX>:.*already exists.*
+
+statement ok
+CREATE OR REPLACE MACRO entry_swap() AS TABLE SELECT 1 AS x;
+
+query T
+SELECT language IS NULL FROM duckdb_functions() WHERE function_name = 'entry_swap';
+----
+true
+
+# ... and the other direction replaces the plain entry as a whole
+statement ok
+CREATE OR REPLACE FUNCTION entry_swap() RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:2';
+
+query T
+SELECT macro_definition FROM duckdb_functions() WHERE function_name = 'entry_swap';
+----
+rows:2
+
+statement ok
+DROP FUNCTION entry_swap;
+
+# EXPORT DATABASE round-trips the stored definition without the extension
+statement ok
+CREATE FUNCTION exported_tf(x INTEGER) RETURNS TABLE(a INTEGER, b VARCHAR) LANGUAGE testlang AS 'rows: it''s opaque';
+
+statement ok
+CREATE FUNCTION exported_tf() RETURNS TABLE(a INTEGER) LANGUAGE testlang AS 'rows:1';
+
+statement ok
+EXPORT DATABASE '{TEST_DIR}/language_table_function_export';
+
+statement ok
+DROP FUNCTION exported_tf(INTEGER);
+
+statement ok
+DROP FUNCTION exported_tf();
+
+statement ok
+IMPORT DATABASE '{TEST_DIR}/language_table_function_export';
+
+query TTTT rowsort
+SELECT language, return_type, parameter_types, macro_definition FROM duckdb_functions() WHERE function_name = 'exported_tf';
+----
+testlang	TABLE(a INTEGER)	[]	rows:1
+testlang	TABLE(a INTEGER, b VARCHAR)	[INTEGER]	rows: it's opaque
+
+# tricky column names and source texts round-trip through EXPORT/IMPORT
+statement ok
+CREATE FUNCTION tricky_tf("column name" INTEGER) RETURNS TABLE("select" INTEGER, "a b" VARCHAR) LANGUAGE testlang AS 'rows:1
+line2';
+
+statement ok
+EXPORT DATABASE '{TEST_DIR}/language_table_function_tricky_export';
+
+statement ok
+DROP FUNCTION tricky_tf;
+
+statement ok
+DROP FUNCTION exported_tf(INTEGER);
+
+statement ok
+DROP FUNCTION exported_tf();
+
+statement ok
+IMPORT DATABASE '{TEST_DIR}/language_table_function_tricky_export';
+
+query TTT
+SELECT parameters, return_type, replace(macro_definition, chr(10), '<NL>') FROM duckdb_functions() WHERE function_name = 'tricky_tf';
+----
+[column name]	TABLE("select" INTEGER, "a b" VARCHAR)	rows:1<NL>line2
+
+# default parameter values work for language table members too
+statement ok
+CREATE FUNCTION defaulted_tf(n := 42) RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:1';
+
+query TT
+SELECT parameters, macro_definition FROM duckdb_functions() WHERE function_name = 'defaulted_tf';
+----
+[n]	rows:1
+
+statement ok
+DROP FUNCTION defaulted_tf;
+
+# nested-schema entries create and round-trip through EXPORT/IMPORT
+statement ok
+CREATE SCHEMA outer_s;
+
+statement ok
+CREATE SCHEMA outer_s.inner_s;
+
+statement ok
+CREATE FUNCTION outer_s.inner_s.nested_tf() RETURNS TABLE(i INTEGER) LANGUAGE testlang AS 'rows:1';
+
+query TT
+SELECT schema_name, macro_definition FROM duckdb_functions() WHERE function_name = 'nested_tf';
+----
+inner_s	rows:1
+
+statement ok
+EXPORT DATABASE '{TEST_DIR}/language_table_function_nested_export';
+
+statement ok
+DROP SCHEMA outer_s CASCADE;
+
+statement ok
+DROP FUNCTION tricky_tf;
+
+statement ok
+DROP FUNCTION exported_tf(INTEGER);
+
+statement ok
+DROP FUNCTION exported_tf();
+
+statement ok
+IMPORT DATABASE '{TEST_DIR}/language_table_function_nested_export';
+
+query TT
+SELECT schema_name, macro_definition FROM duckdb_functions() WHERE function_name = 'nested_tf';
+----
+inner_s	rows:1
