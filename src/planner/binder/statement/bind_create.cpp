@@ -586,12 +586,12 @@ SchemaCatalogEntry &Binder::BindCreateFunctionInfo(CreateInfo &info) {
 			BindLogicalType(function->return_type);
 		}
 
-		// Resolve user types in the declared RETURNS TABLE columns, recursively like parameter types
+		// Resolve user types in the declared RETURNS TABLE columns (empty while unresolved),
+		// recursively like parameter types
 		if (function->type == MacroType::LANGUAGE_TABLE_MACRO) {
 			D_ASSERT(info.type == CatalogType::TABLE_MACRO_ENTRY);
 			auto &table_member = function->Cast<LanguageTableMacroFunction>();
-			D_ASSERT(!table_member.column_names.empty());
-			for (auto &column_type : table_member.column_types) {
+			for (auto &column_type : table_member.return_types) {
 				BindLogicalType(column_type);
 			}
 		}

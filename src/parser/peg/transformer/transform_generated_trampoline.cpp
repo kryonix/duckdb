@@ -1385,7 +1385,7 @@ static const TransformChildPlan FRAME_CHILDREN_100[] = {{PEGRuleId::ReturnsTable
                                                          {0, TRANSFORM_PATH_END, 0}}};
 static const TransformFramePlan FRAME_PLAN_107 = {FRAME_CHILDREN_100, 4, 4, false, 0, {}};
 static const TransformChildPlan FRAME_CHILDREN_101[] = {{PEGRuleId::ColIdTypeList,
-                                                         TransformChildKind::REQUIRED,
+                                                         TransformChildKind::OPTIONAL,
                                                          2,
                                                          0,
                                                          false,
@@ -11471,7 +11471,10 @@ PEGTransformerFactory::FinalizeCreateLanguageTableFunctionStmtTrampoline(PEGTran
 arena_ptr<TransformResultValue>
 PEGTransformerFactory::FinalizeReturnsTableTypeTrampoline(PEGTransformer &transformer,
                                                           GeneratedTransformProcess &process) {
-	auto col_id_type_list = process.TakeResult<vector<pair<Identifier, unique_ptr<ParsedExpression>>>>(0);
+	optional<vector<pair<Identifier, unique_ptr<ParsedExpression>>>> col_id_type_list {};
+	if (process.child_results[0]) {
+		col_id_type_list = process.TakeResult<vector<pair<Identifier, unique_ptr<ParsedExpression>>>>(0);
+	}
 	auto result = TransformReturnsTableType(transformer, std::move(col_id_type_list));
 	return transformer.MakeResult<vector<pair<Identifier, unique_ptr<ParsedExpression>>>>(std::move(result));
 }

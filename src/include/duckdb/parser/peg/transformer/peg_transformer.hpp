@@ -3094,7 +3094,7 @@ public:
 	                                         const Identifier &language, const string &source);
 	static vector<pair<Identifier, unique_ptr<ParsedExpression>>>
 	TransformReturnsTableType(PEGTransformer &transformer,
-	                          vector<pair<Identifier, unique_ptr<ParsedExpression>>> col_id_type_list);
+	                          optional<vector<pair<Identifier, unique_ptr<ParsedExpression>>>> col_id_type_list);
 	static bool TransformMacroKeyword(PEGTransformer &transformer);
 	static bool TransformFunctionKeyword(PEGTransformer &transformer);
 	static unique_ptr<MacroFunction> TransformMacroDefinition(PEGTransformer &transformer,

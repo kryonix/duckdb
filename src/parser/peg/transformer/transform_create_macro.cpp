@@ -101,8 +101,8 @@ unique_ptr<CreateStatement> PEGTransformerFactory::TransformCreateLanguageTableF
 	member->language = language.GetIdentifierName();
 	member->source = source;
 	for (auto &column : returns_table_type) {
-		member->column_names.push_back(column.first);
-		member->column_types.push_back(LogicalType::UNBOUND(std::move(column.second)));
+		member->return_names.push_back(column.first);
+		member->return_types.push_back(LogicalType::UNBOUND(std::move(column.second)));
 	}
 	if (macro_parameters) {
 		AddMacroParameters(*member, *macro_parameters);
@@ -115,14 +115,18 @@ unique_ptr<CreateStatement> PEGTransformerFactory::TransformCreateLanguageTableF
 }
 
 vector<pair<Identifier, unique_ptr<ParsedExpression>>> PEGTransformerFactory::TransformReturnsTableType(
-    PEGTransformer &transformer, vector<pair<Identifier, unique_ptr<ParsedExpression>>> col_id_type_list) {
-	identifier_set_t column_names;
-	for (auto &column : col_id_type_list) {
-		if (!column_names.insert(column.first).second) {
+    PEGTransformer &transformer, optional<vector<pair<Identifier, unique_ptr<ParsedExpression>>>> col_id_type_list) {
+	if (!col_id_type_list) {
+		// the bare RETURNS TABLE form declares an unresolved schema
+		return vector<pair<Identifier, unique_ptr<ParsedExpression>>>();
+	}
+	identifier_set_t return_names;
+	for (auto &column : *col_id_type_list) {
+		if (!return_names.insert(column.first).second) {
 			throw ParserException("Duplicate column name %s in RETURNS TABLE definition", column.first);
 		}
 	}
-	return col_id_type_list;
+	return std::move(*col_id_type_list);
 }
 
 bool PEGTransformerFactory::TransformMacroKeyword(PEGTransformer &transformer) {
