@@ -69,7 +69,12 @@ MacroBindResult MacroFunction::BindMacroFunction(
 		}
 	}
 
-	// Find argument types and separate positional and default arguments
+	// Find argument types and separate positional and default arguments.
+	// Probing an argument type must not leak binder state: a correlated (lateral) argument
+	// registers its correlated column at the probe depth, and the real bind's correct-depth
+	// registration is deduplicated away (identity is the binding), leaving the dependent
+	// join planned at the wrong level. Restore the correlated columns after the probes.
+	const auto correlated_snapshot = binder.correlated_columns;
 	vector<LogicalType> positional_arg_types;
 	InsertionOrderPreservingMap<LogicalType, Identifier, identifier_map_t<idx_t>> named_arg_types;
 	for (auto &arg : function_expr.GetArgumentsMutable()) {
@@ -95,6 +100,10 @@ MacroBindResult MacroFunction::BindMacroFunction(
 			positional_arguments.push_back(std::move(arg.GetExpressionMutable()));
 			positional_arg_types.push_back(std::move(arg_type));
 		}
+	}
+
+	if (requires_bind) {
+		binder.correlated_columns = correlated_snapshot;
 	}
 
 	// Check for each macro function if it matches the number of positional arguments
