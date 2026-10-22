@@ -219,11 +219,24 @@ string TransformStack::FormatStack() const {
 #endif
 
 arena_ptr<TransformResultValue> PEGTransformer::TransformInternal(ParseResult &parse_result) {
-	auto rule = parse_result.GetRule();
+	// unwrap transparent wrapper nodes (CHOICE / present OPTIONAL) until a rule-boundary node is found
+	// wrappers copy the child's name but carry no rule, so transforming them directly would fail
+	reference<ParseResult> target(parse_result);
+	while (!target.get().GetRule()) {
+		if (target.get().type == ParseResultType::CHOICE) {
+			target = target.get().Cast<ChoiceParseResult>().GetResult();
+		} else if (target.get().type == ParseResultType::OPTIONAL &&
+		           target.get().Cast<OptionalParseResult>().HasResult()) {
+			target = target.get().Cast<OptionalParseResult>().GetResult();
+		} else {
+			break;
+		}
+	}
+	auto rule = target.get().GetRule();
 	if (!rule) {
 		throw InternalException("No registered data exists for rule '%s'", parse_result.Name());
 	}
-	TransformInput input {*rule, parse_result};
+	TransformInput input {*rule, target.get()};
 	TransformStack stack(*this);
 	return stack.Execute(input);
 }
