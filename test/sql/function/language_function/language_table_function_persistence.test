@@ -142,6 +142,18 @@ NULL
 statement ok
 USE memory;
 
+# the unresolved form also replays from the WAL alone: detach and re-attach before any checkpoint
+statement ok
+DETACH ltfdb;
+
+statement ok
+ATTACH '{TEST_DIR}/language_table_function_persistence.db' AS ltfdb;
+
+query TT
+SELECT return_type, language_version FROM duckdb_functions() WHERE function_name = 'late_tf';
+----
+NULL	NULL
+
 # Checkpoint, then read the catalog from the checkpoint without the binder
 statement ok
 LOAD '{BUILD_DIRECTORY}/test/extension/language_function_demo.duckdb_extension';
