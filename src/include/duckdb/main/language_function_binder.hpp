@@ -121,7 +121,10 @@ private:
 	struct FrozenMemberState {
 		vector<Identifier> return_names;
 		//! serialized identities instead of type values: type copies share their interned metadata
-		vector<string> return_type_identities;
+		vector<string> return_column_type_identities;
+		//! the resolved signature is equally reachable through returned type copies
+		vector<string> parameter_type_identities;
+		string return_type_identity;
 		string language_version;
 		vector<idx_t> relation_parameters;
 	};

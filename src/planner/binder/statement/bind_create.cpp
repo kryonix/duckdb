@@ -583,6 +583,11 @@ SchemaCatalogEntry &Binder::BindCreateFunctionInfo(CreateInfo &info) {
 			auto &table_member = function->Cast<LanguageTableMacroFunction>();
 			for (auto &column_type : table_member.return_types) {
 				BindLogicalType(column_type);
+				if (!column_type.IsComplete()) {
+					// e.g. ANY: the declared schema is the fixed result shape of every call
+					throw BinderException("Macro %s() declares the incomplete RETURNS TABLE column type %s",
+					                      base.GetFunctionName(), column_type.ToString());
+				}
 			}
 		}
 

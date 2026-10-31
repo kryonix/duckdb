@@ -200,6 +200,28 @@ TEST_CASE("An invalid published schema is rejected", "[api]") {
 	REQUIRE_FAIL(result);
 	REQUIRE(StringUtil::Contains(result->GetError(), "unresolved column type"));
 
+	// ... and incomplete types (ANY, nested ANY, containers without parameters) are no result shape
+	RegisterTestLanguage(*db.instance, "anylang", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		info.PublishMemberSchema(0, {Identifier("x")}, {LogicalType::ANY});
+	}));
+	result = con.Query("CREATE FUNCTION any_published() RETURNS TABLE LANGUAGE anylang AS 'x'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "incomplete column type"));
+
+	RegisterTestLanguage(*db.instance, "nestedany", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		info.PublishMemberSchema(0, {Identifier("x")}, {LogicalType::LIST(LogicalType::ANY)});
+	}));
+	result = con.Query("CREATE FUNCTION nested_any_published() RETURNS TABLE LANGUAGE nestedany AS 'x'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "incomplete column type"));
+
+	RegisterTestLanguage(*db.instance, "barelist", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		info.PublishMemberSchema(0, {Identifier("x")}, {LogicalType(LogicalTypeId::LIST)});
+	}));
+	result = con.Query("CREATE FUNCTION bare_list_published() RETURNS TABLE LANGUAGE barelist AS 'x'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "incomplete column type"));
+
 	// ... and name and type counts must line up
 	RegisterTestLanguage(*db.instance, "countlang", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
 		info.PublishMemberSchema(0, {Identifier("x")}, {LogicalType::INTEGER, LogicalType::INTEGER});
@@ -302,6 +324,17 @@ TEST_CASE("Retained references into published values are rejected", "[api]") {
 	REQUIRE_FAIL(result);
 	REQUIRE(StringUtil::Contains(result->GetError(), "changed the relation parameters"));
 
+	// a case-only rename changes the stored spelling even though SQL lookup treats it as equal
+	RegisterTestLanguage(*db.instance, "casemut", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		vector<Identifier> names {Identifier("Result")};
+		auto &name = names[0];
+		info.PublishMemberSchema(0, std::move(names), {LogicalType::INTEGER});
+		name = Identifier("RESULT");
+	}));
+	result = con.Query("CREATE FUNCTION case_mutated() RETURNS TABLE LANGUAGE casemut AS 'x'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "changed a declared or published result schema"));
+
 	// whether a string move transfers its heap buffer is implementation-defined, so assert the
 	// invariant instead: the mutation is either rejected or it never reached the stored version
 	RegisterTestLanguage(*db.instance, "versionmut", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
@@ -318,6 +351,52 @@ TEST_CASE("Retained references into published values are rejected", "[api]") {
 		    con.Query("SELECT language_version FROM duckdb_functions() WHERE function_name = 'version_mutated'");
 		REQUIRE(CHECK_COLUMN(shown, 0, {Value(string(64, '1'))}));
 	}
+}
+
+TEST_CASE("A declared incomplete column type is rejected at CREATE", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	// the SQL grammar cannot spell ANY in type position, so the state is API-only
+	RegisterTestLanguage(*db.instance, "declany", make_shared_ptr<ViewBinder>(nullptr));
+	auto info = make_uniq<CreateMacroInfo>(CatalogType::TABLE_MACRO_ENTRY);
+	info->SetFunctionName(Identifier("declared_any"));
+	auto member = make_uniq<LanguageTableMacroFunction>("declany", "x");
+	member->return_names.emplace_back("c");
+	member->return_types.emplace_back(LogicalType::ANY);
+	info->macros.push_back(std::move(member));
+	auto statement = make_uniq<CreateStatement>();
+	statement->info = std::move(info);
+	auto result = con.Query(std::move(statement));
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "incomplete RETURNS TABLE column type"));
+}
+
+TEST_CASE("A resolved signature mutation through a returned type copy is rejected", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	// a returned parameter type shares its interned metadata, and extension_info stays a mutable
+	// pointee behind the const LogicalTypeInfo: without the signature freeze this collapses two
+	// distinct overload signatures after the batch conflict check already accepted them
+	RegisterTestLanguage(*db.instance, "sigmut", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		auto parameter_type = info.MemberParameterType(0, 0);
+		parameter_type.GetTypeInfo().extension_info->modifiers.emplace_back(Value::INTEGER(9));
+	}));
+
+	auto ext_info = make_uniq<ExtensionTypeInfo>();
+	ext_info->modifiers.emplace_back(Value::INTEGER(1));
+	auto info = make_uniq<CreateMacroInfo>(CatalogType::TABLE_MACRO_ENTRY);
+	info->SetFunctionName(Identifier("sig_mutated"));
+	auto member = make_uniq<LanguageTableMacroFunction>("sigmut", "x");
+	member->parameters.push_back(make_uniq<ColumnRefExpression>(Identifier("p")));
+	member->types.push_back(LogicalType(LogicalTypeId::INTEGER).WithExtensionInfo(std::move(ext_info)));
+	member->return_names.emplace_back("i");
+	member->return_types.emplace_back(LogicalType::INTEGER);
+	info->macros.push_back(std::move(member));
+	auto statement = make_uniq<CreateStatement>();
+	statement->info = std::move(info);
+	auto result = con.Query(std::move(statement));
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "changed a resolved signature"));
 }
 
 #endif
@@ -368,6 +447,58 @@ TEST_CASE("ValidateCreate publishes relation parameters through the view", "[api
 	auto result = con.Query("SELECT * FROM rel_tf(1)");
 	REQUIRE_FAIL(result);
 	REQUIRE(StringUtil::Contains(result->GetError(), "does not implement table function binding"));
+}
+
+TEST_CASE("Published relation markers persist through a reopen", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	// the markers are not SQL-visible, so the serialized field 105 round trip needs C++ inspection
+	RegisterTestLanguage(*db.instance, "relpersist", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		if (info.MemberRelationParameters(0).empty()) {
+			info.PublishMemberRelationParameters(0, {0});
+		}
+	}));
+	auto path = TestCreatePath("relation_marker_persistence.db");
+	DeleteDatabase(path);
+	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS reldb (STORAGE_VERSION 'v2.1.0')"));
+	REQUIRE_NO_FAIL(con.Query(
+	    "CREATE FUNCTION reldb.main.rel_persist_tf(r) RETURNS TABLE(i INTEGER) LANGUAGE relpersist AS 'rows:1'"));
+	REQUIRE_NO_FAIL(con.Query("CHECKPOINT reldb"));
+	REQUIRE_NO_FAIL(con.Query("DETACH reldb"));
+	REQUIRE_NO_FAIL(con.Query("ATTACH '" + path + "' AS reldb"));
+	con.BeginTransaction();
+	auto &entry =
+	    Catalog::GetEntry<TableMacroCatalogEntry>(*con.context, QualifiedName("reldb", "main", "rel_persist_tf"));
+	REQUIRE(entry.macros[0]->relation_parameters == vector<idx_t> {0});
+	con.Rollback();
+}
+
+TEST_CASE("Direct catalog overload adds reject kind mismatches", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	RegisterTestLanguage(*db.instance, "kindlang", make_shared_ptr<ViewBinder>(nullptr));
+
+	// reach the schema entry directly, the way an extension registering functions does
+	auto &system_catalog = Catalog::GetSystemCatalog(*db.instance);
+	auto data = CatalogTransaction::GetSystemTransaction(*db.instance);
+	auto &schema = system_catalog.GetSchema(data, Identifier::DefaultSchema());
+
+	CreateMacroInfo info(CatalogType::TABLE_MACRO_ENTRY);
+	info.SetFunctionName(Identifier("kind_guard"));
+	info.internal = true;
+	auto table_member = make_uniq<LanguageTableMacroFunction>("kindlang", "x");
+	table_member->return_names.emplace_back("i");
+	table_member->return_types.emplace_back(LogicalType::INTEGER);
+	info.macros.push_back(std::move(table_member));
+	schema.CreateFunction(data, info);
+
+	// a scalar member aimed at the table catalog set must not reach the overload-add path
+	CreateMacroInfo mismatched(CatalogType::TABLE_MACRO_ENTRY);
+	mismatched.SetFunctionName(Identifier("kind_guard"));
+	mismatched.internal = true;
+	mismatched.macros.push_back(make_uniq<LanguageMacroFunction>("kindlang", "y"));
+	REQUIRE_THROWS_WITH(schema.CreateFunction(data, mismatched),
+	                    Catch::Contains("cannot combine scalar and table language function members"));
 }
 
 #ifndef DUCKDB_CRASH_ON_ASSERT
