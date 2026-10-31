@@ -77,6 +77,22 @@ SELECT t.x, r.i FROM t, LATERAL arg_rows(t.x) r ORDER BY t.x, r.i;
 2	0
 2	1
 
+# LEFT LATERAL keeps empty-result driving rows, NULL arguments produce empty results, and
+# duplicate driving keys each get their own expansion
+statement ok
+CREATE TABLE tdup(x INTEGER);
+
+statement ok
+INSERT INTO tdup VALUES (1), (1), (NULL), (0);
+
+query II
+SELECT tdup.x, r.i FROM tdup LEFT JOIN LATERAL arg_rows(tdup.x) r ON true ORDER BY tdup.x NULLS LAST, r.i;
+----
+0	NULL
+1	0
+1	0
+NULL	NULL
+
 # default parameters are filled in before the language binder sees the arguments
 statement ok
 CREATE FUNCTION defaulted_rows(n := 2) RETURNS TABLE(i BIGINT) LANGUAGE testlang AS 'rows:arg:0';
