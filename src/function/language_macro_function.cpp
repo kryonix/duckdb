@@ -314,5 +314,4 @@ void LanguageFunctionCreateInfo::VerifyMemberState() const {
 	}
 }
 
-
 } // namespace duckdb

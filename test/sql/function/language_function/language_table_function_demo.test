@@ -107,6 +107,17 @@ SELECT count(*) FROM defaulted_rows(n := 4);
 ----
 4
 
+# duplicate and unknown named arguments are rejected by the shared overload selection
+statement error
+SELECT count(*) FROM defaulted_rows(n := 1, n := 2);
+----
+<REGEX>:Binder Error:.*n.*
+
+statement error
+SELECT count(*) FROM defaulted_rows(m := 1);
+----
+<REGEX>:Binder Error:.*m.*
+
 # arguments arrive in parameter declaration order, not caller order
 statement ok
 CREATE FUNCTION ordered_rows(a INTEGER, b INTEGER := 2, c INTEGER := 3) RETURNS TABLE(i BIGINT) LANGUAGE testlang AS 'rows:arg:1';
