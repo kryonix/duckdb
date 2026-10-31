@@ -65,10 +65,10 @@ static string SerializedTypeIdentity(const LogicalType &type) {
 	return string(char_ptr_cast(stream.GetData()), stream.GetPosition());
 }
 
-LanguageFunctionCreateInfo::LanguageFunctionCreateInfo(const Identifier &function_name,
+LanguageFunctionCreateInfo::LanguageFunctionCreateInfo(const QualifiedName &qualified_name, const string &sql,
                                                        vector<unique_ptr<MacroFunction>> &members,
                                                        vector<FunctionDescription> &descriptions)
-    : function_name(function_name), members(members), descriptions(descriptions) {
+    : qualified_name(qualified_name), sql(sql), members(members), descriptions(descriptions) {
 	// freeze the resolved signatures and declared result schemas before the callback sees them
 	for (auto &member : members) {
 		FrozenMemberState state;
@@ -178,19 +178,19 @@ void LanguageFunctionCreateInfo::PublishMemberSchema(idx_t member_idx, vector<Id
 	if (member.type != MacroType::LANGUAGE_TABLE_MACRO) {
 		throw InternalException("The language binder for \"%s\" published a result schema for %s(), which is not a "
 		                        "table function member",
-		                        language, function_name);
+		                        language, GetFunctionName());
 	}
 	auto &table_member = member.Cast<LanguageTableMacroFunction>();
 	if (!table_member.return_names.empty()) {
 		// publish-once: only an unresolved schema may be set, and never changed
 		throw InternalException("The language binder for \"%s\" tried to change the result schema of %s() during "
 		                        "validation, which is not allowed",
-		                        language, function_name);
+		                        language, GetFunctionName());
 	}
 	if (names.empty() || names.size() != types.size()) {
 		throw InternalException("The language binder for \"%s\" published a result schema for %s() with %llu column "
 		                        "names and %llu column types, which is not allowed",
-		                        language, function_name, names.size(), types.size());
+		                        language, GetFunctionName(), names.size(), types.size());
 	}
 	// a published schema must be as valid as a declared one
 	identifier_set_t published_names;
@@ -198,7 +198,7 @@ void LanguageFunctionCreateInfo::PublishMemberSchema(idx_t member_idx, vector<Id
 		if (!published_names.insert(name).second) {
 			throw InternalException("The language binder for \"%s\" published a result schema for %s() with a "
 			                        "duplicate column name %s, which is not allowed",
-			                        language, function_name, name);
+			                        language, GetFunctionName(), name);
 		}
 	}
 	for (auto &type : types) {
@@ -210,7 +210,7 @@ void LanguageFunctionCreateInfo::PublishMemberSchema(idx_t member_idx, vector<Id
 		if (TypeVisitor::Contains(type, unresolved)) {
 			throw InternalException("The language binder for \"%s\" published a result schema for %s() with an "
 			                        "unresolved column type, which is not allowed",
-			                        language, function_name);
+			                        language, GetFunctionName());
 		}
 	}
 	// freeze the published column types by serialized identity, like declared ones
@@ -223,13 +223,49 @@ void LanguageFunctionCreateInfo::PublishMemberSchema(idx_t member_idx, vector<Id
 	table_member.return_types = std::move(types);
 }
 
+unique_ptr<ParsedExpression> LanguageFunctionCreateInfo::MemberParameterDefault(idx_t member_idx,
+                                                                                idx_t param_idx) const {
+	auto &member = *members[member_idx];
+	const auto &param_name = member.parameters[param_idx]->Cast<ColumnRefExpression>().GetColumnName();
+	auto entry = member.default_parameters.find(param_name);
+	if (entry == member.default_parameters.end()) {
+		return nullptr;
+	}
+	return entry->second->Copy();
+}
+
+const vector<idx_t> &LanguageFunctionCreateInfo::MemberRelationParameters(idx_t member_idx) const {
+	return members[member_idx]->relation_parameters;
+}
+
+void LanguageFunctionCreateInfo::PublishMemberRelationParameters(idx_t member_idx, vector<idx_t> relation_parameters) {
+	auto &member = *members[member_idx];
+	auto &language = LanguageMacroFunction::Get(member).language;
+	if (!member.relation_parameters.empty()) {
+		// publish-once: only unset markers may be published, and never changed
+		throw InternalException("The language binder for \"%s\" tried to change the relation parameters of %s() "
+		                        "during validation, which is not allowed",
+		                        language, GetFunctionName());
+	}
+	for (idx_t marker_idx = 0; marker_idx < relation_parameters.size(); marker_idx++) {
+		const auto param_idx = relation_parameters[marker_idx];
+		if (param_idx >= member.parameters.size() ||
+		    (marker_idx > 0 && relation_parameters[marker_idx - 1] >= param_idx)) {
+			throw InternalException("The language binder for \"%s\" published relation parameters for %s() that are "
+			                        "not strictly increasing declared parameter indexes",
+			                        language, GetFunctionName());
+		}
+	}
+	member.relation_parameters = std::move(relation_parameters);
+}
+
 void LanguageFunctionCreateInfo::PublishMemberLanguageVersion(idx_t member_idx, string version) {
 	auto &member = LanguageMacroFunction::Get(*members[member_idx]);
 	if (!member.language_version.empty()) {
 		// publish-once: only an empty version may be set, and never changed
 		throw InternalException("The language binder for \"%s\" tried to change the published language version of "
 		                        "%s() during validation, which is not allowed",
-		                        member.language, function_name);
+		                        member.language, GetFunctionName());
 	}
 	member.language_version = std::move(version);
 }

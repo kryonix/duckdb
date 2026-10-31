@@ -723,7 +723,7 @@ SchemaCatalogEntry &Binder::BindCreateFunctionInfo(CreateInfo &info) {
 			auto language_binder = language_entry->binder;
 			// the info type exposes exactly what the callback may do: read members, rewrite member
 			// sources, and publish documentation. The definition itself stays fixed by construction
-			LanguageFunctionCreateInfo create_info(base.GetQualifiedName().Name(), base.macros, base.descriptions);
+			LanguageFunctionCreateInfo create_info(base.GetQualifiedName(), base.sql, base.macros, base.descriptions);
 			language_binder->ValidateCreate(context, create_info);
 			// resolved types and result column types share interned type metadata with values read
 			// through the view, so an in-place metadata mutation needs no setter: reject any identity

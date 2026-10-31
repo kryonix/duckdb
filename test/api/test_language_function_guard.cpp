@@ -2,6 +2,7 @@
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_macro_catalog_entry.hpp"
 #include "duckdb/function/language_macro_function.hpp"
 #include "duckdb/function/language_table_macro_function.hpp"
 #include "duckdb/main/language_function_binder.hpp"
@@ -131,8 +132,8 @@ TEST_CASE("ValidateCreate publishes a schema and language version through the cr
 
 	// the bare RETURNS TABLE form stores an unresolved schema the binder may publish once
 	REQUIRE_NO_FAIL(con.Query("CREATE FUNCTION published_tf() RETURNS TABLE LANGUAGE publang AS 'x'"));
-	auto result = con.Query(
-	    "SELECT return_type, language_version FROM duckdb_functions() WHERE function_name = 'published_tf'");
+	auto result =
+	    con.Query("SELECT return_type, language_version FROM duckdb_functions() WHERE function_name = 'published_tf'");
 	REQUIRE(CHECK_COLUMN(result, 0, {"TABLE(published INTEGER)"}));
 	REQUIRE(CHECK_COLUMN(result, 1, {"publang 7"}));
 
@@ -178,8 +179,7 @@ TEST_CASE("An invalid published schema is rejected", "[api]") {
 	Connection con(db);
 	// a published schema must be as valid as a declared one: unique names, resolved types
 	RegisterTestLanguage(*db.instance, "duplang", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
-		info.PublishMemberSchema(0, {Identifier("x"), Identifier("x")},
-		                         {LogicalType::INTEGER, LogicalType::INTEGER});
+		info.PublishMemberSchema(0, {Identifier("x"), Identifier("x")}, {LogicalType::INTEGER, LogicalType::INTEGER});
 	}));
 	auto result = con.Query("CREATE FUNCTION dup_published() RETURNS TABLE LANGUAGE duplang AS 'x'");
 	REQUIRE_FAIL(result);
@@ -275,6 +275,74 @@ TEST_CASE("An in-place mutation of a result column type is rejected", "[api]") {
 	result = con.Query(std::move(statement));
 	REQUIRE_FAIL(result);
 	REQUIRE(StringUtil::Contains(result->GetError(), "changed a declared or published result schema"));
+}
+
+#endif
+
+TEST_CASE("ValidateCreate reads the destination, statement text, and defaults through the view", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto observed = make_shared_ptr<vector<string>>();
+	RegisterTestLanguage(*db.instance, "ctxlang",
+	                     make_shared_ptr<ViewBinder>([observed](LanguageFunctionCreateInfo &info) {
+		                     // the destination is resolved before validation, so the language sees the real target
+		                     auto &destination = info.GetQualifiedFunctionName();
+		                     observed->push_back(destination.Catalog().GetIdentifierName() + "." +
+		                                         destination.Schema().GetIdentifierName() + "." +
+		                                         destination.Name().GetIdentifierName());
+		                     observed->push_back(info.GetStatementText());
+		                     auto default_value = info.MemberParameterDefault(0, 1);
+		                     observed->push_back(default_value ? default_value->ToString() : "<none>");
+		                     REQUIRE(!info.MemberParameterDefault(0, 0));
+	                     }));
+
+	const string create_text = "CREATE FUNCTION ctx_fun(x INTEGER, y INTEGER := 42) LANGUAGE ctxlang AS 'src'";
+	REQUIRE_NO_FAIL(con.Query(create_text));
+	REQUIRE(observed->size() == 3);
+	REQUIRE((*observed)[0] == "memory.main.ctx_fun");
+	REQUIRE((*observed)[1] == create_text);
+	REQUIRE((*observed)[2] == "42");
+}
+
+TEST_CASE("ValidateCreate publishes relation parameters through the view", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	RegisterTestLanguage(*db.instance, "rellang", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		if (info.MemberRelationParameters(0).empty()) {
+			info.PublishMemberRelationParameters(0, {0});
+		}
+		REQUIRE(info.MemberRelationParameters(0) == vector<idx_t> {0});
+	}));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE FUNCTION rel_tf(r) RETURNS TABLE(i INTEGER) LANGUAGE rellang AS 'rows:1'"));
+	// the published markers are stored on the member
+	con.BeginTransaction();
+	auto &entry = Catalog::GetEntry<TableMacroCatalogEntry>(*con.context, QualifiedName("memory", "main", "rel_tf"));
+	REQUIRE(entry.macros[0]->relation_parameters == vector<idx_t> {0});
+	con.Rollback();
+}
+
+#ifndef DUCKDB_CRASH_ON_ASSERT
+
+TEST_CASE("Invalid relation-parameter publications are rejected", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	// out-of-range and non-increasing indexes are rejected
+	RegisterTestLanguage(*db.instance, "relbad", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		info.PublishMemberRelationParameters(0, {1});
+	}));
+	auto result = con.Query("CREATE FUNCTION rel_bad(r) RETURNS TABLE(i INTEGER) LANGUAGE relbad AS 'rows:1'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "not strictly increasing declared parameter indexes"));
+
+	// publish-once: markers are set exactly once
+	RegisterTestLanguage(*db.instance, "reltwice", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		info.PublishMemberRelationParameters(0, {0});
+		info.PublishMemberRelationParameters(0, {0});
+	}));
+	result = con.Query("CREATE FUNCTION rel_twice(r) RETURNS TABLE(i INTEGER) LANGUAGE reltwice AS 'rows:1'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "tried to change the relation parameters"));
 }
 
 #endif
@@ -769,15 +837,15 @@ TEST_CASE("Batch table member creation follows the overload identity", "[api]") 
 	REQUIRE(StringUtil::Contains(result->GetError(), "conflicting overload members"));
 
 	// an unresolved spelling of the same nested type must not slip past the pairwise check
-	result =
-	    query_batch(make_table_member("resolved ranged", LogicalType::STRUCT({{"m", LogicalType::INTEGER}}), true),
-	                make_table_member("spelled", LogicalType::STRUCT({{"m", UnresolvedUserType("integer")}})));
+	result = query_batch(make_table_member("resolved ranged", LogicalType::STRUCT({{"m", LogicalType::INTEGER}}), true),
+	                     make_table_member("spelled", LogicalType::STRUCT({{"m", UnresolvedUserType("integer")}})));
 	REQUIRE_FAIL(result);
 	REQUIRE(StringUtil::Contains(result->GetError(), "conflicting overload members"));
 
 	// distinct unbound STRUCT spellings resolve to distinct signatures and are not wrongly rejected
-	result = query_batch(make_table_member("int struct", LogicalType::STRUCT({{"m", UnresolvedUserType("integer")}})),
-	                     make_table_member("varchar struct", LogicalType::STRUCT({{"m", UnresolvedUserType("varchar")}})));
+	result =
+	    query_batch(make_table_member("int struct", LogicalType::STRUCT({{"m", UnresolvedUserType("integer")}})),
+	                make_table_member("varchar struct", LogicalType::STRUCT({{"m", UnresolvedUserType("varchar")}})));
 	REQUIRE_NO_FAIL(*result);
 	auto count = con.Query("SELECT count(*) FROM duckdb_functions() WHERE function_name = 'batch_tf'");
 	REQUIRE(CHECK_COLUMN(count, 0, {2}));
