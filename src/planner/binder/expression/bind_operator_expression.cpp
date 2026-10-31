@@ -179,9 +179,11 @@ BindResult ExpressionBinder::BindExpression(OperatorExpression &op, idx_t depth)
 	vector<unique_ptr<Expression>> children;
 	if (operator_type == ExpressionType::OPERATOR_TRY) {
 		D_ASSERT(op.GetChildrenMutable().size() == 1);
+		// restore instead of reset: a nested TRY must not clear the enclosing capture context
+		const auto was_inside_try = inside_try;
 		inside_try = true;
 		children.push_back(BindChild(op.GetChildrenMutable()[0], depth, error));
-		inside_try = false;
+		inside_try = was_inside_try;
 	} else {
 		for (idx_t i = 0; i < op.GetChildrenMutable().size(); i++) {
 			children.push_back(BindChild(op.GetChildrenMutable()[i], depth, error));
