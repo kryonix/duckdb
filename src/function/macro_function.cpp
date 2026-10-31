@@ -298,6 +298,7 @@ void MacroFunction::CopyProperties(MacroFunction &other) const {
 	other.return_type = return_type;
 	other.dependencies_recorded = dependencies_recorded;
 	other.recorded_dependencies = recorded_dependencies;
+	other.relation_parameters = relation_parameters;
 }
 
 vector<unique_ptr<ParsedExpression>>
@@ -313,6 +314,11 @@ MacroFunction::GetPositionalParametersForSerialization(Serializer &serializer) c
 		if (return_type.id() != LogicalTypeId::UNKNOWN) {
 			throw SerializationException(
 			    "Cannot write a macro with a declared RETURNS type for a storage version below v2.1.0. Re-attach "
+			    "with (STORAGE_VERSION 'v2.1.0') or drop the macro");
+		}
+		if (!relation_parameters.empty()) {
+			throw SerializationException(
+			    "Cannot write a macro with member options for a storage version below v2.1.0. Re-attach "
 			    "with (STORAGE_VERSION 'v2.1.0') or drop the macro");
 		}
 	}

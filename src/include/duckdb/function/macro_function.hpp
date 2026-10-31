@@ -57,6 +57,8 @@ public:
 	bool dependencies_recorded = false;
 	//! The catalog dependencies this member's CREATE bind registered
 	LogicalDependencyList recorded_dependencies;
+	//! Indexes of parameters a language declares as relations (TABLE(col TYPE, ...) parameters)
+	vector<idx_t> relation_parameters;
 
 public:
 	virtual ~MacroFunction() {

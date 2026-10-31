@@ -27,6 +27,9 @@ public:
 	string language;
 	//! The verbatim source text, the durable form of the definition
 	string source;
+	//! The language version the member was created with, informational only. Empty when unknown;
+	//! ValidateCreate may set it once (the publish-once rule, like an inferred table schema)
+	string language_version;
 
 public:
 	unique_ptr<MacroFunction> Copy() const override;

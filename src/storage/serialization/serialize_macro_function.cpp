@@ -29,6 +29,9 @@ void MacroFunction::Serialize(Serializer &serializer) const {
 	if (serializer.ShouldSerialize(StorageVersion::V2_1_0)) {
 		serializer.WritePropertyWithDefault<LogicalDependencyList>(106, "recorded_dependencies", recorded_dependencies, LogicalDependencyList());
 	}
+	if (serializer.ShouldSerialize(StorageVersion::V2_1_0)) {
+		serializer.WritePropertyWithDefault<vector<idx_t>>(107, "relation_parameters", relation_parameters, vector<idx_t>());
+	}
 }
 
 unique_ptr<MacroFunction> MacroFunction::Deserialize(Deserializer &deserializer) {
@@ -39,6 +42,7 @@ unique_ptr<MacroFunction> MacroFunction::Deserialize(Deserializer &deserializer)
 	auto return_type = deserializer.ReadPropertyWithExplicitDefault<LogicalType>(104, "return_type", LogicalType(LogicalTypeId::UNKNOWN));
 	auto dependencies_recorded = deserializer.ReadPropertyWithExplicitDefault<bool>(105, "dependencies_recorded", false);
 	auto recorded_dependencies = deserializer.ReadPropertyWithExplicitDefault<LogicalDependencyList>(106, "recorded_dependencies", LogicalDependencyList());
+	auto relation_parameters = deserializer.ReadPropertyWithExplicitDefault<vector<idx_t>>(107, "relation_parameters", vector<idx_t>());
 	unique_ptr<MacroFunction> result;
 	switch (type) {
 	case MacroType::LANGUAGE_MACRO:
@@ -62,6 +66,7 @@ unique_ptr<MacroFunction> MacroFunction::Deserialize(Deserializer &deserializer)
 	result->return_type = std::move(return_type);
 	result->dependencies_recorded = dependencies_recorded;
 	result->recorded_dependencies = recorded_dependencies;
+	result->relation_parameters = std::move(relation_parameters);
 	result->FinalizeDeserialization();
 	return result;
 }
@@ -70,12 +75,14 @@ void LanguageMacroFunction::Serialize(Serializer &serializer) const {
 	MacroFunction::Serialize(serializer);
 	serializer.WritePropertyWithDefault<string>(200, "language", language);
 	serializer.WritePropertyWithDefault<string>(201, "source", source);
+	serializer.WritePropertyWithDefault<string>(202, "language_version", language_version, "");
 }
 
 unique_ptr<MacroFunction> LanguageMacroFunction::Deserialize(Deserializer &deserializer) {
 	auto result = duckdb::unique_ptr<LanguageMacroFunction>(new LanguageMacroFunction());
 	deserializer.ReadPropertyWithDefault<string>(200, "language", result->language);
 	deserializer.ReadPropertyWithDefault<string>(201, "source", result->source);
+	deserializer.ReadPropertyWithExplicitDefault<string>(202, "language_version", result->language_version, "");
 	return std::move(result);
 }
 
@@ -85,6 +92,7 @@ void LanguageTableMacroFunction::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<string>(201, "source", source);
 	serializer.WritePropertyWithDefault<vector<Identifier>>(202, "return_names", return_names);
 	serializer.WritePropertyWithDefault<vector<LogicalType>>(203, "return_types", return_types);
+	serializer.WritePropertyWithDefault<string>(204, "language_version", language_version, "");
 }
 
 unique_ptr<MacroFunction> LanguageTableMacroFunction::Deserialize(Deserializer &deserializer) {
@@ -93,6 +101,7 @@ unique_ptr<MacroFunction> LanguageTableMacroFunction::Deserialize(Deserializer &
 	deserializer.ReadPropertyWithDefault<string>(201, "source", result->source);
 	deserializer.ReadPropertyWithDefault<vector<Identifier>>(202, "return_names", result->return_names);
 	deserializer.ReadPropertyWithDefault<vector<LogicalType>>(203, "return_types", result->return_types);
+	deserializer.ReadPropertyWithExplicitDefault<string>(204, "language_version", result->language_version, "");
 	return std::move(result);
 }
 
