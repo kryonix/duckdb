@@ -1,0 +1,60 @@
+# name: test/sql/error/test_try_nested_context.test
+# description: A nested TRY must not clear the enclosing TRY's binder context
+# group: [error]
+
+statement ok
+CREATE TABLE t AS SELECT 42 AS x, 0 AS y;
+
+# the restrictions hold directly under TRY
+statement error
+SELECT TRY(sum(100 // y)) FROM t;
+----
+aggregates are not allowed inside the TRY expression
+
+statement error
+SELECT TRY(unnest([1, 2]));
+----
+UNNEST
+
+statement error
+SELECT TRY((SELECT 1));
+----
+TRY can not be used in combination with a scalar subquery
+
+# and they still hold when a nested TRY precedes the offending expression
+statement error
+SELECT TRY(TRY(x) + sum(100 // y)) FROM t GROUP BY x;
+----
+aggregates are not allowed inside the TRY expression
+
+statement error
+SELECT TRY(TRY(1) + unnest([1, 2]));
+----
+UNNEST
+
+statement error
+SELECT TRY(TRY(1) + (SELECT 1));
+----
+TRY can not be used in combination with a scalar subquery
+
+statement error
+SELECT TRY(TRY(1) + sum(x) OVER ()) FROM t;
+----
+window functions are not allowed in try
+
+# nested TRY itself keeps working
+query I
+SELECT TRY(TRY(100 // y)) FROM t;
+----
+NULL
+
+query I
+SELECT TRY(TRY(100 // y) + x) FROM t;
+----
+NULL
+
+# the context restores to false outside the TRY: an aggregate over nested TRY still binds
+query I
+SELECT sum(TRY(TRY(100 // y)) IS NULL::INT) FROM t;
+----
+1
