@@ -719,4 +719,17 @@ TEST_CASE("Mixed scalar and table language members are rejected at CREATE", "[ap
 	auto result = con.Query(std::move(statement));
 	REQUIRE_FAIL(result);
 	REQUIRE(StringUtil::Contains(result->GetError(), "cannot combine scalar and table language function members"));
+
+	// ... and in the other direction: a table member in a scalar entry
+	auto scalar_info = make_uniq<CreateMacroInfo>(CatalogType::MACRO_ENTRY);
+	scalar_info->SetFunctionName(Identifier("mixed_kinds2"));
+	auto lone_table_member = make_uniq<LanguageTableMacroFunction>("missinglang", "table source");
+	lone_table_member->return_names.emplace_back("i");
+	lone_table_member->return_types.emplace_back(LogicalType::INTEGER);
+	scalar_info->macros.push_back(std::move(lone_table_member));
+	statement = make_uniq<CreateStatement>();
+	statement->info = std::move(scalar_info);
+	result = con.Query(std::move(statement));
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "cannot combine scalar and table language function members"));
 }

@@ -487,6 +487,14 @@ SchemaCatalogEntry &Binder::BindCreateFunctionInfo(CreateInfo &info) {
 			has_plain_members = true;
 			continue;
 		}
+		// a language member's kind must match the entry kind: dispatch derives it from the members
+		const auto member_entry_type = function->type == MacroType::LANGUAGE_TABLE_MACRO
+		                                   ? CatalogType::TABLE_MACRO_ENTRY
+		                                   : CatalogType::MACRO_ENTRY;
+		if (info.type != member_entry_type) {
+			throw BinderException("Macro %s() cannot combine scalar and table language function members in one entry",
+			                      base.GetFunctionName());
+		}
 		auto &language_member = LanguageMacroFunction::Get(*function);
 		if (has_language_members && !StringUtil::CIEquals(language_member.language, entry_language)) {
 			throw BinderException("Macro %s() cannot mix members of languages \"%s\" and \"%s\"",
