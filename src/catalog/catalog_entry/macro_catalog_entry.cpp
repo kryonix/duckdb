@@ -8,11 +8,11 @@
 namespace duckdb {
 
 MacroCatalogEntry::MacroCatalogEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateMacroInfo &info)
-    : FunctionEntry((info.macros[0]->type == MacroType::TABLE_MACRO ||
-                             info.macros[0]->type == MacroType::LANGUAGE_TABLE_MACRO
-                         ? CatalogType::TABLE_MACRO_ENTRY
-                         : CatalogType::MACRO_ENTRY),
-                    catalog, schema, info),
+    : FunctionEntry(
+          (info.macros[0]->type == MacroType::TABLE_MACRO || info.macros[0]->type == MacroType::LANGUAGE_TABLE_MACRO
+               ? CatalogType::TABLE_MACRO_ENTRY
+               : CatalogType::MACRO_ENTRY),
+          catalog, schema, info),
       macros(std::move(info.macros)) {
 	this->temporary = info.temporary;
 	this->internal = info.internal;
@@ -25,17 +25,29 @@ MacroCatalogEntry::MacroCatalogEntry(Catalog &catalog, SchemaCatalogEntry &schem
 unique_ptr<MacroCatalogEntry> MacroCatalogEntry::Create(Catalog &catalog, SchemaCatalogEntry &schema,
                                                         CreateMacroInfo &info) {
 	// every producer funnels through here: binder dispatch and member selection rely on an entry
-	// holding either plain members or language members of one language, so enforce it at the boundary
+	// holding members of one kind and, for language members, of one language and the entry's kind,
+	// so enforce it at the boundary
+	for (auto &member_ptr : info.macros) {
+		auto &member = *member_ptr;
+		if (!member.IsLanguageMember()) {
+			continue;
+		}
+		const auto member_entry_type =
+		    member.type == MacroType::LANGUAGE_TABLE_MACRO ? CatalogType::TABLE_MACRO_ENTRY : CatalogType::MACRO_ENTRY;
+		if (member_entry_type != info.type) {
+			throw CatalogException("Macro %s cannot combine scalar and table language function members in one entry",
+			                       info.GetFunctionName());
+		}
+	}
 	for (idx_t member_idx = 1; member_idx < info.macros.size(); member_idx++) {
 		auto &first = *info.macros[0];
 		auto &member = *info.macros[member_idx];
-		if ((first.type == MacroType::LANGUAGE_MACRO) != (member.type == MacroType::LANGUAGE_MACRO)) {
+		if (first.IsLanguageMember() != member.IsLanguageMember()) {
 			throw CatalogException("Macro %s cannot mix language function members and plain macro members",
 			                       info.GetFunctionName());
 		}
-		if (first.type == MacroType::LANGUAGE_MACRO &&
-		    !StringUtil::CIEquals(first.Cast<LanguageMacroFunction>().language,
-		                          member.Cast<LanguageMacroFunction>().language)) {
+		if (first.IsLanguageMember() && !StringUtil::CIEquals(LanguageMacroFunction::Get(first).language,
+		                                                      LanguageMacroFunction::Get(member).language)) {
 			throw CatalogException("Macro %s cannot mix members of different languages", info.GetFunctionName());
 		}
 	}
