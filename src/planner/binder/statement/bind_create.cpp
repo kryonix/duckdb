@@ -725,9 +725,9 @@ SchemaCatalogEntry &Binder::BindCreateFunctionInfo(CreateInfo &info) {
 			// sources, and publish documentation. The definition itself stays fixed by construction
 			LanguageFunctionCreateInfo create_info(base.GetQualifiedName(), base.sql, base.macros, base.descriptions);
 			language_binder->ValidateCreate(context, create_info);
-			// resolved types and result column types share interned type metadata with values read
-			// through the view, so an in-place metadata mutation needs no setter: reject any identity
-			// change after the callback
+			// published vectors and strings adopt the caller's allocation, and result column types
+			// share interned type info with values read through the view, so a retained reference
+			// can mutate the stored state without a setter: reject any change after the callback
 			create_info.VerifyMemberState();
 		}
 	}

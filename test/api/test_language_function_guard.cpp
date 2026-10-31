@@ -277,6 +277,49 @@ TEST_CASE("An in-place mutation of a result column type is rejected", "[api]") {
 	REQUIRE(StringUtil::Contains(result->GetError(), "changed a declared or published result schema"));
 }
 
+TEST_CASE("Retained references into published values are rejected", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	// the publish setters adopt the caller's allocation: a retained reference into a published
+	// vector or string still names the stored value after the moves, without any view call
+	RegisterTestLanguage(*db.instance, "namemut", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		vector<Identifier> names {Identifier("a"), Identifier("b")};
+		auto &second = names[1];
+		info.PublishMemberSchema(0, std::move(names), {LogicalType::INTEGER, LogicalType::INTEGER});
+		second = Identifier("a");
+	}));
+	auto result = con.Query("CREATE FUNCTION name_mutated() RETURNS TABLE LANGUAGE namemut AS 'x'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "changed a declared or published result schema"));
+
+	RegisterTestLanguage(*db.instance, "markermut", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		vector<idx_t> markers {0};
+		auto &marker = markers[0];
+		info.PublishMemberRelationParameters(0, std::move(markers));
+		marker = info.MemberParameterCount(0);
+	}));
+	result = con.Query("CREATE FUNCTION marker_mutated(r) RETURNS TABLE LANGUAGE markermut AS 'x'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "changed the relation parameters"));
+
+	// whether a string move transfers its heap buffer is implementation-defined, so assert the
+	// invariant instead: the mutation is either rejected or it never reached the stored version
+	RegisterTestLanguage(*db.instance, "versionmut", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		string version(64, '1');
+		auto &first = version[0];
+		info.PublishMemberLanguageVersion(0, std::move(version));
+		first = '2';
+	}));
+	result = con.Query("CREATE FUNCTION version_mutated() LANGUAGE versionmut AS 'x'");
+	if (result->HasError()) {
+		REQUIRE(StringUtil::Contains(result->GetError(), "changed the language version"));
+	} else {
+		auto shown =
+		    con.Query("SELECT language_version FROM duckdb_functions() WHERE function_name = 'version_mutated'");
+		REQUIRE(CHECK_COLUMN(shown, 0, {Value(string(64, '1'))}));
+	}
+}
+
 #endif
 
 TEST_CASE("ValidateCreate reads the destination, statement text, and defaults through the view", "[api]") {

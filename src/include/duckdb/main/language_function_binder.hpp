@@ -112,19 +112,24 @@ public:
 		descriptions.push_back(std::move(description));
 	}
 
-	//! Called by the CREATE binder after the callback: the resolved parameter, RETURNS, and result
-	//! column types share interned type metadata with values read through the view, so an in-place
-	//! metadata mutation needs no setter. The frozen identities captured at construction (declared
-	//! state) and at publication (published schemas) make the detached-value convention enforceable
+	//! Called by the CREATE binder after the callback: result column types share interned type
+	//! metadata like any LogicalType copy, and published vectors and strings adopt the caller's
+	//! allocation, so a retained reference can mutate the stored state without a setter call. The
+	//! frozen copies captured at construction (declared state) and inside the publish setters make
+	//! the detached-value convention enforceable
 	void VerifyMemberState() const;
 
 private:
-	//! The frozen copy of one member's resolved signature and declared-or-published schema
+	//! The frozen copy of one member's declared-or-published state
 	struct FrozenMemberState {
+		vector<Identifier> return_names;
 		//! serialized identities instead of type values: type copies share their interned metadata
 		vector<string> return_column_type_identities;
+		//! the resolved signature is equally reachable through returned type copies
 		vector<string> parameter_type_identities;
 		string return_type_identity;
+		string language_version;
+		vector<idx_t> relation_parameters;
 	};
 
 private:
