@@ -69,15 +69,20 @@ LanguageFunctionCreateInfo::LanguageFunctionCreateInfo(const QualifiedName &qual
                                                        vector<unique_ptr<MacroFunction>> &members,
                                                        vector<FunctionDescription> &descriptions)
     : qualified_name(qualified_name), sql(sql), members(members), descriptions(descriptions) {
-	// freeze declared result schemas by serialized identity before the callback sees them
+	// freeze the declared state before the callback sees it
 	for (auto &member : members) {
-		vector<string> identities;
+		FrozenMemberState state;
+		auto &language_member = LanguageMacroFunction::Get(*member);
+		state.language_version = language_member.language_version;
+		state.relation_parameters = member->relation_parameters;
 		if (member->type == MacroType::LANGUAGE_TABLE_MACRO) {
-			for (auto &type : member->Cast<LanguageTableMacroFunction>().return_types) {
-				identities.push_back(ReturnColumnTypeIdentity(type));
+			auto &table_member = member->Cast<LanguageTableMacroFunction>();
+			state.return_names = table_member.return_names;
+			for (auto &type : table_member.return_types) {
+				state.return_type_identities.push_back(ReturnColumnTypeIdentity(type));
 			}
 		}
-		return_type_identities.push_back(std::move(identities));
+		frozen_members.push_back(std::move(state));
 	}
 }
 
@@ -179,11 +184,13 @@ void LanguageFunctionCreateInfo::PublishMemberSchema(idx_t member_idx, vector<Id
 			                        language, GetFunctionName());
 		}
 	}
-	// freeze the published column types by serialized identity, like declared ones
-	auto &identities = return_type_identities[member_idx];
-	D_ASSERT(identities.empty());
+	// freeze the published schema, like a declared one: the callback may retain references into the
+	// adopted vectors and into the shared type metadata
+	auto &state = frozen_members[member_idx];
+	D_ASSERT(state.return_names.empty() && state.return_type_identities.empty());
+	state.return_names = names;
 	for (auto &type : types) {
-		identities.push_back(ReturnColumnTypeIdentity(type));
+		state.return_type_identities.push_back(ReturnColumnTypeIdentity(type));
 	}
 	table_member.return_names = std::move(names);
 	table_member.return_types = std::move(types);
@@ -222,6 +229,8 @@ void LanguageFunctionCreateInfo::PublishMemberRelationParameters(idx_t member_id
 			                        language, GetFunctionName());
 		}
 	}
+	// freeze the published markers: the callback may retain references into the adopted vector
+	frozen_members[member_idx].relation_parameters = relation_parameters;
 	member.relation_parameters = std::move(relation_parameters);
 }
 
@@ -233,20 +242,35 @@ void LanguageFunctionCreateInfo::PublishMemberLanguageVersion(idx_t member_idx, 
 		                        "%s() during validation, which is not allowed",
 		                        member.language, GetFunctionName());
 	}
+	// freeze the published version: the callback may retain a reference into the adopted buffer
+	frozen_members[member_idx].language_version = version;
 	member.language_version = std::move(version);
 }
 
-void LanguageFunctionCreateInfo::VerifyReturnSchemaIdentity() const {
+void LanguageFunctionCreateInfo::VerifyMemberState() const {
 	for (idx_t member_idx = 0; member_idx < members.size(); member_idx++) {
 		auto &member = *members[member_idx];
+		auto &language_member = LanguageMacroFunction::Get(member);
+		auto &state = frozen_members[member_idx];
+		if (language_member.language_version != state.language_version) {
+			throw InternalException("The language binder for \"%s\" changed the language version of %s() during "
+			                        "validation, which is not allowed",
+			                        language_member.language, GetFunctionName());
+		}
+		if (member.relation_parameters != state.relation_parameters) {
+			throw InternalException("The language binder for \"%s\" changed the relation parameters of %s() during "
+			                        "validation, which is not allowed",
+			                        language_member.language, GetFunctionName());
+		}
 		if (member.type != MacroType::LANGUAGE_TABLE_MACRO) {
 			continue;
 		}
 		auto &table_member = member.Cast<LanguageTableMacroFunction>();
-		auto &identities = return_type_identities[member_idx];
-		bool changed = identities.size() != table_member.return_types.size();
-		for (idx_t col_idx = 0; !changed && col_idx < identities.size(); col_idx++) {
-			changed = identities[col_idx] != ReturnColumnTypeIdentity(table_member.return_types[col_idx]);
+		bool changed = state.return_names != table_member.return_names ||
+		               state.return_type_identities.size() != table_member.return_types.size();
+		for (idx_t col_idx = 0; !changed && col_idx < state.return_type_identities.size(); col_idx++) {
+			changed =
+			    state.return_type_identities[col_idx] != ReturnColumnTypeIdentity(table_member.return_types[col_idx]);
 		}
 		if (changed) {
 			throw InternalException("The language binder for \"%s\" changed a declared or published result schema of "

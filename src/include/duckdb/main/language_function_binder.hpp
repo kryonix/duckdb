@@ -110,18 +110,29 @@ public:
 	}
 
 	//! Called by the CREATE binder after the callback: result column types share interned type
-	//! metadata like any LogicalType copy, so an in-place mutation needs no setter. The serialized
-	//! identities captured at construction (declared schemas) and at publication (published
-	//! schemas) make the detached-copy convention enforceable
-	void VerifyReturnSchemaIdentity() const;
+	//! metadata like any LogicalType copy, and published vectors and strings adopt the caller's
+	//! allocation, so a retained reference can mutate the stored state without a setter call. The
+	//! frozen copies captured at construction (declared state) and inside the publish setters make
+	//! the detached-value convention enforceable
+	void VerifyMemberState() const;
+
+private:
+	//! The frozen copy of one member's declared-or-published state
+	struct FrozenMemberState {
+		vector<Identifier> return_names;
+		//! serialized identities instead of type values: type copies share their interned metadata
+		vector<string> return_type_identities;
+		string language_version;
+		vector<idx_t> relation_parameters;
+	};
 
 private:
 	const QualifiedName &qualified_name;
 	const string &sql;
 	vector<unique_ptr<MacroFunction>> &members;
 	vector<FunctionDescription> &descriptions;
-	//! Per member, the serialized identities of its result column types (empty for scalar members)
-	vector<vector<string>> return_type_identities;
+	//! Per member, the frozen state VerifyMemberState compares against after the callback
+	vector<FrozenMemberState> frozen_members;
 };
 
 //! Interface an extension registers to bind calls to macro members written in its language. It
