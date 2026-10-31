@@ -103,6 +103,9 @@ static unique_ptr<FunctionData> DuckDBFunctionsBind(ClientContext &context, Tabl
 	names.emplace_back("language");
 	return_types.emplace_back(LogicalType::VARCHAR);
 
+	names.emplace_back("language_version");
+	return_types.emplace_back(LogicalType::VARCHAR);
+
 	return nullptr;
 }
 
@@ -216,6 +219,10 @@ struct ScalarFunctionExtractor {
 		return Value();
 	}
 
+	static Value GetLanguageVersion(ScalarFunctionCatalogEntry &entry, idx_t offset) {
+		return Value();
+	}
+
 	static Value ResultType(ScalarFunctionCatalogEntry &entry, idx_t offset) {
 		return FunctionStabilityToValue(entry.functions.GetFunctionByOffset(offset)->GetStability());
 	}
@@ -279,6 +286,10 @@ struct WindowFunctionExtractor {
 	}
 
 	static Value GetLanguage(WindowFunctionCatalogEntry &entry, idx_t offset) {
+		return Value();
+	}
+
+	static Value GetLanguageVersion(WindowFunctionCatalogEntry &entry, idx_t offset) {
 		return Value();
 	}
 
@@ -346,6 +357,10 @@ struct AggregateFunctionExtractor {
 	}
 
 	static Value GetLanguage(AggregateFunctionCatalogEntry &entry, idx_t offset) {
+		return Value();
+	}
+
+	static Value GetLanguageVersion(AggregateFunctionCatalogEntry &entry, idx_t offset) {
 		return Value();
 	}
 
@@ -430,6 +445,17 @@ struct MacroExtractor {
 		}
 		return Value();
 	}
+
+	static Value GetLanguageVersion(ScalarMacroCatalogEntry &entry, idx_t offset) {
+		auto &macro_entry = *entry.macros[offset];
+		if (macro_entry.type == MacroType::LANGUAGE_MACRO) {
+			auto &version = macro_entry.Cast<LanguageMacroFunction>().language_version;
+			if (!version.empty()) {
+				return Value(version);
+			}
+		}
+		return Value();
+	}
 };
 
 struct TableMacroExtractor {
@@ -508,6 +534,17 @@ struct TableMacroExtractor {
 		auto &macro_entry = *entry.macros[offset];
 		if (macro_entry.type == MacroType::LANGUAGE_TABLE_MACRO) {
 			return Value(macro_entry.Cast<LanguageTableMacroFunction>().language);
+		}
+		return Value();
+	}
+
+	static Value GetLanguageVersion(TableMacroCatalogEntry &entry, idx_t offset) {
+		auto &macro_entry = *entry.macros[offset];
+		if (macro_entry.type == MacroType::LANGUAGE_TABLE_MACRO) {
+			auto &version = macro_entry.Cast<LanguageTableMacroFunction>().language_version;
+			if (!version.empty()) {
+				return Value(version);
+			}
 		}
 		return Value();
 	}
@@ -594,6 +631,10 @@ struct TableFunctionExtractor {
 		return Value();
 	}
 
+	static Value GetLanguageVersion(TableFunctionCatalogEntry &entry, idx_t offset) {
+		return Value();
+	}
+
 	static Value ResultType(TableFunctionCatalogEntry &entry, idx_t offset) {
 		return Value();
 	}
@@ -663,6 +704,10 @@ struct PragmaFunctionExtractor {
 	}
 
 	static Value GetLanguage(PragmaFunctionCatalogEntry &entry, idx_t offset) {
+		return Value();
+	}
+
+	static Value GetLanguageVersion(PragmaFunctionCatalogEntry &entry, idx_t offset) {
 		return Value();
 	}
 
@@ -828,6 +873,9 @@ bool ExtractFunctionData(CatalogEntry &entry, idx_t function_idx, DataChunk &out
 
 	// language, LogicalType::VARCHAR
 	output.data[col++].Append(OP::GetLanguage(function, function_idx));
+
+	// language_version, LogicalType::VARCHAR
+	output.data[col++].Append(OP::GetLanguageVersion(function, function_idx));
 
 	return function_idx + 1 == OP::FunctionCount(function);
 }

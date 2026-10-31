@@ -51,6 +51,8 @@ public:
 	vector<LogicalType> types;
 	//! The declared return type, UNKNOWN when none was declared: the member's result is cast to it
 	LogicalType return_type = LogicalType::UNKNOWN;
+	//! Indexes of parameters a language declares as relations (TABLE(col TYPE, ...) parameters)
+	vector<idx_t> relation_parameters;
 
 public:
 	virtual ~MacroFunction() {

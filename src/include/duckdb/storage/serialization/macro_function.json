@@ -35,6 +35,13 @@
         "type": "LogicalType",
         "default": "LogicalType(LogicalTypeId::UNKNOWN)",
         "version": "v2.1.0"
+      },
+      {
+        "id": 105,
+        "name": "relation_parameters",
+        "type": "vector<idx_t>",
+        "default": "vector<idx_t>()",
+        "version": "v2.1.0"
       }
     ],
     "finalize_deserialization": [
@@ -92,6 +99,12 @@
         "id": 201,
         "name": "source",
         "type": "string"
+      },
+      {
+        "id": 202,
+        "name": "language_version",
+        "type": "string",
+        "default": "\"\""
       }
     ]
   },
@@ -122,6 +135,12 @@
         "id": 203,
         "name": "return_types",
         "type": "vector<LogicalType>"
+      },
+      {
+        "id": 204,
+        "name": "language_version",
+        "type": "string",
+        "default": "\"\""
       }
     ]
   }
