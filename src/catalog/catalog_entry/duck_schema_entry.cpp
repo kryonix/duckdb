@@ -242,7 +242,13 @@ optional_ptr<CatalogEntry> DuckSchemaEntry::CreateFunction(CatalogTransaction tr
 	case CatalogType::MACRO_ENTRY:
 	case CatalogType::TABLE_MACRO_ENTRY: {
 		auto &macro_info = info.Cast<CreateMacroInfo>();
-		if (macro_info.macros.size() == 1 && macro_info.macros[0]->IsLanguageMember()) {
+		// the overload-add path requires the member kind to match the targeted catalog set: a
+		// mismatched programmatic info falls through to the factory's kind rejection instead
+		const auto member_matches_entry =
+		    macro_info.macros.size() == 1 && macro_info.macros[0]->IsLanguageMember() &&
+		    (macro_info.macros[0]->type == MacroType::LANGUAGE_TABLE_MACRO ? CatalogType::TABLE_MACRO_ENTRY
+		                                                                   : CatalogType::MACRO_ENTRY) == info.type;
+		if (member_matches_entry) {
 			auto &catalog_set = GetCatalogSet(info.type);
 			auto existing_entry = catalog_set.GetEntry(transaction, info.GetFunctionName());
 			if (existing_entry && existing_entry->type == info.type) {

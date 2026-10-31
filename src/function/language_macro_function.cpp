@@ -187,6 +187,12 @@ void LanguageFunctionCreateInfo::PublishMemberSchema(idx_t member_idx, vector<Id
 			                        "unresolved column type, which is not allowed",
 			                        language, GetFunctionName());
 		}
+		if (!type.IsComplete()) {
+			// e.g. ANY or a container missing its type parameters, no concrete result column type
+			throw InternalException("The language binder for \"%s\" published a result schema for %s() with an "
+			                        "incomplete column type, which is not allowed",
+			                        language, GetFunctionName());
+		}
 	}
 	// freeze the published schema, like a declared one: the callback may retain references into the
 	// adopted vectors and into the shared type metadata
@@ -251,6 +257,20 @@ void LanguageFunctionCreateInfo::PublishMemberLanguageVersion(idx_t member_idx, 
 	member.language_version = std::move(version);
 }
 
+//! Exact spellings: Identifier equality is the case-insensitive SQL lookup equivalence, but a
+//! published name's identity is its stored spelling
+static bool SameNames(const vector<Identifier> &left, const vector<Identifier> &right) {
+	if (left.size() != right.size()) {
+		return false;
+	}
+	for (idx_t i = 0; i < left.size(); i++) {
+		if (left[i].GetIdentifierName() != right[i].GetIdentifierName()) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void LanguageFunctionCreateInfo::VerifyMemberState() const {
 	for (idx_t member_idx = 0; member_idx < members.size(); member_idx++) {
 		auto &member = *members[member_idx];
@@ -280,7 +300,7 @@ void LanguageFunctionCreateInfo::VerifyMemberState() const {
 			continue;
 		}
 		auto &table_member = member.Cast<LanguageTableMacroFunction>();
-		bool changed = state.return_names != table_member.return_names ||
+		bool changed = !SameNames(state.return_names, table_member.return_names) ||
 		               state.return_column_type_identities.size() != table_member.return_types.size();
 		for (idx_t col_idx = 0; !changed && col_idx < state.return_column_type_identities.size(); col_idx++) {
 			changed = state.return_column_type_identities[col_idx] !=
