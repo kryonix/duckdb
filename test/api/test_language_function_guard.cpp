@@ -3,6 +3,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
 #include "duckdb/function/language_macro_function.hpp"
+#include "duckdb/function/language_table_macro_function.hpp"
 #include "duckdb/main/language_function_binder.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/common/extension_type_info.hpp"
@@ -115,6 +116,168 @@ TEST_CASE("ValidateCreate publishes documentation through the create view", "[ap
 	auto result = con.Query("SELECT description FROM duckdb_functions() WHERE function_name = 'documented_fun'");
 	REQUIRE(CHECK_COLUMN(result, 0, {"doclang doc"}));
 }
+
+TEST_CASE("ValidateCreate publishes a schema and language version through the create view", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	RegisterTestLanguage(*db.instance, "publang", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		if (info.MemberIsTableFunction(0) && info.MemberReturnColumnCount(0) == 0) {
+			info.PublishMemberSchema(0, {Identifier("published")}, {LogicalType::INTEGER});
+		}
+		if (info.MemberLanguageVersion(0).empty()) {
+			info.PublishMemberLanguageVersion(0, "publang 7");
+		}
+	}));
+
+	// the bare RETURNS TABLE form stores an unresolved schema the binder may publish once
+	REQUIRE_NO_FAIL(con.Query("CREATE FUNCTION published_tf() RETURNS TABLE LANGUAGE publang AS 'x'"));
+	auto result = con.Query(
+	    "SELECT return_type, language_version FROM duckdb_functions() WHERE function_name = 'published_tf'");
+	REQUIRE(CHECK_COLUMN(result, 0, {"TABLE(published INTEGER)"}));
+	REQUIRE(CHECK_COLUMN(result, 1, {"publang 7"}));
+
+	// a declared schema reads back through the view
+	RegisterTestLanguage(*db.instance, "readcols", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		REQUIRE(info.MemberIsTableFunction(0));
+		REQUIRE(info.MemberReturnColumnCount(0) == 2);
+		REQUIRE(info.MemberReturnColumnName(0, 1) == Identifier("b"));
+		REQUIRE(info.MemberReturnColumnType(0, 1) == LogicalType::VARCHAR);
+	}));
+	REQUIRE_NO_FAIL(con.Query("CREATE FUNCTION declared_tf() RETURNS TABLE(a INTEGER, b VARCHAR) "
+	                          "LANGUAGE readcols AS 'x'"));
+}
+
+// the publish-once and identity checks raise InternalException, which aborts the process when
+// DUCKDB_CRASH_ON_ASSERT is set
+#ifndef DUCKDB_CRASH_ON_ASSERT
+
+TEST_CASE("Publishing over a declared or published schema is rejected", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	RegisterTestLanguage(*db.instance, "republ", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		info.PublishMemberSchema(0, {Identifier("x")}, {LogicalType::INTEGER});
+	}));
+
+	// publish-once only covers an EMPTY schema: a declared RETURNS TABLE shape is out of reach
+	auto result = con.Query("CREATE FUNCTION declared_repub() RETURNS TABLE(a INTEGER) LANGUAGE republ AS 'x'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "tried to change the result schema"));
+
+	// ... and a published schema is set exactly once
+	RegisterTestLanguage(*db.instance, "twicelang", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		info.PublishMemberSchema(0, {Identifier("x")}, {LogicalType::INTEGER});
+		info.PublishMemberSchema(0, {Identifier("y")}, {LogicalType::VARCHAR});
+	}));
+	result = con.Query("CREATE FUNCTION published_twice() RETURNS TABLE LANGUAGE twicelang AS 'x'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "tried to change the result schema"));
+}
+
+TEST_CASE("An invalid published schema is rejected", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	// a published schema must be as valid as a declared one: unique names, resolved types
+	RegisterTestLanguage(*db.instance, "duplang", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		info.PublishMemberSchema(0, {Identifier("x"), Identifier("x")},
+		                         {LogicalType::INTEGER, LogicalType::INTEGER});
+	}));
+	auto result = con.Query("CREATE FUNCTION dup_published() RETURNS TABLE LANGUAGE duplang AS 'x'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "duplicate column name"));
+
+	RegisterTestLanguage(*db.instance, "unknownlang", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		info.PublishMemberSchema(0, {Identifier("x")}, {LogicalType::UNKNOWN});
+	}));
+	result = con.Query("CREATE FUNCTION unknown_published() RETURNS TABLE LANGUAGE unknownlang AS 'x'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "unresolved column type"));
+
+	// ... also when the unresolved type hides below a concrete container
+	RegisterTestLanguage(*db.instance, "nestedunk", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		info.PublishMemberSchema(0, {Identifier("x")}, {LogicalType::STRUCT({{"m", LogicalType::UNKNOWN}})});
+	}));
+	result = con.Query("CREATE FUNCTION nested_published() RETURNS TABLE LANGUAGE nestedunk AS 'x'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "unresolved column type"));
+
+	// ... and name and type counts must line up
+	RegisterTestLanguage(*db.instance, "countlang", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		info.PublishMemberSchema(0, {Identifier("x")}, {LogicalType::INTEGER, LogicalType::INTEGER});
+	}));
+	result = con.Query("CREATE FUNCTION count_published() RETURNS TABLE LANGUAGE countlang AS 'x'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "column names and"));
+
+	// a schema cannot be published onto a scalar member
+	RegisterTestLanguage(*db.instance, "scalarpub", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		info.PublishMemberSchema(0, {Identifier("x")}, {LogicalType::INTEGER});
+	}));
+	result = con.Query("CREATE FUNCTION scalar_published() LANGUAGE scalarpub AS 'x'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "not a table function member"));
+}
+
+TEST_CASE("A language version change is rejected", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	RegisterTestLanguage(*db.instance, "verlang", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		info.PublishMemberLanguageVersion(0, "verlang 2");
+	}));
+
+	// publish-once: a definition arriving with a version must keep it (only constructible via the API)
+	auto info = make_uniq<CreateMacroInfo>(CatalogType::MACRO_ENTRY);
+	info->SetFunctionName(Identifier("versioned_fun"));
+	auto member = make_uniq<LanguageMacroFunction>("verlang", "x");
+	member->language_version = "verlang 1";
+	info->macros.push_back(std::move(member));
+	auto statement = make_uniq<CreateStatement>();
+	statement->info = std::move(info);
+	auto result = con.Query(std::move(statement));
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "tried to change the published language version"));
+}
+
+TEST_CASE("An in-place mutation of a result column type is rejected", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	// LogicalType copies share their type info: a binder that built a column type can keep a path
+	// to its extension metadata and mutate the stored schema in place, without any view call. The
+	// serialized-identity freeze is what makes the detached-copy convention enforceable.
+	RegisterTestLanguage(*db.instance, "mutlang", make_shared_ptr<ViewBinder>([](LanguageFunctionCreateInfo &info) {
+		auto ext_info = make_uniq<ExtensionTypeInfo>();
+		auto &ext_ref = *ext_info;
+		auto column_type = LogicalType(LogicalTypeId::INTEGER).WithExtensionInfo(std::move(ext_info));
+		info.PublishMemberSchema(0, {Identifier("x")}, {std::move(column_type)});
+		// mutate the published schema through the retained metadata reference
+		ext_ref.modifiers.emplace_back(Value::INTEGER(10));
+	}));
+
+	auto result = con.Query("CREATE FUNCTION mutated_published() RETURNS TABLE LANGUAGE mutlang AS 'x'");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "changed a declared or published result schema"));
+
+	// the same freeze covers a DECLARED schema, captured before the callback runs
+	optional_ptr<ExtensionTypeInfo> declared_ext;
+	RegisterTestLanguage(*db.instance, "mutdeclared",
+	                     make_shared_ptr<ViewBinder>([&declared_ext](LanguageFunctionCreateInfo &info) {
+		                     declared_ext->modifiers.emplace_back(Value::INTEGER(10));
+	                     }));
+	auto ext_info = make_uniq<ExtensionTypeInfo>();
+	declared_ext = ext_info.get();
+	auto info = make_uniq<CreateMacroInfo>(CatalogType::TABLE_MACRO_ENTRY);
+	info->SetFunctionName(Identifier("mutated_declared"));
+	auto member = make_uniq<LanguageTableMacroFunction>("mutdeclared", "x");
+	member->return_names.emplace_back("c");
+	member->return_types.push_back(LogicalType(LogicalTypeId::INTEGER).WithExtensionInfo(std::move(ext_info)));
+	info->macros.push_back(std::move(member));
+	auto statement = make_uniq<CreateStatement>();
+	statement->info = std::move(info);
+	result = con.Query(std::move(statement));
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "changed a declared or published result schema"));
+}
+
+#endif
 
 TEST_CASE("Member mutations respect internal entry protection", "[api]") {
 	DuckDB db(nullptr);

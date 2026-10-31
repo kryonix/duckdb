@@ -2,7 +2,11 @@
 
 #include "duckdb/main/language_function_binder.hpp"
 
+#include "duckdb/common/serializer/binary_serializer.hpp"
+#include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/sql_identifier.hpp"
+#include "duckdb/common/type_visitor.hpp"
+#include "duckdb/function/language_table_macro_function.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 
 namespace duckdb {
@@ -46,6 +50,37 @@ string LanguageMacroFunction::ToSQL() const {
 	return prefix + " LANGUAGE " + SQLIdentifier::ToString(language) + " AS " + SQLString::ToString(source);
 }
 
+//! A complete identity for a frozen result column type: ordinary type equality ignores collations
+//! and treats extension metadata as a wildcard, so compare the serialized representation, which
+//! captures aliases, collations, modifiers, and nested types exactly
+static string ReturnColumnTypeIdentity(const LogicalType &type) {
+	Allocator allocator;
+	MemoryStream stream(allocator);
+	SerializationOptions options;
+	options.storage_compatibility = StorageCompatibility::Latest();
+	BinarySerializer serializer(stream, options);
+	serializer.Begin();
+	serializer.WriteProperty(100, "type", type);
+	serializer.End();
+	return string(char_ptr_cast(stream.GetData()), stream.GetPosition());
+}
+
+LanguageFunctionCreateInfo::LanguageFunctionCreateInfo(const Identifier &function_name,
+                                                       vector<unique_ptr<MacroFunction>> &members,
+                                                       vector<FunctionDescription> &descriptions)
+    : function_name(function_name), members(members), descriptions(descriptions) {
+	// freeze declared result schemas by serialized identity before the callback sees them
+	for (auto &member : members) {
+		vector<string> identities;
+		if (member->type == MacroType::LANGUAGE_TABLE_MACRO) {
+			for (auto &type : member->Cast<LanguageTableMacroFunction>().return_types) {
+				identities.push_back(ReturnColumnTypeIdentity(type));
+			}
+		}
+		return_type_identities.push_back(std::move(identities));
+	}
+}
+
 const string &LanguageFunctionCreateInfo::MemberLanguage(idx_t member_idx) const {
 	return LanguageMacroFunction::Get(*members[member_idx]).language;
 }
@@ -78,8 +113,111 @@ LogicalType LanguageFunctionCreateInfo::MemberReturnType(idx_t member_idx) const
 	return members[member_idx]->return_type;
 }
 
+idx_t LanguageFunctionCreateInfo::MemberReturnColumnCount(idx_t member_idx) const {
+	auto &member = *members[member_idx];
+	if (member.type != MacroType::LANGUAGE_TABLE_MACRO) {
+		return 0;
+	}
+	return member.Cast<LanguageTableMacroFunction>().return_names.size();
+}
+
+const Identifier &LanguageFunctionCreateInfo::MemberReturnColumnName(idx_t member_idx, idx_t col_idx) const {
+	return members[member_idx]->Cast<LanguageTableMacroFunction>().return_names[col_idx];
+}
+
+LogicalType LanguageFunctionCreateInfo::MemberReturnColumnType(idx_t member_idx, idx_t col_idx) const {
+	return members[member_idx]->Cast<LanguageTableMacroFunction>().return_types[col_idx];
+}
+
+const string &LanguageFunctionCreateInfo::MemberLanguageVersion(idx_t member_idx) const {
+	return LanguageMacroFunction::Get(*members[member_idx]).language_version;
+}
+
 void LanguageFunctionCreateInfo::SetMemberSource(idx_t member_idx, string source) {
 	LanguageMacroFunction::Get(*members[member_idx]).source = std::move(source);
+}
+
+void LanguageFunctionCreateInfo::PublishMemberSchema(idx_t member_idx, vector<Identifier> names,
+                                                     vector<LogicalType> types) {
+	auto &member = *members[member_idx];
+	auto &language = LanguageMacroFunction::Get(member).language;
+	if (member.type != MacroType::LANGUAGE_TABLE_MACRO) {
+		throw InternalException("The language binder for \"%s\" published a result schema for %s(), which is not a "
+		                        "table function member",
+		                        language, function_name);
+	}
+	auto &table_member = member.Cast<LanguageTableMacroFunction>();
+	if (!table_member.return_names.empty()) {
+		// publish-once: only an unresolved schema may be set, and never changed
+		throw InternalException("The language binder for \"%s\" tried to change the result schema of %s() during "
+		                        "validation, which is not allowed",
+		                        language, function_name);
+	}
+	if (names.empty() || names.size() != types.size()) {
+		throw InternalException("The language binder for \"%s\" published a result schema for %s() with %llu column "
+		                        "names and %llu column types, which is not allowed",
+		                        language, function_name, names.size(), types.size());
+	}
+	// a published schema must be as valid as a declared one
+	identifier_set_t published_names;
+	for (auto &name : names) {
+		if (!published_names.insert(name).second) {
+			throw InternalException("The language binder for \"%s\" published a result schema for %s() with a "
+			                        "duplicate column name %s, which is not allowed",
+			                        language, function_name, name);
+		}
+	}
+	for (auto &type : types) {
+		// recursively: an unresolved type may hide below a concrete container
+		const auto unresolved = [](const LogicalType &child) {
+			return child.id() == LogicalTypeId::UNKNOWN || child.id() == LogicalTypeId::UNBOUND ||
+			       child.id() == LogicalTypeId::INVALID;
+		};
+		if (TypeVisitor::Contains(type, unresolved)) {
+			throw InternalException("The language binder for \"%s\" published a result schema for %s() with an "
+			                        "unresolved column type, which is not allowed",
+			                        language, function_name);
+		}
+	}
+	// freeze the published column types by serialized identity, like declared ones
+	auto &identities = return_type_identities[member_idx];
+	D_ASSERT(identities.empty());
+	for (auto &type : types) {
+		identities.push_back(ReturnColumnTypeIdentity(type));
+	}
+	table_member.return_names = std::move(names);
+	table_member.return_types = std::move(types);
+}
+
+void LanguageFunctionCreateInfo::PublishMemberLanguageVersion(idx_t member_idx, string version) {
+	auto &member = LanguageMacroFunction::Get(*members[member_idx]);
+	if (!member.language_version.empty()) {
+		// publish-once: only an empty version may be set, and never changed
+		throw InternalException("The language binder for \"%s\" tried to change the published language version of "
+		                        "%s() during validation, which is not allowed",
+		                        member.language, function_name);
+	}
+	member.language_version = std::move(version);
+}
+
+void LanguageFunctionCreateInfo::VerifyReturnSchemaIdentity() const {
+	for (idx_t member_idx = 0; member_idx < members.size(); member_idx++) {
+		auto &member = *members[member_idx];
+		if (member.type != MacroType::LANGUAGE_TABLE_MACRO) {
+			continue;
+		}
+		auto &table_member = member.Cast<LanguageTableMacroFunction>();
+		auto &identities = return_type_identities[member_idx];
+		bool changed = identities.size() != table_member.return_types.size();
+		for (idx_t col_idx = 0; !changed && col_idx < identities.size(); col_idx++) {
+			changed = identities[col_idx] != ReturnColumnTypeIdentity(table_member.return_types[col_idx]);
+		}
+		if (changed) {
+			throw InternalException("The language binder for \"%s\" changed a declared or published result schema of "
+			                        "%s() during validation, which is not allowed",
+			                        table_member.language, function_name);
+		}
+	}
 }
 
 } // namespace duckdb
