@@ -12,6 +12,7 @@
 #include "duckdb/common/identifier.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/parser/parsed_data/create_function_info.hpp"
+#include "duckdb/parser/qualified_name.hpp"
 
 namespace duckdb {
 
@@ -40,12 +41,22 @@ struct BindResult;
 //! The view borrows from the definition under validation: it is only valid inside the callback.
 class LanguageFunctionCreateInfo {
 public:
-	LanguageFunctionCreateInfo(const Identifier &function_name, vector<unique_ptr<MacroFunction>> &members,
-	                           vector<FunctionDescription> &descriptions);
+	LanguageFunctionCreateInfo(const QualifiedName &qualified_name, const string &sql,
+	                           vector<unique_ptr<MacroFunction>> &members, vector<FunctionDescription> &descriptions);
 
 	//! The unqualified function name, for error messages
 	const Identifier &GetFunctionName() const {
-		return function_name;
+		return qualified_name.Name();
+	}
+	//! The resolved destination identity, e.g. for cross-kind name-conflict checks a language
+	//! enforces at CREATE
+	const QualifiedName &GetQualifiedFunctionName() const {
+		return qualified_name;
+	}
+	//! The verbatim CREATE statement text the definition was parsed from, empty when the definition
+	//! was built programmatically. A dialect transformer can recover spans SetMemberSource rewrites
+	const string &GetStatementText() const {
+		return sql;
 	}
 	//! The number of members in the definition under validation
 	idx_t MemberCount() const {
@@ -63,6 +74,10 @@ public:
 	string MemberParameterName(idx_t member_idx, idx_t param_idx) const;
 	//! A parameter's resolved type, UNKNOWN for an untyped parameter
 	LogicalType MemberParameterType(idx_t member_idx, idx_t param_idx) const;
+	//! A parameter's default expression as a detached copy, null when the parameter has none
+	unique_ptr<ParsedExpression> MemberParameterDefault(idx_t member_idx, idx_t param_idx) const;
+	//! The indexes of parameters a language declared as relations, empty while unpublished
+	const vector<idx_t> &MemberRelationParameters(idx_t member_idx) const;
 	//! A member's declared RETURNS type, UNKNOWN when none was declared
 	LogicalType MemberReturnType(idx_t member_idx) const;
 	//! The number of declared or published RETURNS TABLE columns of a table member, 0 while the
@@ -83,6 +98,10 @@ public:
 	//! Publish a member's language version, exactly once: legal only while the stored version is
 	//! empty. Informational, surfaced by duckdb_functions, not re-exported by SQL EXPORT
 	void PublishMemberLanguageVersion(idx_t member_idx, string version);
+	//! Publish a member's relation-parameter markers, exactly once: legal only while unset. Indexes
+	//! must be strictly increasing and name declared parameters. The semantics stay language-owned,
+	//! core stores the markers and does not consume them yet
+	void PublishMemberRelationParameters(idx_t member_idx, vector<idx_t> relation_parameters);
 	//! Publish documentation. A description must carry a member's parameter types, with ANY for
 	//! untyped parameters: documentation in any other shape is not released when its member is
 	//! replaced or dropped
@@ -97,7 +116,8 @@ public:
 	void VerifyReturnSchemaIdentity() const;
 
 private:
-	const Identifier &function_name;
+	const QualifiedName &qualified_name;
+	const string &sql;
 	vector<unique_ptr<MacroFunction>> &members;
 	vector<FunctionDescription> &descriptions;
 	//! Per member, the serialized identities of its result column types (empty for scalar members)
