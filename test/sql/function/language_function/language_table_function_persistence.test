@@ -114,6 +114,13 @@ SELECT function_type, language, parameter_types, macro_definition FROM duckdb_fu
 table_macro	testlang	[INTEGER]	rows:5
 table_macro	testlang	[]	rows:3
 
+# the published language version and the declared schemas replay from the WAL, with no binder to republish them
+query TT rowsort
+SELECT return_type, language_version FROM duckdb_functions() WHERE function_name = 'persistent_tf';
+----
+TABLE(i INTEGER)	testlang 1.0
+TABLE(i INTEGER, tag VARCHAR)	testlang 1.0
+
 # calling without the binder names the language and suggests loading it
 statement error
 SELECT * FROM ltfdb.main.persistent_tf();
@@ -179,6 +186,15 @@ SELECT function_type, language, parameter_types, macro_definition FROM duckdb_fu
 table_macro	testlang	[INTEGER]	rows:5
 table_macro	testlang	[]	rows:3
 
+# the version and the unresolved schema read back from the checkpoint: late_tf was created without
+# the binder, so it carries neither a version nor a published schema
+query TT rowsort
+SELECT return_type, language_version FROM duckdb_functions() WHERE function_name IN ('persistent_tf', 'late_tf');
+----
+NULL	NULL
+TABLE(i INTEGER)	testlang 1.0
+TABLE(i INTEGER, tag VARCHAR)	testlang 1.0
+
 # member-granular DROP works on the checkpointed entry without the binder
 statement ok
 USE ltfdb;
@@ -199,3 +215,18 @@ query TT
 SELECT parameter_types, macro_definition FROM duckdb_functions() WHERE function_name = 'persistent_tf';
 ----
 []	rows:3
+
+# the checkpointed unresolved member still binds its schema per call once the binder is back
+statement ok
+LOAD '{BUILD_DIRECTORY}/test/extension/language_function_demo.duckdb_extension';
+
+query I
+SELECT count(*) FROM ltfdb.main.late_tf();
+----
+2
+
+# ... and its stored definition stays unresolved
+query TT
+SELECT return_type, language_version FROM duckdb_functions() WHERE function_name = 'late_tf';
+----
+NULL	NULL

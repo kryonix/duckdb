@@ -363,6 +363,11 @@ TEST_CASE("ValidateCreate publishes relation parameters through the view", "[api
 	auto &entry = Catalog::GetEntry<TableMacroCatalogEntry>(*con.context, QualifiedName("memory", "main", "rel_tf"));
 	REQUIRE(entry.macros[0]->relation_parameters == vector<idx_t> {0});
 	con.Rollback();
+
+	// a language that registers no table support rejects table calls through the default seam
+	auto result = con.Query("SELECT * FROM rel_tf(1)");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "does not implement table function binding"));
 }
 
 #ifndef DUCKDB_CRASH_ON_ASSERT
