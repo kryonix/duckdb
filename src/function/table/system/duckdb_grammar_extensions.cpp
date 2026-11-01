@@ -11,7 +11,12 @@
 namespace duckdb {
 
 static bool IsActiveGrammarExtension(const ClientContext &context, const string &name) {
-	for (auto &active : ClientConfig::GetConfig(context).active_grammar_extensions) {
+	// the explicit selection is an immutable snapshot, unset means empty
+	auto selection = ClientConfig::GetConfig(context).active_grammar_extensions.atomic_load();
+	if (!selection) {
+		return false;
+	}
+	for (auto &active : *selection) {
 		if (StringUtil::CIEquals(active, name)) {
 			return true;
 		}
@@ -124,7 +129,8 @@ static void AddGrammarExtension(ClientContext &context, TableFunctionInput &data
 	if (IsActiveGrammarExtension(context, name)) {
 		return;
 	}
-	auto extensions = ClientConfig::GetConfig(context).active_grammar_extensions;
+	auto selection = ClientConfig::GetConfig(context).active_grammar_extensions.atomic_load();
+	auto extensions = selection ? *selection : vector<string>();
 	extensions.push_back(name);
 	SetActiveGrammarExtensions(context, extensions);
 }
@@ -135,8 +141,10 @@ static void RemoveGrammarExtension(ClientContext &context, TableFunctionInput &d
 	if (!IsActiveGrammarExtension(context, name)) {
 		return;
 	}
+	// IsActiveGrammarExtension above guarantees a non-null selection here
+	auto selection = ClientConfig::GetConfig(context).active_grammar_extensions.atomic_load();
 	vector<string> extensions;
-	for (auto &active : ClientConfig::GetConfig(context).active_grammar_extensions) {
+	for (auto &active : *selection) {
 		if (!StringUtil::CIEquals(active, name)) {
 			extensions.push_back(active);
 		}
