@@ -93,6 +93,18 @@ SELECT tdup.x, r.i FROM tdup LEFT JOIN LATERAL arg_rows(tdup.x) r ON true ORDER 
 1	0
 NULL	NULL
 
+# a declared parameter type with a correlated argument: the boundary cast applies per
+# driving row through the same pre-evaluation seam
+statement ok
+CREATE FUNCTION arg_rows_typed(n BIGINT) RETURNS TABLE(i BIGINT) LANGUAGE testlang AS 'rows:arg:0';
+
+query II
+SELECT t.x, r.i FROM t, arg_rows_typed(t.x) r ORDER BY t.x, r.i;
+----
+1	0
+2	0
+2	1
+
 # default parameters are filled in before the language binder sees the arguments
 statement ok
 CREATE FUNCTION defaulted_rows(n := 2) RETURNS TABLE(i BIGINT) LANGUAGE testlang AS 'rows:arg:0';
