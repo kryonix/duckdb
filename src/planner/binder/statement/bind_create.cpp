@@ -558,12 +558,17 @@ SchemaCatalogEntry &Binder::BindCreateFunctionInfo(CreateInfo &info) {
 			    });
 		}
 
-		// Constant-fold all default parameter expressions
+		// Constant-fold all default parameter expressions. A procedure's defaults stay expressions:
+		// every CALL expands anew and evaluates them like arguments, so a volatile default draws
+		// per call and a default of a call the procedure never reaches is never evaluated
 		identifier_map_t<Value> default_values;
 		identifier_set_t integer_literal_defaults;
 		for (auto &it : function->default_parameters) {
 			auto &param_name = it.first;
 			auto &param_expr = it.second;
+			if (function->type == MacroType::LANGUAGE_PROCEDURE_MACRO) {
+				continue;
+			}
 
 			if (param_expr->GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
 				auto value = param_expr->Cast<ConstantExpression>().GetLiteral().ToValue();
