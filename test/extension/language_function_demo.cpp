@@ -1,9 +1,11 @@
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/procedure_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_macro_catalog_entry.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/language_macro_function.hpp"
+#include "duckdb/function/language_procedure_function.hpp"
 #include "duckdb/function/language_table_macro_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/language_function_binder.hpp"
@@ -13,6 +15,7 @@
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression_binder.hpp"
@@ -28,6 +31,18 @@ public:
 			if (StringUtil::Contains(info.MemberSource(member_idx), "invalid")) {
 				throw BinderException("testlang: the source of %s may not contain the word \"invalid\"",
 				                      info.GetFunctionName());
+			}
+			if (info.MemberIsProcedure(member_idx)) {
+				if (!StringUtil::StartsWith(info.MemberSource(member_idx), "sql:")) {
+					// a testlang procedure expands the statements its 'sql:...' source denotes
+					throw BinderException("testlang: the source of procedure %s must have the form 'sql:...'",
+					                      info.GetFunctionName());
+				}
+				if (StringUtil::Contains(info.MemberSource(member_idx), "__PUBLISH__") &&
+				    info.MemberReturnColumnCount(member_idx) == 0) {
+					// publish-once: resolve an undeclared result schema at CREATE, like an inferring language
+					info.PublishMemberSchema(member_idx, {Identifier("i")}, {LogicalType::BIGINT});
+				}
 			}
 			if (info.MemberIsTableFunction(member_idx)) {
 				if (!StringUtil::StartsWith(info.MemberSource(member_idx), "rows:")) {
@@ -150,6 +165,33 @@ public:
 		auto statement = make_uniq<SelectStatement>();
 		statement->node = std::move(select);
 		return statement;
+	}
+
+	void ExpandCall(ClientContext &context, ProcedureCatalogEntry &entry, LanguageProcedureFunction &member,
+	                vector<unique_ptr<ParsedExpression>> arguments,
+	                vector<unique_ptr<SQLStatement>> &statements) override {
+		// the source 'sql:<statements>' expands verbatim, with __ARG<i>__ spliced as the i-th
+		// UNEVALUATED argument expression's text and __PUBLISH__ dropped (it only directs
+		// ValidateCreate). An empty remainder is the empty expansion.
+		if (!StringUtil::StartsWith(member.source, "sql:")) {
+			throw BinderException("testlang: the source of procedure \"%s\" is not a 'sql:' spec",
+			                      entry.name.GetIdentifierName());
+		}
+		auto text = member.source.substr(4);
+		text = StringUtil::Replace(text, "__PUBLISH__", "");
+		for (idx_t i = 0; i < arguments.size(); i++) {
+			text = StringUtil::Replace(text, "__ARG" + to_string(i) + "__", arguments[i]->ToString());
+		}
+		auto trimmed = text;
+		StringUtil::Trim(trimmed);
+		if (trimmed.empty()) {
+			return;
+		}
+		Parser parser(context);
+		parser.ParseQuery(text);
+		for (auto &statement : parser.statements) {
+			statements.push_back(std::move(statement));
+		}
 	}
 };
 

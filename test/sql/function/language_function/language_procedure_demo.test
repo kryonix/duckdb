@@ -1,0 +1,255 @@
+# name: test/sql/function/language_function/language_procedure_demo.test
+# description: Procedure CALL expansion behavior with a registered binder (testlang demo extension)
+# group: [language_function]
+
+# Language function tests manage their own storage version (persistent entries need v2.1.0+)
+require noforcestorage
+
+require skip_reload
+
+require allow_unsigned_extensions
+
+statement ok
+LOAD '{BUILD_DIRECTORY}/test/extension/language_function_demo.duckdb_extension';
+
+statement ok
+CREATE TABLE sink(v BIGINT);
+
+# a CALL expands into the statement sequence and the row-returning statement is the result
+statement ok
+CREATE PROCEDURE add_and_count(x BIGINT) RETURNS TABLE(n BIGINT) LANGUAGE testlang AS
+'sql:INSERT INTO sink VALUES (__ARG0__); SELECT count(*)::BIGINT AS n FROM sink;';
+
+query I
+CALL add_and_count(7);
+----
+1
+
+query I
+CALL add_and_count(2 + 2);
+----
+2
+
+query I
+SELECT sum(v) FROM sink;
+----
+11
+
+# a procedure without a RETURNS schema yields nothing
+statement ok
+CREATE PROCEDURE add_only(x BIGINT) LANGUAGE testlang AS 'sql:INSERT INTO sink VALUES (__ARG0__);';
+
+statement ok
+CALL add_only(100);
+
+query I
+SELECT sum(v) FROM sink;
+----
+111
+
+# an empty expansion is legal and yields nothing
+statement ok
+CREATE PROCEDURE noop() LANGUAGE testlang AS 'sql:';
+
+statement ok
+CALL noop();
+
+# the declared schema casts the result statement column-wise
+statement ok
+CREATE PROCEDURE narrow() RETURNS TABLE(t TINYINT) LANGUAGE testlang AS 'sql:SELECT 5::BIGINT;';
+
+query I
+CALL narrow();
+----
+5
+
+# ---------------------------------------------------------------------------
+# transactions: atomic per CALL in autocommit
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE PROCEDURE add_then_fail(x BIGINT) LANGUAGE testlang AS
+'sql:INSERT INTO sink VALUES (__ARG0__); SELECT error(''mid-call failure'');';
+
+statement error
+CALL add_then_fail(1000);
+----
+mid-call failure
+
+# the insert rolled back with the failing call
+query I
+SELECT sum(v) FROM sink;
+----
+111
+
+# participation without commit inside an explicit transaction
+statement ok
+BEGIN;
+
+statement ok
+CALL add_only(500);
+
+query I
+SELECT sum(v) FROM sink;
+----
+611
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT sum(v) FROM sink;
+----
+111
+
+# a failing CALL aborts the enclosing explicit transaction
+statement ok
+BEGIN;
+
+statement error
+CALL add_then_fail(1);
+----
+mid-call failure
+
+statement error
+SELECT 1;
+----
+<REGEX>:.*(transaction is aborted|Current transaction is aborted).*
+
+statement ok
+ROLLBACK;
+
+# per-statement binding within a call: a later statement binds against what an earlier one
+# created, and the row-returning statement is last per the one-result-statement rule
+statement ok
+CREATE PROCEDURE create_and_read() RETURNS TABLE(c BIGINT) LANGUAGE testlang AS
+'sql:CREATE OR REPLACE TEMP TABLE call_local AS SELECT 42 AS a; INSERT INTO call_local VALUES (43); SELECT count(*)::BIGINT AS c FROM call_local;';
+
+query I
+CALL create_and_read();
+----
+2
+
+# ---------------------------------------------------------------------------
+# transaction statements are rejected in any expansion size
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE PROCEDURE smuggle_commit() LANGUAGE testlang AS 'sql:COMMIT;';
+
+statement error
+CALL smuggle_commit();
+----
+<REGEX>:.*CALL expansion cannot contain a transaction statement.*
+
+statement ok
+CREATE PROCEDURE smuggle_commit2() LANGUAGE testlang AS 'sql:SELECT 1; COMMIT;';
+
+statement error
+CALL smuggle_commit2();
+----
+<REGEX>:.*cannot contain a transaction statement.*
+
+# ---------------------------------------------------------------------------
+# prepared CALL always re-expands; parameters are rejected
+# ---------------------------------------------------------------------------
+
+# SQL-level PREPARE of a CALL is rejected at parse, like PRAGMA: the always-re-expand
+# contract lives on the client Prepare API (pinned in the C++ guard tests)
+statement error
+PREPARE call_versioned AS CALL noop();
+----
+<REGEX>:.*not a preparable statement.*
+
+# ---------------------------------------------------------------------------
+# overloads, named arguments, defaults
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE PROCEDURE routed() RETURNS TABLE(n BIGINT) LANGUAGE testlang AS 'sql:SELECT 0::BIGINT;';
+
+statement ok
+CREATE PROCEDURE routed(a BIGINT, b := 10) RETURNS TABLE(n BIGINT) LANGUAGE testlang AS
+'sql:SELECT (__ARG0__ + __ARG1__)::BIGINT;';
+
+query I
+CALL routed();
+----
+0
+
+query I
+CALL routed(1);
+----
+11
+
+query I
+CALL routed(1, b := 100);
+----
+101
+
+# member-granular DROP composes with the signature drop
+statement ok
+DROP PROCEDURE routed(BIGINT, ANY);
+
+query I
+CALL routed();
+----
+0
+
+# ---------------------------------------------------------------------------
+# publish-once schema resolution at CREATE
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE PROCEDURE published() LANGUAGE testlang AS 'sql:__PUBLISH__SELECT 9::BIGINT AS i;';
+
+query I
+SELECT return_type FROM duckdb_functions() WHERE function_name = 'published';
+----
+TABLE(i BIGINT)
+
+query I
+CALL published();
+----
+9
+
+# ---------------------------------------------------------------------------
+# directed errors
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM add_and_count(1);
+----
+<REGEX>:.*is a procedure.*top-level CALL.*
+
+statement error
+SELECT add_and_count(1);
+----
+<REGEX>:.*is a procedure.*top-level CALL.*
+
+statement error
+EXPLAIN CALL add_and_count(1);
+----
+<REGEX>:.*is a procedure.*top-level CALL.*
+
+# a name is procedures-only: the same name cannot gain a function member
+statement error
+CREATE FUNCTION add_only(y BIGINT) RETURNS BIGINT LANGUAGE testlang AS '42';
+----
+<REGEX>:.*already exists.*
+
+# CREATE-time validation runs through the same callback
+statement error
+CREATE PROCEDURE badsource() LANGUAGE testlang AS 'not-a-sql-spec';
+----
+<REGEX>:.*must have the form .sql:.*
+
+# a CALL inside an expansion binds down the ordinary path and lands on the directed error:
+# nested CALL resolution is extension-side by contract, core never re-expands mid-sequence
+statement ok
+CREATE PROCEDURE selfcall() LANGUAGE testlang AS 'sql:CALL selfcall();';
+
+statement error
+CALL selfcall();
+----
+<REGEX>:.*is a procedure.*top-level CALL.*

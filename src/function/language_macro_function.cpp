@@ -6,6 +6,7 @@
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/common/type_visitor.hpp"
+#include "duckdb/function/language_procedure_function.hpp"
 #include "duckdb/function/language_table_macro_function.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 
@@ -65,6 +66,23 @@ static string SerializedTypeIdentity(const LogicalType &type) {
 	return string(char_ptr_cast(stream.GetData()), stream.GetPosition());
 }
 
+//! The result-schema fields of a member kind that carries them (the table and procedure variants)
+static bool TryGetReturnSchema(MacroFunction &member, vector<Identifier> *&names, vector<LogicalType> *&types) {
+	if (member.type == MacroType::LANGUAGE_TABLE_MACRO) {
+		auto &table_member = member.Cast<LanguageTableMacroFunction>();
+		names = &table_member.return_names;
+		types = &table_member.return_types;
+		return true;
+	}
+	if (member.type == MacroType::LANGUAGE_PROCEDURE_MACRO) {
+		auto &procedure_member = member.Cast<LanguageProcedureFunction>();
+		names = &procedure_member.return_names;
+		types = &procedure_member.return_types;
+		return true;
+	}
+	return false;
+}
+
 LanguageFunctionCreateInfo::LanguageFunctionCreateInfo(const QualifiedName &qualified_name, const string &sql,
                                                        vector<unique_ptr<MacroFunction>> &members,
                                                        vector<FunctionDescription> &descriptions)
@@ -79,10 +97,11 @@ LanguageFunctionCreateInfo::LanguageFunctionCreateInfo(const QualifiedName &qual
 			state.parameter_type_identities.push_back(SerializedTypeIdentity(type));
 		}
 		state.return_type_identity = SerializedTypeIdentity(member->return_type);
-		if (member->type == MacroType::LANGUAGE_TABLE_MACRO) {
-			auto &table_member = member->Cast<LanguageTableMacroFunction>();
-			state.return_names = table_member.return_names;
-			for (auto &type : table_member.return_types) {
+		vector<Identifier> *schema_names;
+		vector<LogicalType> *schema_types;
+		if (TryGetReturnSchema(*member, schema_names, schema_types)) {
+			state.return_names = *schema_names;
+			for (auto &type : *schema_types) {
 				state.return_column_type_identities.push_back(SerializedTypeIdentity(type));
 			}
 		}
@@ -100,6 +119,10 @@ const string &LanguageFunctionCreateInfo::MemberSource(idx_t member_idx) const {
 
 bool LanguageFunctionCreateInfo::MemberIsTableFunction(idx_t member_idx) const {
 	return members[member_idx]->type == MacroType::LANGUAGE_TABLE_MACRO;
+}
+
+bool LanguageFunctionCreateInfo::MemberIsProcedure(idx_t member_idx) const {
+	return members[member_idx]->type == MacroType::LANGUAGE_PROCEDURE_MACRO;
 }
 
 idx_t LanguageFunctionCreateInfo::MemberParameterCount(idx_t member_idx) const {
@@ -123,19 +146,30 @@ LogicalType LanguageFunctionCreateInfo::MemberReturnType(idx_t member_idx) const
 }
 
 idx_t LanguageFunctionCreateInfo::MemberReturnColumnCount(idx_t member_idx) const {
-	auto &member = *members[member_idx];
-	if (member.type != MacroType::LANGUAGE_TABLE_MACRO) {
+	vector<Identifier> *names;
+	vector<LogicalType> *types;
+	if (!TryGetReturnSchema(*members[member_idx], names, types)) {
 		return 0;
 	}
-	return member.Cast<LanguageTableMacroFunction>().return_names.size();
+	return names->size();
 }
 
 const Identifier &LanguageFunctionCreateInfo::MemberReturnColumnName(idx_t member_idx, idx_t col_idx) const {
-	return members[member_idx]->Cast<LanguageTableMacroFunction>().return_names[col_idx];
+	vector<Identifier> *names;
+	vector<LogicalType> *types;
+	if (!TryGetReturnSchema(*members[member_idx], names, types)) {
+		throw InternalException("Member %llu of %s carries no result schema", member_idx, GetFunctionName());
+	}
+	return (*names)[col_idx];
 }
 
 LogicalType LanguageFunctionCreateInfo::MemberReturnColumnType(idx_t member_idx, idx_t col_idx) const {
-	return members[member_idx]->Cast<LanguageTableMacroFunction>().return_types[col_idx];
+	vector<Identifier> *names;
+	vector<LogicalType> *types;
+	if (!TryGetReturnSchema(*members[member_idx], names, types)) {
+		throw InternalException("Member %llu of %s carries no result schema", member_idx, GetFunctionName());
+	}
+	return (*types)[col_idx];
 }
 
 const string &LanguageFunctionCreateInfo::MemberLanguageVersion(idx_t member_idx) const {
@@ -150,13 +184,14 @@ void LanguageFunctionCreateInfo::PublishMemberSchema(idx_t member_idx, vector<Id
                                                      vector<LogicalType> types) {
 	auto &member = *members[member_idx];
 	auto &language = LanguageMacroFunction::Get(member).language;
-	if (member.type != MacroType::LANGUAGE_TABLE_MACRO) {
+	vector<Identifier> *member_names;
+	vector<LogicalType> *member_types;
+	if (!TryGetReturnSchema(member, member_names, member_types)) {
 		throw InternalException("The language binder for \"%s\" published a result schema for %s(), which is not a "
-		                        "table function member",
+		                        "table function or procedure member",
 		                        language, GetFunctionName());
 	}
-	auto &table_member = member.Cast<LanguageTableMacroFunction>();
-	if (!table_member.return_names.empty()) {
+	if (!member_names->empty()) {
 		// publish-once: only an unresolved schema may be set, and never changed
 		throw InternalException("The language binder for \"%s\" tried to change the result schema of %s() during "
 		                        "validation, which is not allowed",
@@ -202,8 +237,8 @@ void LanguageFunctionCreateInfo::PublishMemberSchema(idx_t member_idx, vector<Id
 	for (auto &type : types) {
 		state.return_column_type_identities.push_back(SerializedTypeIdentity(type));
 	}
-	table_member.return_names = std::move(names);
-	table_member.return_types = std::move(types);
+	*member_names = std::move(names);
+	*member_types = std::move(types);
 }
 
 unique_ptr<ParsedExpression> LanguageFunctionCreateInfo::MemberParameterDefault(idx_t member_idx,
@@ -296,20 +331,20 @@ void LanguageFunctionCreateInfo::VerifyMemberState() const {
 			                        "validation, which is not allowed",
 			                        language_member.language, GetFunctionName());
 		}
-		if (member.type != MacroType::LANGUAGE_TABLE_MACRO) {
+		vector<Identifier> *schema_names;
+		vector<LogicalType> *schema_types;
+		if (!TryGetReturnSchema(member, schema_names, schema_types)) {
 			continue;
 		}
-		auto &table_member = member.Cast<LanguageTableMacroFunction>();
-		bool changed = !SameNames(state.return_names, table_member.return_names) ||
-		               state.return_column_type_identities.size() != table_member.return_types.size();
+		bool changed = !SameNames(state.return_names, *schema_names) ||
+		               state.return_column_type_identities.size() != schema_types->size();
 		for (idx_t col_idx = 0; !changed && col_idx < state.return_column_type_identities.size(); col_idx++) {
-			changed = state.return_column_type_identities[col_idx] !=
-			          SerializedTypeIdentity(table_member.return_types[col_idx]);
+			changed = state.return_column_type_identities[col_idx] != SerializedTypeIdentity((*schema_types)[col_idx]);
 		}
 		if (changed) {
 			throw InternalException("The language binder for \"%s\" changed a declared or published result schema of "
 			                        "%s() during validation, which is not allowed",
-			                        table_member.language, GetFunctionName());
+			                        LanguageMacroFunction::Get(member).language, GetFunctionName());
 		}
 	}
 }

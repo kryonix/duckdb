@@ -1,0 +1,183 @@
+# name: test/sql/function/language_function/language_procedure_persistence.test
+# description: Procedures survive WAL replay, checkpoints, and EXPORT, with and without the extension loaded
+# group: [language_function]
+
+# Language function tests manage their own storage version (v2.1.0+) and extension loading
+require noforcestorage
+
+require skip_reload
+
+require allow_unsigned_extensions
+
+statement ok
+SET checkpoint_threshold = '10.0 GB';
+
+statement ok
+PRAGMA disable_checkpoint_on_shutdown;
+
+statement ok
+LOAD '{BUILD_DIRECTORY}/test/extension/language_function_demo.duckdb_extension';
+
+statement ok
+ATTACH '{TEST_DIR}/language_procedure_persistence.db' AS lpdb (STORAGE_VERSION 'v2.1.0');
+
+statement ok
+USE lpdb;
+
+statement ok
+CREATE TABLE lpdb_sink(v BIGINT);
+
+statement ok
+CREATE PROCEDURE persistent_p() RETURNS TABLE(n BIGINT) LANGUAGE testlang AS 'sql:SELECT 1::BIGINT;';
+
+statement ok
+CREATE PROCEDURE persistent_p(x BIGINT) LANGUAGE testlang AS 'sql:INSERT INTO lpdb.main.lpdb_sink VALUES (__ARG0__);';
+
+statement ok
+CREATE PROCEDURE dropped_p() LANGUAGE testlang AS 'sql:';
+
+statement ok
+DROP PROCEDURE dropped_p;
+
+statement ok
+CREATE PROCEDURE replaced_p() RETURNS TABLE(n BIGINT) LANGUAGE testlang AS 'sql:SELECT 1::BIGINT;';
+
+statement ok
+CREATE OR REPLACE PROCEDURE replaced_p() RETURNS TABLE(n BIGINT) LANGUAGE testlang AS 'sql:SELECT 2::BIGINT;';
+
+# Detach without checkpoint - the procedures must survive WAL replay
+statement ok
+USE memory;
+
+statement ok
+DETACH lpdb;
+
+statement ok
+ATTACH '{TEST_DIR}/language_procedure_persistence.db' AS lpdb;
+
+query TTT rowsort
+SELECT function_type, language, macro_definition FROM duckdb_functions() WHERE function_name = 'persistent_p' AND database_name = 'lpdb';
+----
+procedure	testlang	sql:INSERT INTO lpdb.main.lpdb_sink VALUES (__ARG0__);
+procedure	testlang	sql:SELECT 1::BIGINT;
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'dropped_p';
+----
+0
+
+query T
+SELECT macro_definition FROM duckdb_functions() WHERE function_name = 'replaced_p';
+----
+sql:SELECT 2::BIGINT;
+
+# the replayed procedure runs
+query I
+CALL lpdb.main.persistent_p();
+----
+1
+
+statement ok
+CALL lpdb.main.persistent_p(41);
+
+query I
+SELECT sum(v) FROM lpdb.main.lpdb_sink;
+----
+41
+
+# a checkpoint carries the entries without the WAL
+statement ok
+CHECKPOINT lpdb;
+
+statement ok
+USE memory;
+
+statement ok
+DETACH lpdb;
+
+statement ok
+ATTACH '{TEST_DIR}/language_procedure_persistence.db' AS lpdb;
+
+query I
+CALL lpdb.main.persistent_p();
+----
+1
+
+# EXPORT renders replayable CREATE PROCEDURE statements
+statement ok
+USE lpdb;
+
+statement ok
+EXPORT DATABASE '{TEST_DIR}/language_procedure_export';
+
+statement ok
+USE memory;
+
+statement ok
+ATTACH ':memory:' AS importdb;
+
+statement ok
+USE importdb;
+
+statement ok
+IMPORT DATABASE '{TEST_DIR}/language_procedure_export'
+
+query TT rowsort
+SELECT function_type, macro_definition FROM duckdb_functions() WHERE function_name = 'persistent_p' AND database_name = 'importdb';
+----
+procedure	sql:INSERT INTO lpdb.main.lpdb_sink VALUES (__ARG0__);
+procedure	sql:SELECT 1::BIGINT;
+
+statement ok
+USE memory;
+
+statement ok
+DETACH importdb;
+
+statement ok
+DETACH lpdb;
+
+# A fresh instance without the extension: replay must succeed without the binder
+restart no_extension_load
+
+statement ok
+ATTACH '{TEST_DIR}/language_procedure_persistence.db' AS lpdb;
+
+query TT rowsort
+SELECT function_type, macro_definition FROM duckdb_functions() WHERE function_name = 'persistent_p';
+----
+procedure	sql:INSERT INTO lpdb.main.lpdb_sink VALUES (__ARG0__);
+procedure	sql:SELECT 1::BIGINT;
+
+# calling without the binder names the language and suggests loading it
+statement error
+CALL lpdb.main.persistent_p();
+----
+<REGEX>:.*Missing Extension Error.*testlang.*no binder for that language is registered.*
+
+# a definition created without the binder is stored unvalidated
+statement ok
+USE lpdb;
+
+statement ok
+CREATE PROCEDURE late_p() LANGUAGE testlang AS 'sql:SELECT 3;';
+
+query T
+SELECT function_type FROM duckdb_functions() WHERE function_name = 'late_p';
+----
+procedure
+
+statement ok
+USE memory;
+
+statement ok
+DETACH lpdb;
+
+# the storage-version gate rejects persistent procedures below v2.1.0
+statement ok
+ATTACH '{TEST_DIR}/language_procedure_old.db' AS olddb (STORAGE_VERSION 'v1.0.0');
+
+statement error
+CREATE PROCEDURE olddb.main.gated() LANGUAGE testlang AS 'sql:';
+----
+<REGEX>:.*only supported for storage versions v2.1.0 and higher.*
