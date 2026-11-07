@@ -557,6 +557,10 @@ unique_ptr<PreparedStatement> ClientContext::PrepareInternal(ClientContextLock &
 		written_statement = statement->Copy();
 	}
 	const bool always_reexpand = statement->type == StatementType::CALL_STATEMENT;
+	if (always_reexpand && !statement->named_param_map.empty()) {
+		// parameters cannot thread through a re-expanded statement sequence
+		throw InvalidInputException(EXPANDING_PARAMETERS_ERROR);
+	}
 	auto expanded = PreprocessStatementInternal(lock, std::move(statement));
 	if (expanded.statements.size() != 1 || always_reexpand) {
 		D_ASSERT(written_statement);

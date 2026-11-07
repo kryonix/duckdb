@@ -2,10 +2,13 @@
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
+#include "duckdb/catalog/catalog_entry/procedure_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_macro_catalog_entry.hpp"
 #include "duckdb/function/language_macro_function.hpp"
+#include "duckdb/function/language_procedure_function.hpp"
 #include "duckdb/function/language_table_macro_function.hpp"
 #include "duckdb/main/language_function_binder.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/common/extension_type_info.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
@@ -46,6 +49,16 @@ public:
 	                          vector<unique_ptr<ParsedExpression>> arguments, idx_t depth) override {
 		// the compiled form is the constant the source denotes, like the testlang demo
 		return BindResult(make_uniq<BoundConstantExpression>(Value(member.source)));
+	}
+	void ExpandCall(ClientContext &context, ProcedureCatalogEntry &entry, LanguageProcedureFunction &member,
+	                vector<unique_ptr<ParsedExpression>> arguments,
+	                vector<unique_ptr<SQLStatement>> &statements) override {
+		// the expansion is the member source parsed verbatim, like the testlang demo
+		Parser parser(context);
+		parser.ParseQuery(member.source);
+		for (auto &statement : parser.statements) {
+			statements.push_back(std::move(statement));
+		}
 	}
 
 private:
@@ -148,6 +161,30 @@ TEST_CASE("ValidateCreate publishes a schema and language version through the cr
 	                          "LANGUAGE readcols AS 'x'"));
 }
 
+TEST_CASE("A prepared CALL re-expands at every execution", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	RegisterTestLanguage(*db.instance, "preplang", make_shared_ptr<ViewBinder>(nullptr));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE PROCEDURE prep_p() RETURNS TABLE(n BIGINT) LANGUAGE preplang AS "
+	                          "'SELECT 1::BIGINT AS n'"));
+	// the client Prepare API keeps the written CALL and re-expands it at each execution, so a
+	// member replacement between executions is visible (SQL-level PREPARE rejects CALL at parse)
+	auto prepared = con.Prepare("CALL prep_p()");
+	REQUIRE_FALSE(prepared->HasError());
+	auto result = prepared->Execute();
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+	REQUIRE_NO_FAIL(con.Query("CREATE OR REPLACE PROCEDURE prep_p() RETURNS TABLE(n BIGINT) LANGUAGE preplang AS "
+	                          "'SELECT 2::BIGINT AS n'"));
+	result = prepared->Execute();
+	REQUIRE(CHECK_COLUMN(result, 0, {2}));
+
+	// a parameterized prepared CALL is rejected: parameters cannot thread through an expansion
+	auto parameterized = con.Prepare("CALL prep_p($1)");
+	REQUIRE(parameterized->HasError());
+	REQUIRE(StringUtil::Contains(parameterized->GetError(), "parameters"));
+}
+
 // the publish-once and identity checks raise InternalException, which aborts the process when
 // DUCKDB_CRASH_ON_ASSERT is set
 #ifndef DUCKDB_CRASH_ON_ASSERT
@@ -236,7 +273,7 @@ TEST_CASE("An invalid published schema is rejected", "[api]") {
 	}));
 	result = con.Query("CREATE FUNCTION scalar_published() LANGUAGE scalarpub AS 'x'");
 	REQUIRE_FAIL(result);
-	REQUIRE(StringUtil::Contains(result->GetError(), "not a table function member"));
+	REQUIRE(StringUtil::Contains(result->GetError(), "not a table function or procedure member"));
 }
 
 TEST_CASE("A language version change is rejected", "[api]") {
@@ -498,7 +535,7 @@ TEST_CASE("Direct catalog overload adds reject kind mismatches", "[api]") {
 	mismatched.internal = true;
 	mismatched.macros.push_back(make_uniq<LanguageMacroFunction>("kindlang", "y"));
 	REQUIRE_THROWS_WITH(schema.CreateFunction(data, mismatched),
-	                    Catch::Contains("cannot combine scalar and table language function members"));
+	                    Catch::Contains("cannot combine language function members of different kinds"));
 }
 
 #ifndef DUCKDB_CRASH_ON_ASSERT
@@ -1086,7 +1123,7 @@ TEST_CASE("Mixed scalar and table language members are rejected at CREATE", "[ap
 	statement->info = std::move(info);
 	auto result = con.Query(std::move(statement));
 	REQUIRE_FAIL(result);
-	REQUIRE(StringUtil::Contains(result->GetError(), "cannot combine scalar and table language function members"));
+	REQUIRE(StringUtil::Contains(result->GetError(), "cannot combine language function members of different kinds"));
 
 	// ... and in the other direction: a table member in a scalar entry
 	auto scalar_info = make_uniq<CreateMacroInfo>(CatalogType::MACRO_ENTRY);
@@ -1099,5 +1136,5 @@ TEST_CASE("Mixed scalar and table language members are rejected at CREATE", "[ap
 	statement->info = std::move(scalar_info);
 	result = con.Query(std::move(statement));
 	REQUIRE_FAIL(result);
-	REQUIRE(StringUtil::Contains(result->GetError(), "cannot combine scalar and table language function members"));
+	REQUIRE(StringUtil::Contains(result->GetError(), "cannot combine language function members of different kinds"));
 }
