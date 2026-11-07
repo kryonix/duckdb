@@ -1042,3 +1042,48 @@ TEST_CASE("Preparing an extracted dynamic PIVOT in the C API", "[capi][expanding
 	REQUIRE(statement_type == DUCKDB_STATEMENT_TYPE_MULTI);
 	RequirePivotRows(*result);
 }
+
+TEST_CASE("A prepared CALL keeps its parameters discoverable", "[capi]") {
+	// a CALL keeps its written form to re-resolve the target at every execution; the parser's
+	// parameter map must survive that path so C API clients can discover and bind parameters
+	CAPITester tester;
+	duckdb_result res;
+	duckdb_prepared_statement stmt = nullptr;
+
+	REQUIRE(tester.OpenDatabase(nullptr));
+
+	REQUIRE(duckdb_prepare(tester.connection, "CALL range($1)", &stmt) == DuckDBSuccess);
+	REQUIRE(duckdb_nparams(stmt) == 1);
+	REQUIRE(duckdb_bind_int32(stmt, 1, 3) == DuckDBSuccess);
+	REQUIRE(duckdb_execute_prepared(stmt, &res) == DuckDBSuccess);
+	REQUIRE(duckdb_row_count(&res) == 3);
+	duckdb_destroy_result(&res);
+	duckdb_destroy_prepare(&stmt);
+
+	// named parameters resolve by name and by cached index
+	REQUIRE(duckdb_prepare(tester.connection, "CALL range($stop)", &stmt) == DuckDBSuccess);
+	REQUIRE(duckdb_nparams(stmt) == 1);
+	idx_t param_idx = 0;
+	REQUIRE(duckdb_bind_parameter_index(stmt, &param_idx, "stop") == DuckDBSuccess);
+	REQUIRE(param_idx == 1);
+	auto name = duckdb_parameter_name(stmt, 1);
+	REQUIRE(string(name) == "stop");
+	duckdb_free((void *)name);
+	REQUIRE(duckdb_bind_int32(stmt, 1, 2) == DuckDBSuccess);
+	REQUIRE(duckdb_execute_prepared(stmt, &res) == DuckDBSuccess);
+	REQUIRE(duckdb_row_count(&res) == 2);
+	duckdb_destroy_result(&res);
+	duckdb_destroy_prepare(&stmt);
+
+	// the same discovery works through extracted-statement preparation
+	duckdb_extracted_statements extracted = nullptr;
+	REQUIRE(duckdb_extract_statements(tester.connection, "CALL range($1)", &extracted) == 1);
+	REQUIRE(duckdb_prepare_extracted_statement(tester.connection, extracted, 0, &stmt) == DuckDBSuccess);
+	REQUIRE(duckdb_nparams(stmt) == 1);
+	REQUIRE(duckdb_bind_int32(stmt, 1, 4) == DuckDBSuccess);
+	REQUIRE(duckdb_execute_prepared(stmt, &res) == DuckDBSuccess);
+	REQUIRE(duckdb_row_count(&res) == 4);
+	duckdb_destroy_result(&res);
+	duckdb_destroy_prepare(&stmt);
+	duckdb_destroy_extracted(&extracted);
+}

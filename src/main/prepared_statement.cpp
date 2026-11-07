@@ -20,6 +20,9 @@ PreparedStatement::PreparedStatement(const shared_ptr<ClientContext> &context_p,
 	info.types = {LogicalTypeId::UNKNOWN};
 	info.statement_type = written_statement->type;
 	info.properties.always_require_rebind = true;
+	// the parser's parameter map, so clients can discover and bind parameters; their types are
+	// only known at execution, like the result's
+	info.named_param_map = written_statement->named_param_map;
 }
 
 PreparedStatement::PreparedStatement(ErrorData error) : success(false), error(std::move(error)) {
