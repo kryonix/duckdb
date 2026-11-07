@@ -21,11 +21,14 @@ class ClientContext;
 class ExpressionBinder;
 class FunctionExpression;
 class LanguageMacroFunction;
+class LanguageProcedureFunction;
 class LanguageTableMacroFunction;
 class MacroFunction;
 class ParsedExpression;
+class ProcedureCatalogEntry;
 class ScalarMacroCatalogEntry;
 class SelectStatement;
+class SQLStatement;
 class TableMacroCatalogEntry;
 struct BindResult;
 
@@ -171,6 +174,16 @@ public:
 	virtual unique_ptr<SelectStatement> BindTableCall(Binder &binder, TableMacroCatalogEntry &entry,
 	                                                  LanguageTableMacroFunction &member,
 	                                                  vector<unique_ptr<ParsedExpression>> arguments);
+
+	//! Expand a top-level CALL of the already-selected procedure member into the statement sequence
+	//! the context runs as one query in one transaction. Core has resolved the entry, the overload,
+	//! named arguments, and defaults: arguments holds one UNEVALUATED expression per member
+	//! parameter, in declaration order. The statements bind and execute in order, each binding
+	//! after the previous one ran; at most one may return rows (the CALL's result). The default
+	//! raises a BinderException: a language without procedure support rejects CALLs cleanly.
+	virtual void ExpandCall(ClientContext &context, ProcedureCatalogEntry &entry, LanguageProcedureFunction &member,
+	                        vector<unique_ptr<ParsedExpression>> arguments,
+	                        vector<unique_ptr<SQLStatement>> &statements);
 };
 
 } // namespace duckdb

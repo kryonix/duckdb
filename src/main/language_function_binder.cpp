@@ -1,7 +1,9 @@
 #include "duckdb/main/language_function_binder.hpp"
 
+#include "duckdb/catalog/catalog_entry/procedure_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_macro_catalog_entry.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/function/language_procedure_function.hpp"
 #include "duckdb/function/language_table_macro_function.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 
@@ -12,6 +14,15 @@ unique_ptr<SelectStatement> LanguageFunctionBinder::BindTableCall(Binder &binder
                                                                   vector<unique_ptr<ParsedExpression>> arguments) {
 	throw BinderException("Table function %s is a %s language function, but the registered %s binder does not "
 	                      "implement table function binding",
+	                      entry.name, member.language, member.language);
+}
+
+void LanguageFunctionBinder::ExpandCall(ClientContext &context, ProcedureCatalogEntry &entry,
+                                        LanguageProcedureFunction &member,
+                                        vector<unique_ptr<ParsedExpression>> arguments,
+                                        vector<unique_ptr<SQLStatement>> &statements) {
+	throw BinderException("%s is a %s procedure, but the registered %s binder does not implement procedure "
+	                      "expansion",
 	                      entry.name, member.language, member.language);
 }
 
