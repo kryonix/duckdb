@@ -475,6 +475,9 @@ static string EntryToString(const CatalogEntryInfo &info) {
 	case CatalogType::TABLE_MACRO_ENTRY: {
 		return StringUtil::Format("table macro function %s", info.name);
 	}
+	case CatalogType::PROCEDURE_ENTRY: {
+		return StringUtil::Format("procedure %s", info.name);
+	}
 	case CatalogType::SECRET_ENTRY: {
 		return StringUtil::Format("secret %s", info.name);
 	}

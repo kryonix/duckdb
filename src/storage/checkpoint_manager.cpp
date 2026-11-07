@@ -4,6 +4,7 @@
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/procedure_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/sequence_catalog_entry.hpp"
@@ -200,7 +201,7 @@ static catalog_entry_vector_t GetCatalogEntries(vector<reference<DuckSchemaEntry
 			if (entry.internal) {
 				return;
 			}
-			if (entry.type == CatalogType::MACRO_ENTRY) {
+			if (entry.type == CatalogType::MACRO_ENTRY || entry.type == CatalogType::PROCEDURE_ENTRY) {
 				entries.push_back(entry);
 			}
 		});
@@ -502,6 +503,11 @@ void CheckpointWriter::WriteEntry(CatalogEntry &entry, Serializer &serializer) {
 		WriteTableMacro(macro, serializer);
 		break;
 	}
+	case CatalogType::PROCEDURE_ENTRY: {
+		auto &procedure = entry.Cast<ProcedureCatalogEntry>();
+		WriteProcedure(procedure, serializer);
+		break;
+	}
 	case CatalogType::INDEX_ENTRY: {
 		auto &index = entry.Cast<IndexCatalogEntry>();
 		WriteIndex(index, serializer);
@@ -568,6 +574,10 @@ void CheckpointReader::ReadEntry(CatalogTransaction transaction, Deserializer &d
 	}
 	case CatalogType::TABLE_MACRO_ENTRY: {
 		ReadTableMacro(transaction, deserializer);
+		break;
+	}
+	case CatalogType::PROCEDURE_ENTRY: {
+		ReadProcedure(transaction, deserializer);
 		break;
 	}
 	case CatalogType::INDEX_ENTRY: {
@@ -740,6 +750,16 @@ void CheckpointWriter::WriteTableMacro(TableMacroCatalogEntry &macro, Serializer
 
 void CheckpointReader::ReadTableMacro(CatalogTransaction transaction, Deserializer &deserializer) {
 	auto info = ReadCreateInfo(deserializer, CatalogType::TABLE_MACRO_ENTRY, "table_macro");
+	auto &macro_info = info->Cast<CreateMacroInfo>();
+	catalog.CreateFunction(transaction, macro_info);
+}
+
+void CheckpointWriter::WriteProcedure(ProcedureCatalogEntry &procedure, Serializer &serializer) {
+	serializer.WriteProperty(100, "procedure", &procedure);
+}
+
+void CheckpointReader::ReadProcedure(CatalogTransaction transaction, Deserializer &deserializer) {
+	auto info = ReadCreateInfo(deserializer, CatalogType::PROCEDURE_ENTRY, "procedure");
 	auto &macro_info = info->Cast<CreateMacroInfo>();
 	catalog.CreateFunction(transaction, macro_info);
 }

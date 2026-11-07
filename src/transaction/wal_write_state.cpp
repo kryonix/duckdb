@@ -3,6 +3,7 @@
 #include "duckdb/catalog/catalog_entry/duck_index_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/procedure_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/trigger_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/type_catalog_entry.hpp"
@@ -64,6 +65,7 @@ void WALWriteState::WriteCatalogEntry(CatalogEntry &entry, data_ptr_t dataptr) {
 	case CatalogType::TYPE_ENTRY:
 	case CatalogType::MACRO_ENTRY:
 	case CatalogType::TABLE_MACRO_ENTRY:
+	case CatalogType::PROCEDURE_ENTRY:
 		if (entry.type == CatalogType::RENAMED_ENTRY || entry.type == parent.type) {
 			// ALTER statement, read the extra data after the entry
 			auto extra_data_size = Load<idx_t>(dataptr);
@@ -106,6 +108,9 @@ void WALWriteState::WriteCatalogEntry(CatalogEntry &entry, data_ptr_t dataptr) {
 			case CatalogType::TABLE_MACRO_ENTRY:
 				log.WriteCreateTableMacro(parent.Cast<TableMacroCatalogEntry>());
 				break;
+			case CatalogType::PROCEDURE_ENTRY:
+				log.WriteCreateProcedure(parent.Cast<ProcedureCatalogEntry>());
+				break;
 			default:
 				throw InternalException("Don't know how to create this type!");
 			}
@@ -143,6 +148,9 @@ void WALWriteState::WriteCatalogEntry(CatalogEntry &entry, data_ptr_t dataptr) {
 			break;
 		case CatalogType::TABLE_MACRO_ENTRY:
 			log.WriteDropTableMacro(entry.Cast<TableMacroCatalogEntry>());
+			break;
+		case CatalogType::PROCEDURE_ENTRY:
+			log.WriteDropProcedure(entry.Cast<ProcedureCatalogEntry>());
 			break;
 		case CatalogType::TYPE_ENTRY:
 			log.WriteDropType(entry.Cast<TypeCatalogEntry>());

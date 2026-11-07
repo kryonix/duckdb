@@ -39,6 +39,7 @@ enum class CatalogType : uint8_t {
 	MACRO_ENTRY = 30,
 	TABLE_MACRO_ENTRY = 31,
 	WINDOW_FUNCTION_ENTRY = 32,
+	PROCEDURE_ENTRY = 33,
 
 	// version info
 	DELETED_ENTRY = 51,

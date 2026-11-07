@@ -7,6 +7,7 @@
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/catalog/catalog_entry/language_catalog_entry.hpp"
 #include "duckdb/function/language_macro_function.hpp"
+#include "duckdb/function/language_procedure_function.hpp"
 #include "duckdb/function/language_table_macro_function.hpp"
 #include "duckdb/function/scalar_macro_function.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
@@ -487,11 +488,14 @@ SchemaCatalogEntry &Binder::BindCreateFunctionInfo(CreateInfo &info) {
 			continue;
 		}
 		// a language member's kind must match the entry kind: dispatch derives it from the members
-		const auto member_entry_type = function->type == MacroType::LANGUAGE_TABLE_MACRO
-		                                   ? CatalogType::TABLE_MACRO_ENTRY
-		                                   : CatalogType::MACRO_ENTRY;
+		auto member_entry_type = CatalogType::MACRO_ENTRY;
+		if (function->type == MacroType::LANGUAGE_TABLE_MACRO) {
+			member_entry_type = CatalogType::TABLE_MACRO_ENTRY;
+		} else if (function->type == MacroType::LANGUAGE_PROCEDURE_MACRO) {
+			member_entry_type = CatalogType::PROCEDURE_ENTRY;
+		}
 		if (info.type != member_entry_type) {
-			throw BinderException("Macro %s() cannot combine scalar and table language function members in one entry",
+			throw BinderException("Macro %s() cannot combine language function members of different kinds in one entry",
 			                      base.GetFunctionName());
 		}
 		auto &language_member = LanguageMacroFunction::Get(*function);
@@ -596,10 +600,12 @@ SchemaCatalogEntry &Binder::BindCreateFunctionInfo(CreateInfo &info) {
 
 		// Resolve user types in the declared RETURNS TABLE columns (empty while unresolved),
 		// recursively like parameter types
-		if (function->type == MacroType::LANGUAGE_TABLE_MACRO) {
-			D_ASSERT(info.type == CatalogType::TABLE_MACRO_ENTRY);
-			auto &table_member = function->Cast<LanguageTableMacroFunction>();
-			for (auto &column_type : table_member.return_types) {
+		if (function->type == MacroType::LANGUAGE_TABLE_MACRO ||
+		    function->type == MacroType::LANGUAGE_PROCEDURE_MACRO) {
+			auto &return_types = function->type == MacroType::LANGUAGE_TABLE_MACRO
+			                         ? function->Cast<LanguageTableMacroFunction>().return_types
+			                         : function->Cast<LanguageProcedureFunction>().return_types;
+			for (auto &column_type : return_types) {
 				BindLogicalType(column_type);
 				if (!column_type.IsComplete()) {
 					// e.g. ANY: the declared schema is the fixed result shape of every call
@@ -1032,7 +1038,8 @@ BoundStatement Binder::Bind(CreateStatement &stmt) {
 		    make_uniq<LogicalCreate>(LogicalOperatorType::LOGICAL_CREATE_SEQUENCE, std::move(stmt.info), &schema);
 		break;
 	}
-	case CatalogType::TABLE_MACRO_ENTRY: {
+	case CatalogType::TABLE_MACRO_ENTRY:
+	case CatalogType::PROCEDURE_ENTRY: {
 		auto &schema = BindCreateFunctionInfo(*stmt.info);
 		result.plan =
 		    make_uniq<LogicalCreate>(LogicalOperatorType::LOGICAL_CREATE_MACRO, std::move(stmt.info), &schema);

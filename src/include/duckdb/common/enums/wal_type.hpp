@@ -55,6 +55,9 @@ enum class WALType : uint8_t {
 
 	CREATE_TRIGGER = 30,
 	DROP_TRIGGER = 31,
+
+	CREATE_PROCEDURE = 32,
+	DROP_PROCEDURE = 33,
 	// -----------------------------
 	// Flush
 	// -----------------------------

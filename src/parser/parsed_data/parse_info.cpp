@@ -28,6 +28,8 @@ string ParseInfo::TypeToString(CatalogType type) {
 		return "MACRO";
 	case CatalogType::TABLE_MACRO_ENTRY:
 		return "MACRO TABLE";
+	case CatalogType::PROCEDURE_ENTRY:
+		return "PROCEDURE";
 	case CatalogType::SECRET_ENTRY:
 		return "SECRET";
 	case CatalogType::TRIGGER_ENTRY:

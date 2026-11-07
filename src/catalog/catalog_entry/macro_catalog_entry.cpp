@@ -1,5 +1,6 @@
 #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/procedure_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_macro_catalog_entry.hpp"
 #include "duckdb/function/scalar_macro_function.hpp"
 #include "duckdb/function/language_macro_function.hpp"
@@ -11,7 +12,8 @@ MacroCatalogEntry::MacroCatalogEntry(Catalog &catalog, SchemaCatalogEntry &schem
     : FunctionEntry(
           (info.macros[0]->type == MacroType::TABLE_MACRO || info.macros[0]->type == MacroType::LANGUAGE_TABLE_MACRO
                ? CatalogType::TABLE_MACRO_ENTRY
-               : CatalogType::MACRO_ENTRY),
+               : (info.macros[0]->type == MacroType::LANGUAGE_PROCEDURE_MACRO ? CatalogType::PROCEDURE_ENTRY
+                                                                              : CatalogType::MACRO_ENTRY)),
           catalog, schema, info),
       macros(std::move(info.macros)) {
 	this->temporary = info.temporary;
@@ -32,10 +34,14 @@ unique_ptr<MacroCatalogEntry> MacroCatalogEntry::Create(Catalog &catalog, Schema
 		if (!member.IsLanguageMember()) {
 			continue;
 		}
-		const auto member_entry_type =
-		    member.type == MacroType::LANGUAGE_TABLE_MACRO ? CatalogType::TABLE_MACRO_ENTRY : CatalogType::MACRO_ENTRY;
+		auto member_entry_type = CatalogType::MACRO_ENTRY;
+		if (member.type == MacroType::LANGUAGE_TABLE_MACRO) {
+			member_entry_type = CatalogType::TABLE_MACRO_ENTRY;
+		} else if (member.type == MacroType::LANGUAGE_PROCEDURE_MACRO) {
+			member_entry_type = CatalogType::PROCEDURE_ENTRY;
+		}
 		if (member_entry_type != info.type) {
-			throw CatalogException("Macro %s cannot combine scalar and table language function members in one entry",
+			throw CatalogException("Macro %s cannot combine language function members of different kinds in one entry",
 			                       info.GetFunctionName());
 		}
 	}
@@ -66,6 +72,9 @@ unique_ptr<MacroCatalogEntry> MacroCatalogEntry::Create(Catalog &catalog, Schema
 	if (info.type == CatalogType::TABLE_MACRO_ENTRY) {
 		return make_uniq<TableMacroCatalogEntry>(catalog, schema, info);
 	}
+	if (info.type == CatalogType::PROCEDURE_ENTRY) {
+		return make_uniq<ProcedureCatalogEntry>(catalog, schema, info);
+	}
 	return make_uniq<ScalarMacroCatalogEntry>(catalog, schema, info);
 }
 
@@ -82,6 +91,17 @@ unique_ptr<CatalogEntry> ScalarMacroCatalogEntry::Copy(ClientContext &context) c
 
 TableMacroCatalogEntry::TableMacroCatalogEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateMacroInfo &info)
     : MacroCatalogEntry(catalog, schema, info) {
+}
+
+ProcedureCatalogEntry::ProcedureCatalogEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateMacroInfo &info)
+    : MacroCatalogEntry(catalog, schema, info) {
+}
+
+unique_ptr<CatalogEntry> ProcedureCatalogEntry::Copy(ClientContext &context) const {
+	auto info_copy = GetInfo();
+	auto &cast_info = info_copy->Cast<CreateMacroInfo>();
+	auto result = make_uniq<ProcedureCatalogEntry>(catalog, schema, cast_info);
+	return std::move(result);
 }
 
 unique_ptr<CatalogEntry> TableMacroCatalogEntry::Copy(ClientContext &context) const {

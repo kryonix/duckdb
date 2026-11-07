@@ -62,6 +62,9 @@ unique_ptr<CreateInfo> CreateInfo::Deserialize(Deserializer &deserializer) {
 	case CatalogType::MACRO_ENTRY:
 		result = CreateMacroInfo::Deserialize(deserializer);
 		break;
+	case CatalogType::PROCEDURE_ENTRY:
+		result = CreateMacroInfo::Deserialize(deserializer);
+		break;
 	case CatalogType::SCHEMA_ENTRY:
 		result = CreateSchemaInfo::Deserialize(deserializer);
 		break;

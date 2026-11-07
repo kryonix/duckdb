@@ -286,6 +286,8 @@ protected:
 		case WALType::UPDATE_TUPLE:
 		case WALType::CREATE_TRIGGER:
 		case WALType::DROP_TRIGGER:
+		case WALType::CREATE_PROCEDURE:
+		case WALType::DROP_PROCEDURE:
 			return true;
 		default:
 			return false;
@@ -316,6 +318,9 @@ protected:
 
 	void ReplayCreateTableMacro();
 	void ReplayDropTableMacro();
+
+	void ReplayCreateProcedure();
+	void ReplayDropProcedure();
 
 	void ReplayCreateIndex();
 	void ReplayDropIndex();
@@ -753,6 +758,12 @@ void WriteAheadLogDeserializer::ReplayEntry(WALType entry_type) {
 		break;
 	case WALType::DROP_TABLE_MACRO:
 		ReplayDropTableMacro();
+		break;
+	case WALType::CREATE_PROCEDURE:
+		ReplayCreateProcedure();
+		break;
+	case WALType::DROP_PROCEDURE:
+		ReplayDropProcedure();
 		break;
 	case WALType::CREATE_INDEX:
 		ReplayCreateIndex();
@@ -1274,6 +1285,26 @@ void WriteAheadLogDeserializer::ReplayCreateIndex() {
 	auto &table_index_list = storage.GetDataTableInfo()->GetIndexes();
 	state.replay_index_infos.emplace_back(table_index_list, std::move(unbound_index), table.oid, index_entry->oid,
 	                                      ConstraintCheckMode::DEFAULT);
+}
+
+void WriteAheadLogDeserializer::ReplayCreateProcedure() {
+	auto wal_entry = WALCreateProcedure::Deserialize(deserializer);
+	auto &entry = wal_entry.procedure;
+	if (DeserializeOnly()) {
+		return;
+	}
+	catalog.CreateFunction(context, entry->Cast<CreateMacroInfo>());
+}
+
+void WriteAheadLogDeserializer::ReplayDropProcedure() {
+	auto entry = WALDropProcedure::Deserialize(deserializer);
+	DropInfo info;
+	info.type = CatalogType::PROCEDURE_ENTRY;
+	info.SetQualifiedName(ReplayEntryName(catalog, entry.qualified_name));
+	if (DeserializeOnly()) {
+		return;
+	}
+	catalog.DropEntry(context, info);
 }
 
 void WriteAheadLogDeserializer::ReplayDropIndex() {

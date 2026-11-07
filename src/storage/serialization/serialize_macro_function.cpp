@@ -9,6 +9,7 @@
 #include "duckdb/function/scalar_macro_function.hpp"
 #include "duckdb/function/table_macro_function.hpp"
 #include "duckdb/function/language_macro_function.hpp"
+#include "duckdb/function/language_procedure_function.hpp"
 #include "duckdb/function/language_table_macro_function.hpp"
 
 namespace duckdb {
@@ -48,6 +49,9 @@ unique_ptr<MacroFunction> MacroFunction::Deserialize(Deserializer &deserializer)
 	case MacroType::LANGUAGE_MACRO:
 		result = LanguageMacroFunction::Deserialize(deserializer);
 		break;
+	case MacroType::LANGUAGE_PROCEDURE_MACRO:
+		result = LanguageProcedureFunction::Deserialize(deserializer);
+		break;
 	case MacroType::LANGUAGE_TABLE_MACRO:
 		result = LanguageTableMacroFunction::Deserialize(deserializer);
 		break;
@@ -83,6 +87,25 @@ unique_ptr<MacroFunction> LanguageMacroFunction::Deserialize(Deserializer &deser
 	deserializer.ReadPropertyWithDefault<string>(200, "language", result->language);
 	deserializer.ReadPropertyWithDefault<string>(201, "source", result->source);
 	deserializer.ReadPropertyWithExplicitDefault<string>(202, "language_version", result->language_version, "");
+	return std::move(result);
+}
+
+void LanguageProcedureFunction::Serialize(Serializer &serializer) const {
+	MacroFunction::Serialize(serializer);
+	serializer.WritePropertyWithDefault<string>(200, "language", language);
+	serializer.WritePropertyWithDefault<string>(201, "source", source);
+	serializer.WritePropertyWithDefault<vector<Identifier>>(202, "return_names", return_names);
+	serializer.WritePropertyWithDefault<vector<LogicalType>>(203, "return_types", return_types);
+	serializer.WritePropertyWithDefault<string>(204, "language_version", language_version, "");
+}
+
+unique_ptr<MacroFunction> LanguageProcedureFunction::Deserialize(Deserializer &deserializer) {
+	auto result = duckdb::unique_ptr<LanguageProcedureFunction>(new LanguageProcedureFunction());
+	deserializer.ReadPropertyWithDefault<string>(200, "language", result->language);
+	deserializer.ReadPropertyWithDefault<string>(201, "source", result->source);
+	deserializer.ReadPropertyWithDefault<vector<Identifier>>(202, "return_names", result->return_names);
+	deserializer.ReadPropertyWithDefault<vector<LogicalType>>(203, "return_types", result->return_types);
+	deserializer.ReadPropertyWithExplicitDefault<string>(204, "language_version", result->language_version, "");
 	return std::move(result);
 }
 

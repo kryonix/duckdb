@@ -25,7 +25,8 @@ enum class MacroType : uint8_t {
 	TABLE_MACRO = 1,
 	SCALAR_MACRO = 2,
 	LANGUAGE_MACRO = 3,
-	LANGUAGE_TABLE_MACRO = 4
+	LANGUAGE_TABLE_MACRO = 4,
+	LANGUAGE_PROCEDURE_MACRO = 5
 };
 
 struct MacroBindResult {

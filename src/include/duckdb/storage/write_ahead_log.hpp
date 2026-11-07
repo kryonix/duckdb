@@ -28,6 +28,7 @@ class DatabaseInstance;
 class SchemaCatalogEntry;
 class SequenceCatalogEntry;
 class ScalarMacroCatalogEntry;
+class ProcedureCatalogEntry;
 class ViewCatalogEntry;
 class TriggerCatalogEntry;
 class TypeCatalogEntry;
@@ -91,6 +92,9 @@ public:
 
 	void WriteCreateTableMacro(const TableMacroCatalogEntry &entry);
 	void WriteDropTableMacro(const TableMacroCatalogEntry &entry);
+
+	void WriteCreateProcedure(const ProcedureCatalogEntry &entry);
+	void WriteDropProcedure(const ProcedureCatalogEntry &entry);
 
 	void WriteCreateIndex(const IndexCatalogEntry &entry);
 	void WriteDropIndex(const IndexCatalogEntry &entry);

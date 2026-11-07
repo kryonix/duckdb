@@ -35,7 +35,8 @@ unique_ptr<LogicalOperator> Binder::BindCopyDatabaseSchema(Catalog &from_databas
 		auto create_info = entry.get().GetInfo();
 		// re-root the entry (keeping its possibly nested schema path) in the target database
 		create_info->SetQualifiedName(create_info->GetQualifiedName().WithCatalog(target_database_name));
-		if (create_info->type == CatalogType::MACRO_ENTRY || create_info->type == CatalogType::TABLE_MACRO_ENTRY) {
+		if (create_info->type == CatalogType::MACRO_ENTRY || create_info->type == CatalogType::TABLE_MACRO_ENTRY ||
+		    create_info->type == CatalogType::PROCEDURE_ENTRY) {
 			// this path bypasses the CREATE binder, enforce the storage-version gate here
 			CheckMacroStorageVersion(target_catalog, create_info->Cast<CreateMacroInfo>());
 		}
@@ -49,7 +50,8 @@ unique_ptr<LogicalOperator> Binder::BindCopyDatabaseSchema(Catalog &from_databas
 			altered_dependencies.AddDependency(altered_dep);
 		}
 		create_info->dependencies = altered_dependencies;
-		if (create_info->type == CatalogType::MACRO_ENTRY || create_info->type == CatalogType::TABLE_MACRO_ENTRY) {
+		if (create_info->type == CatalogType::MACRO_ENTRY || create_info->type == CatalogType::TABLE_MACRO_ENTRY ||
+		    create_info->type == CatalogType::PROCEDURE_ENTRY) {
 			// the members' recorded dependency attribution re-roots the same way
 			for (auto &member : create_info->Cast<CreateMacroInfo>().macros) {
 				LogicalDependencyList altered_member_dependencies;

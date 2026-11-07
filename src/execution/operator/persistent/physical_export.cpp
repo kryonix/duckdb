@@ -164,6 +164,11 @@ void PhysicalExport::ExtractEntries(ClientContext &context, vector<reference<Sch
 				result.macros.push_back(entry);
 			}
 		});
+		schema.Scan(context, CatalogType::PROCEDURE_ENTRY, [&](CatalogEntry &entry) {
+			if (!entry.internal && entry.type == CatalogType::PROCEDURE_ENTRY) {
+				result.macros.push_back(entry);
+			}
+		});
 	}
 }
 

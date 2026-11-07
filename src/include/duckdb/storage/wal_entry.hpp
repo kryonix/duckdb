@@ -189,6 +189,25 @@ struct WALDropMacro {
 	static WALDropMacro Deserialize(Deserializer &deserializer);
 };
 
+struct WALCreateProcedure {
+	unique_ptr<CreateInfo> procedure;
+
+	void Serialize(Serializer &serializer) const;
+	static WALCreateProcedure Deserialize(Deserializer &deserializer);
+};
+
+struct WALDropProcedure {
+	// the entry as a QualifiedName (the containing schema path + the entry name)
+	QualifiedName qualified_name;
+
+	WALDropProcedure() = default;
+	explicit WALDropProcedure(QualifiedName qualified_name_p) : qualified_name(std::move(qualified_name_p)) {
+	}
+
+	void Serialize(Serializer &serializer) const;
+	static WALDropProcedure Deserialize(Deserializer &deserializer);
+};
+
 struct WALCreateTableMacro {
 	unique_ptr<CreateInfo> table_macro;
 

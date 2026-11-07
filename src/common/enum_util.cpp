@@ -1248,6 +1248,7 @@ const StringUtil::EnumStringLiteral *GetCatalogTypeValues() {
 		{ static_cast<uint32_t>(CatalogType::MACRO_ENTRY), "MACRO_ENTRY" },
 		{ static_cast<uint32_t>(CatalogType::TABLE_MACRO_ENTRY), "TABLE_MACRO_ENTRY" },
 		{ static_cast<uint32_t>(CatalogType::WINDOW_FUNCTION_ENTRY), "WINDOW_FUNCTION_ENTRY" },
+		{ static_cast<uint32_t>(CatalogType::PROCEDURE_ENTRY), "PROCEDURE_ENTRY" },
 		{ static_cast<uint32_t>(CatalogType::DELETED_ENTRY), "DELETED_ENTRY" },
 		{ static_cast<uint32_t>(CatalogType::RENAMED_ENTRY), "RENAMED_ENTRY" },
 		{ static_cast<uint32_t>(CatalogType::SECRET_ENTRY), "SECRET_ENTRY" },
@@ -1260,12 +1261,12 @@ const StringUtil::EnumStringLiteral *GetCatalogTypeValues() {
 
 template<>
 const char* EnumUtil::ToChars<CatalogType>(CatalogType value) {
-	return StringUtil::EnumToString(GetCatalogTypeValues(), 27, "CatalogType", static_cast<uint32_t>(value));
+	return StringUtil::EnumToString(GetCatalogTypeValues(), 28, "CatalogType", static_cast<uint32_t>(value));
 }
 
 template<>
 CatalogType EnumUtil::FromString<CatalogType>(const char *value) {
-	return static_cast<CatalogType>(StringUtil::StringToEnum(GetCatalogTypeValues(), 27, "CatalogType", value));
+	return static_cast<CatalogType>(StringUtil::StringToEnum(GetCatalogTypeValues(), 28, "CatalogType", value));
 }
 
 const StringUtil::EnumStringLiteral *GetCheckpointAbortValues() {
@@ -4048,19 +4049,20 @@ const StringUtil::EnumStringLiteral *GetMacroTypeValues() {
 		{ static_cast<uint32_t>(MacroType::TABLE_MACRO), "TABLE_MACRO" },
 		{ static_cast<uint32_t>(MacroType::SCALAR_MACRO), "SCALAR_MACRO" },
 		{ static_cast<uint32_t>(MacroType::LANGUAGE_MACRO), "LANGUAGE_MACRO" },
-		{ static_cast<uint32_t>(MacroType::LANGUAGE_TABLE_MACRO), "LANGUAGE_TABLE_MACRO" }
+		{ static_cast<uint32_t>(MacroType::LANGUAGE_TABLE_MACRO), "LANGUAGE_TABLE_MACRO" },
+		{ static_cast<uint32_t>(MacroType::LANGUAGE_PROCEDURE_MACRO), "LANGUAGE_PROCEDURE_MACRO" }
 	};
 	return values;
 }
 
 template<>
 const char* EnumUtil::ToChars<MacroType>(MacroType value) {
-	return StringUtil::EnumToString(GetMacroTypeValues(), 5, "MacroType", static_cast<uint32_t>(value));
+	return StringUtil::EnumToString(GetMacroTypeValues(), 6, "MacroType", static_cast<uint32_t>(value));
 }
 
 template<>
 MacroType EnumUtil::FromString<MacroType>(const char *value) {
-	return static_cast<MacroType>(StringUtil::StringToEnum(GetMacroTypeValues(), 5, "MacroType", value));
+	return static_cast<MacroType>(StringUtil::StringToEnum(GetMacroTypeValues(), 6, "MacroType", value));
 }
 
 const StringUtil::EnumStringLiteral *GetMapInvalidReasonValues() {
@@ -7708,6 +7710,8 @@ const StringUtil::EnumStringLiteral *GetWALTypeValues() {
 		{ static_cast<uint32_t>(WALType::ROW_GROUP_DATA), "ROW_GROUP_DATA" },
 		{ static_cast<uint32_t>(WALType::CREATE_TRIGGER), "CREATE_TRIGGER" },
 		{ static_cast<uint32_t>(WALType::DROP_TRIGGER), "DROP_TRIGGER" },
+		{ static_cast<uint32_t>(WALType::CREATE_PROCEDURE), "CREATE_PROCEDURE" },
+		{ static_cast<uint32_t>(WALType::DROP_PROCEDURE), "DROP_PROCEDURE" },
 		{ static_cast<uint32_t>(WALType::WAL_VERSION), "WAL_VERSION" },
 		{ static_cast<uint32_t>(WALType::CHECKPOINT), "CHECKPOINT" },
 		{ static_cast<uint32_t>(WALType::WAL_FLUSH), "WAL_FLUSH" }
@@ -7717,12 +7721,12 @@ const StringUtil::EnumStringLiteral *GetWALTypeValues() {
 
 template<>
 const char* EnumUtil::ToChars<WALType>(WALType value) {
-	return StringUtil::EnumToString(GetWALTypeValues(), 29, "WALType", static_cast<uint32_t>(value));
+	return StringUtil::EnumToString(GetWALTypeValues(), 31, "WALType", static_cast<uint32_t>(value));
 }
 
 template<>
 WALType EnumUtil::FromString<WALType>(const char *value) {
-	return static_cast<WALType>(StringUtil::StringToEnum(GetWALTypeValues(), 29, "WALType", value));
+	return static_cast<WALType>(StringUtil::StringToEnum(GetWALTypeValues(), 31, "WALType", value));
 }
 
 const StringUtil::EnumStringLiteral *GetWindowAggregationModeValues() {

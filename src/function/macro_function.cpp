@@ -363,7 +363,8 @@ void MacroFunction::FinalizeDeserialization() {
 }
 
 bool MacroFunction::IsLanguageMember() const {
-	return type == MacroType::LANGUAGE_MACRO || type == MacroType::LANGUAGE_TABLE_MACRO;
+	return type == MacroType::LANGUAGE_MACRO || type == MacroType::LANGUAGE_TABLE_MACRO ||
+	       type == MacroType::LANGUAGE_PROCEDURE_MACRO;
 }
 
 bool MacroFunction::HasUntypedParameter() const {

@@ -288,6 +288,28 @@
     ]
   },
   {
+    "class": "WALCreateProcedure",
+    "pointer_type": "none",
+    "members": [
+      {
+        "id": 101,
+        "name": "procedure",
+        "type": "CreateInfo*"
+      }
+    ]
+  },
+  {
+    "class": "WALDropProcedure",
+    "pointer_type": "none",
+    "members": [
+      {
+        "id": 101,
+        "name": "qualified_name",
+        "type": "QualifiedName"
+      }
+    ]
+  },
+  {
     "class": "WALCreateTableMacro",
     "pointer_type": "none",
     "members": [

@@ -240,14 +240,19 @@ optional_ptr<CatalogEntry> DuckSchemaEntry::CreateFunction(CatalogTransaction tr
 		                                                                    info.Cast<CreateTableFunctionInfo>());
 		break;
 	case CatalogType::MACRO_ENTRY:
-	case CatalogType::TABLE_MACRO_ENTRY: {
+	case CatalogType::TABLE_MACRO_ENTRY:
+	case CatalogType::PROCEDURE_ENTRY: {
 		auto &macro_info = info.Cast<CreateMacroInfo>();
 		// the overload-add path requires the member kind to match the targeted catalog set: a
 		// mismatched programmatic info falls through to the factory's kind rejection instead
-		const auto member_matches_entry =
-		    macro_info.macros.size() == 1 && macro_info.macros[0]->IsLanguageMember() &&
-		    (macro_info.macros[0]->type == MacroType::LANGUAGE_TABLE_MACRO ? CatalogType::TABLE_MACRO_ENTRY
-		                                                                   : CatalogType::MACRO_ENTRY) == info.type;
+		auto first_member_entry_type = CatalogType::MACRO_ENTRY;
+		if (!macro_info.macros.empty() && macro_info.macros[0]->type == MacroType::LANGUAGE_TABLE_MACRO) {
+			first_member_entry_type = CatalogType::TABLE_MACRO_ENTRY;
+		} else if (!macro_info.macros.empty() && macro_info.macros[0]->type == MacroType::LANGUAGE_PROCEDURE_MACRO) {
+			first_member_entry_type = CatalogType::PROCEDURE_ENTRY;
+		}
+		const auto member_matches_entry = macro_info.macros.size() == 1 && macro_info.macros[0]->IsLanguageMember() &&
+		                                  first_member_entry_type == info.type;
 		if (member_matches_entry) {
 			auto &catalog_set = GetCatalogSet(info.type);
 			auto existing_entry = catalog_set.GetEntry(transaction, info.GetFunctionName());
@@ -507,7 +512,8 @@ void DuckSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 
 	if (info.extra_drop_info && info.extra_drop_info->info_type == ExtraDropInfoType::FUNCTION_SIGNATURE_INFO) {
 		if (existing_entry->type != CatalogType::MACRO_ENTRY &&
-		    existing_entry->type != CatalogType::TABLE_MACRO_ENTRY) {
+		    existing_entry->type != CatalogType::TABLE_MACRO_ENTRY &&
+		    existing_entry->type != CatalogType::PROCEDURE_ENTRY) {
 			throw CatalogException("Cannot drop %s with a parameter type list: dropping a single overload is only "
 			                       "supported for macros and functions",
 			                       info.GetQualifiedName().Name());
@@ -660,6 +666,7 @@ CatalogSet &DuckSchemaEntry::GetCatalogSet(CatalogType type) {
 	case CatalogType::SCALAR_FUNCTION_ENTRY:
 	case CatalogType::MACRO_ENTRY:
 	case CatalogType::WINDOW_FUNCTION_ENTRY:
+	case CatalogType::PROCEDURE_ENTRY:
 		return functions;
 	case CatalogType::SEQUENCE_ENTRY:
 		return sequences;

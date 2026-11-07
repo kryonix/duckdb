@@ -33,6 +33,16 @@ WALCreateMacro WALCreateMacro::Deserialize(Deserializer &deserializer) {
 	return result;
 }
 
+void WALCreateProcedure::Serialize(Serializer &serializer) const {
+	serializer.WritePropertyWithDefault<unique_ptr<CreateInfo>>(101, "procedure", procedure);
+}
+
+WALCreateProcedure WALCreateProcedure::Deserialize(Deserializer &deserializer) {
+	WALCreateProcedure result;
+	deserializer.ReadPropertyWithDefault<unique_ptr<CreateInfo>>(101, "procedure", result.procedure);
+	return result;
+}
+
 void WALCreateSchema::Serialize(Serializer &serializer) const {
 	if (!serializer.ShouldSerialize(StorageVersion::V2_0_0)) {
 		serializer.WritePropertyWithDefault<Identifier>(101, "schema", schema);
@@ -176,6 +186,16 @@ WALDropMacro WALDropMacro::Deserialize(Deserializer &deserializer) {
 	if (result.qualified_name.Path().empty()) {
 		result.qualified_name = QualifiedName(vector<Identifier> {std::move(schema)}, std::move(name));
 	}
+	return result;
+}
+
+void WALDropProcedure::Serialize(Serializer &serializer) const {
+	serializer.WriteProperty<QualifiedName>(101, "qualified_name", qualified_name);
+}
+
+WALDropProcedure WALDropProcedure::Deserialize(Deserializer &deserializer) {
+	WALDropProcedure result;
+	deserializer.ReadProperty<QualifiedName>(101, "qualified_name", result.qualified_name);
 	return result;
 }
 
