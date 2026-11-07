@@ -710,6 +710,7 @@ CatalogPushdownResult RemotePushdownOptimizer::RewriteStatement(CreateStatement 
 	case CatalogType::TYPE_ENTRY:
 	case CatalogType::MACRO_ENTRY:
 	case CatalogType::TABLE_MACRO_ENTRY:
+	case CatalogType::PROCEDURE_ENTRY:
 		break;
 	default:
 		// an entry type that never lives in a remote catalog (secrets, ...)
@@ -742,6 +743,7 @@ CatalogPushdownResult RemotePushdownOptimizer::RewriteStatement(DropStatement &s
 	case CatalogType::TYPE_ENTRY:
 	case CatalogType::MACRO_ENTRY:
 	case CatalogType::TABLE_MACRO_ENTRY:
+	case CatalogType::PROCEDURE_ENTRY:
 		break;
 	default:
 		// prepared statements, secrets, ... never live in a remote catalog
@@ -1758,7 +1760,8 @@ void RemotePushdownOptimizer::StripCatalogName(CreateInfo &info, const Identifie
 		break;
 	}
 	case CatalogType::MACRO_ENTRY:
-	case CatalogType::TABLE_MACRO_ENTRY: {
+	case CatalogType::TABLE_MACRO_ENTRY:
+	case CatalogType::PROCEDURE_ENTRY: {
 		auto &macro_info = info.Cast<CreateMacroInfo>();
 		for (auto &macro : macro_info.macros) {
 			for (auto &default_param : macro->default_parameters) {
