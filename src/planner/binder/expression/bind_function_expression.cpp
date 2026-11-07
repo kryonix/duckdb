@@ -354,6 +354,11 @@ BindResult ExpressionBinder::BindExpression(FunctionExpression &function, idx_t 
 	case CatalogType::WINDOW_FUNCTION_ENTRY:
 		// window function
 		return BindWindow(function, func.Cast<WindowFunctionCatalogEntry>(), depth);
+	case CatalogType::PROCEDURE_ENTRY:
+		throw BinderException(function,
+		                      "%s is a procedure: procedures execute as a top-level CALL and are not "
+		                      "composable in queries",
+		                      func.name);
 	default:
 		throw InvalidInputException("Unsupported catalog type when binding function");
 	}

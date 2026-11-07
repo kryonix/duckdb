@@ -18,14 +18,15 @@ CreateMacroInfo::CreateMacroInfo(CatalogType type, unique_ptr<MacroFunction> fun
 
 string CreateMacroInfo::ToString() const {
 	if (!macros.empty() && macros[0]->IsLanguageMember()) {
-		// language members round-trip through the CREATE FUNCTION sugar, one statement per member:
-		// replaying the later statements adds the members back as overloads
+		// language members round-trip through the CREATE FUNCTION / CREATE PROCEDURE sugar, one
+		// statement per member: replaying the later statements adds the members back as overloads
+		const char *keyword = type == CatalogType::PROCEDURE_ENTRY ? "PROCEDURE" : "FUNCTION";
 		string result;
 		for (auto &function : macros) {
 			if (!result.empty()) {
 				result += "\n";
 			}
-			result += GetCreatePrefix("FUNCTION") + QualifiedNameToString() + function->ToSQL() + ";";
+			result += GetCreatePrefix(keyword) + QualifiedNameToString() + function->ToSQL() + ";";
 		}
 		return result;
 	}

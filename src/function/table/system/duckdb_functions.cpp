@@ -6,9 +6,11 @@
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/procedure_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_macro_catalog_entry.hpp"
 #include "duckdb/function/table_macro_function.hpp"
 #include "duckdb/function/language_macro_function.hpp"
+#include "duckdb/function/language_procedure_function.hpp"
 #include "duckdb/function/language_table_macro_function.hpp"
 #include "duckdb/function/scalar_macro_function.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
@@ -554,6 +556,86 @@ struct TableMacroExtractor {
 	}
 };
 
+struct ProcedureExtractor {
+	static idx_t FunctionCount(ProcedureCatalogEntry &entry) {
+		return entry.macros.size();
+	}
+
+	static Value GetFunctionType() {
+		return Value("procedure");
+	}
+
+	static Value GetReturnType(ProcedureCatalogEntry &entry, idx_t offset) {
+		auto &macro_entry = *entry.macros[offset];
+		// the declared RETURNS TABLE columns are the fixed result shape, NULL when the
+		// procedure yields nothing
+		auto &member = macro_entry.Cast<LanguageProcedureFunction>();
+		if (!member.return_names.empty()) {
+			return Value("TABLE(" + member.ColumnsToSQL() + ")");
+		}
+		return Value();
+	}
+
+	static vector<Value> GetParameters(ProcedureCatalogEntry &entry, idx_t offset) {
+		vector<Value> results;
+		auto &macro_entry = *entry.macros[offset];
+		for (auto &param : macro_entry.parameters) {
+			D_ASSERT(param->GetExpressionType() == ExpressionType::COLUMN_REF);
+			auto &colref = param->Cast<ColumnRefExpression>();
+			results.emplace_back(colref.GetColumnName());
+		}
+		return results;
+	}
+
+	static Value GetParameterTypes(ProcedureCatalogEntry &entry, idx_t offset) {
+		vector<Value> results;
+		auto &macro_entry = *entry.macros[offset];
+		for (idx_t i = 0; i < macro_entry.parameters.size(); i++) {
+			const auto has_type = !macro_entry.types.empty() && macro_entry.types[i] != LogicalType::UNKNOWN;
+			results.emplace_back(has_type ? macro_entry.types[i].ToString() : Value(LogicalType::VARCHAR));
+		}
+		return Value::LIST(LogicalType::VARCHAR, std::move(results));
+	}
+
+	static vector<LogicalType> GetParameterLogicalTypes(ProcedureCatalogEntry &entry, idx_t offset) {
+		vector<LogicalType> results;
+		auto &macro_entry = *entry.macros[offset];
+		for (idx_t i = 0; i < macro_entry.parameters.size(); i++) {
+			results.emplace_back(macro_entry.types.empty() ? LogicalType::UNKNOWN : macro_entry.types[i]);
+		}
+		return results;
+	}
+
+	static Value GetVarArgs(ProcedureCatalogEntry &entry, idx_t offset) {
+		return Value();
+	}
+
+	static Value GetMacroDefinition(ProcedureCatalogEntry &entry, idx_t offset) {
+		// the verbatim source of the language member
+		return Value(entry.macros[offset]->Cast<LanguageProcedureFunction>().source);
+	}
+
+	static Value IsVolatile(ProcedureCatalogEntry &entry, idx_t offset) {
+		return Value();
+	}
+
+	static Value GetLanguage(ProcedureCatalogEntry &entry, idx_t offset) {
+		return Value(entry.macros[offset]->Cast<LanguageProcedureFunction>().language);
+	}
+
+	static Value GetLanguageVersion(ProcedureCatalogEntry &entry, idx_t offset) {
+		auto &version = entry.macros[offset]->Cast<LanguageProcedureFunction>().language_version;
+		if (!version.empty()) {
+			return Value(version);
+		}
+		return Value();
+	}
+
+	static Value ResultType(ProcedureCatalogEntry &entry, idx_t offset) {
+		return Value();
+	}
+};
+
 //! The options a "**kwargs" parameter declares are listed after the parameters, as they are passed by name like them
 static void AddOptions(const FunctionSignature &signature, vector<Value> &results, bool types) {
 	auto option_schema = signature.GetTypedKwargs();
@@ -912,6 +994,10 @@ void DuckDBFunctionsFunction(ClientContext &context, TableFunctionInput &data_p,
 		case CatalogType::TABLE_MACRO_ENTRY:
 			finished =
 			    ExtractFunctionData<TableMacroCatalogEntry, TableMacroExtractor>(entry, data.offset_in_entry, output);
+			break;
+		case CatalogType::PROCEDURE_ENTRY:
+			finished =
+			    ExtractFunctionData<ProcedureCatalogEntry, ProcedureExtractor>(entry, data.offset_in_entry, output);
 			break;
 		case CatalogType::MACRO_ENTRY:
 			finished =

@@ -468,8 +468,22 @@ BoundStatement Binder::Bind(TableFunctionRef &ref) {
 	EntryLookupInfo table_function_lookup(CatalogType::TABLE_FUNCTION_ENTRY, QualifiedName(fexpr.FunctionName()),
 	                                      error_context);
 	auto bound_name = BindTableName(entry_retriever, fexpr.GetQualifiedName());
-	auto &func_catalog =
-	    *GetCatalogEntry(EntryLookupInfo(table_function_lookup, bound_name), OnEntryNotFound::THROW_EXCEPTION);
+	auto func_entry = GetCatalogEntry(EntryLookupInfo(table_function_lookup, bound_name), OnEntryNotFound::RETURN_NULL);
+	if (!func_entry) {
+		// a name that resolves to a procedure gets the directed error instead of the lookup miss
+		EntryLookupInfo procedure_lookup(CatalogType::PROCEDURE_ENTRY, bound_name, error_context);
+		auto procedure_entry = GetCatalogEntry(procedure_lookup, OnEntryNotFound::RETURN_NULL);
+		if (procedure_entry && procedure_entry->type == CatalogType::PROCEDURE_ENTRY) {
+			throw BinderException(ref,
+			                      "%s is a procedure: procedures execute as a top-level CALL and are not "
+			                      "composable in queries",
+			                      fexpr.FunctionName());
+		}
+		// repeat the lookup for the original error, with its did-you-mean candidates
+		func_entry =
+		    GetCatalogEntry(EntryLookupInfo(table_function_lookup, bound_name), OnEntryNotFound::THROW_EXCEPTION);
+	}
+	auto &func_catalog = *func_entry;
 
 	if (func_catalog.type == CatalogType::TABLE_MACRO_ENTRY) {
 		auto &macro_func = func_catalog.Cast<TableMacroCatalogEntry>();
