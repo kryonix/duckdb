@@ -549,19 +549,21 @@ unique_ptr<PreparedStatement> ClientContext::PrepareInternal(ClientContextLock &
 	}
 	// Only a pragma, a CALL, or a multi-statement can expand. A pragma or multi-statement that does
 	// not expand into exactly one statement keeps the statement as written, to expand it again at
-	// each execution; a CALL of a procedure keeps the written form unconditionally, so it re-expands
-	// against the current catalog even when its expansion happens to be one statement. A CALL whose
-	// target is no procedure is the ordinary table-function path and prepares like any statement;
-	// a parameterized procedure CALL is rejected inside the expansion itself
+	// each execution; a CALL keeps the written form unconditionally, so a prepared CALL re-expands
+	// against the current catalog even when its target gains or loses a procedure between executions.
+	// Parameters thread through the re-submitted form unless the target is a procedure, whose
+	// expansion rejects them itself - at this prepare when it is one already, else at the execution
+	// that first resolves one
 	unique_ptr<SQLStatement> written_statement;
 	if (statement->type == StatementType::PRAGMA_STATEMENT || statement->type == StatementType::MULTI_STATEMENT ||
 	    statement->type == StatementType::CALL_STATEMENT) {
 		written_statement = statement->Copy();
 	}
+	const bool always_reexpand = statement->type == StatementType::CALL_STATEMENT;
 	auto expanded = PreprocessStatementInternal(lock, std::move(statement));
-	if (expanded.statements.size() != 1 || expanded.IsProcedureExpansion()) {
+	if (expanded.statements.size() != 1 || always_reexpand) {
 		D_ASSERT(written_statement);
-		if (!written_statement->named_param_map.empty()) {
+		if (!always_reexpand && !written_statement->named_param_map.empty()) {
 			throw InvalidInputException(EXPANDING_PARAMETERS_ERROR);
 		}
 		return make_uniq<PreparedStatement>(shared_from_this(), std::move(written_statement));

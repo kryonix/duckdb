@@ -54,6 +54,9 @@ private:
 	vector<unique_ptr<SQLStatement>> TryReparsePragma(unique_ptr<SQLStatement> statement) const;
 	//! Expands a CALL of a procedure into its statement sequence; a non-procedure CALL passes through
 	void TryExpandCall(unique_ptr<SQLStatement> statement, PreprocessedStatement &result) const;
+	//! Normalizes a statement of a procedure expansion like a top-level statement: flattens
+	//! multi-statement wrappers recursively and reparses pragmas one level
+	void NormalizeExpandedStatement(unique_ptr<SQLStatement> statement, vector<unique_ptr<SQLStatement>> &result) const;
 };
 
 } // namespace duckdb

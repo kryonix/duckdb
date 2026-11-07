@@ -18,6 +18,7 @@
 #include "duckdb/parser/expression/type_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
+#include "duckdb/parser/statement/multi_statement.hpp"
 #include "duckdb/parser/expression/type_expression.hpp"
 #include "duckdb/parser/parsed_data/create_language_info.hpp"
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
@@ -63,6 +64,24 @@ public:
 
 private:
 	std::function<void(LanguageFunctionCreateInfo &)> action;
+};
+
+//! A binder that groups its parsed expansion in a MultiStatement wrapper, which the
+//! preprocessor must flatten before planning
+class WrappingBinder : public ViewBinder {
+public:
+	WrappingBinder() : ViewBinder(nullptr) {
+	}
+
+	void ExpandCall(ClientContext &context, ProcedureCatalogEntry &entry, LanguageProcedureFunction &member,
+	                vector<unique_ptr<ParsedExpression>> arguments,
+	                vector<unique_ptr<SQLStatement>> &statements) override {
+		Parser parser(context);
+		parser.ParseQuery(member.source);
+		auto wrapper = make_uniq<MultiStatement>();
+		wrapper->statements = std::move(parser.statements);
+		statements.push_back(std::move(wrapper));
+	}
 };
 
 //! Register a language the way ExtensionLoader::RegisterLanguage does, without an extension
@@ -185,11 +204,51 @@ TEST_CASE("A prepared CALL re-expands at every execution", "[api]") {
 	REQUIRE(StringUtil::Contains(parameterized->GetError(), "parameters"));
 
 	// a CALL whose target is no procedure is the ordinary table-function path: it prepares,
-	// binds parameters, and executes like any statement
+	// and parameters thread through the re-submitted written form
 	auto ordinary = con.Prepare("CALL range($1)");
 	REQUIRE_FALSE(ordinary->HasError());
 	result = ordinary->Execute(3);
 	REQUIRE(CHECK_COLUMN(result, 0, {0, 1, 2}));
+	result = ordinary->Execute(2);
+	REQUIRE(CHECK_COLUMN(result, 0, {0, 1}));
+
+	// the re-expansion also carries a prepared CALL across a target swap in either direction
+	REQUIRE_NO_FAIL(con.Query("CREATE MACRO flip() AS TABLE SELECT 10::BIGINT AS n"));
+	auto swapped = con.Prepare("CALL flip()");
+	REQUIRE_FALSE(swapped->HasError());
+	result = swapped->Execute();
+	REQUIRE(CHECK_COLUMN(result, 0, {10}));
+	REQUIRE_NO_FAIL(con.Query("DROP MACRO TABLE flip"));
+	REQUIRE_NO_FAIL(con.Query("CREATE PROCEDURE flip() RETURNS TABLE(n BIGINT) LANGUAGE preplang AS "
+	                          "'SELECT 20::BIGINT AS n'"));
+	result = swapped->Execute();
+	REQUIRE(CHECK_COLUMN(result, 0, {20}));
+	REQUIRE_NO_FAIL(con.Query("DROP PROCEDURE flip"));
+	REQUIRE_NO_FAIL(con.Query("CREATE MACRO flip() AS TABLE SELECT 30::BIGINT AS n"));
+	result = swapped->Execute();
+	REQUIRE(CHECK_COLUMN(result, 0, {30}));
+}
+
+TEST_CASE("A procedure expansion flattens nested statement wrappers", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	RegisterTestLanguage(*db.instance, "wrapped", make_shared_ptr<WrappingBinder>());
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE wrap_t(i INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO wrap_t VALUES (1)"));
+	// ALTER with a default parses into a multi-statement wrapper nested inside the binder's own
+	REQUIRE_NO_FAIL(con.Query("CREATE PROCEDURE wrap_alter() LANGUAGE wrapped AS "
+	                          "'ALTER TABLE wrap_t ADD COLUMN j INT DEFAULT (2+2)'"));
+	REQUIRE_NO_FAIL(con.Query("CALL wrap_alter()"));
+	auto result = con.Query("SELECT i, j FROM wrap_t");
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+	REQUIRE(CHECK_COLUMN(result, 1, {4}));
+
+	// a wrapped transaction statement is still rejected after flattening
+	REQUIRE_NO_FAIL(con.Query("CREATE PROCEDURE wrap_commit() LANGUAGE wrapped AS 'COMMIT'"));
+	result = con.Query("CALL wrap_commit()");
+	REQUIRE_FAIL(result);
+	REQUIRE(StringUtil::Contains(result->GetError(), "cannot contain a transaction statement"));
 }
 
 // the publish-once and identity checks raise InternalException, which aborts the process when

@@ -47,6 +47,35 @@ vector<unique_ptr<SQLStatement>> StatementPreprocessor::TryReparsePragma(unique_
 	return res;
 }
 
+static void FlattenMultiStatement(unique_ptr<SQLStatement> statement, vector<unique_ptr<SQLStatement>> &result) {
+	if (statement->type == StatementType::MULTI_STATEMENT) {
+		for (auto &child : statement->Cast<MultiStatement>().statements) {
+			FlattenMultiStatement(std::move(child), result);
+		}
+		return;
+	}
+	result.push_back(std::move(statement));
+}
+
+void StatementPreprocessor::NormalizeExpandedStatement(unique_ptr<SQLStatement> statement,
+                                                       vector<unique_ptr<SQLStatement>> &result) const {
+	if (statement->type == StatementType::MULTI_STATEMENT) {
+		for (auto &child : statement->Cast<MultiStatement>().statements) {
+			NormalizeExpandedStatement(std::move(child), result);
+		}
+		return;
+	}
+	if (statement->type == StatementType::PRAGMA_STATEMENT) {
+		// one reparse level, like a top-level pragma: a pragma a reparse emits plans as parsed
+		auto reparsed = TryReparsePragma(std::move(statement));
+		for (auto &reparsed_statement : reparsed) {
+			FlattenMultiStatement(std::move(reparsed_statement), result);
+		}
+		return;
+	}
+	result.push_back(std::move(statement));
+}
+
 void StatementPreprocessor::TryExpandCall(unique_ptr<SQLStatement> statement, PreprocessedStatement &result) const {
 	auto &call = statement->Cast<CallStatement>();
 	if (!call.function || call.function->GetExpressionType() != ExpressionType::FUNCTION) {
@@ -100,27 +129,7 @@ void StatementPreprocessor::TryExpandCall(unique_ptr<SQLStatement> statement, Pr
 
 	// normalize the expansion like top-level statements: unpack multi-statements and reparse pragmas
 	for (auto &expanded : expansion) {
-		if (expanded->type == StatementType::MULTI_STATEMENT) {
-			for (auto &child : expanded->Cast<MultiStatement>().statements) {
-				if (child->type == StatementType::PRAGMA_STATEMENT) {
-					auto reparsed = TryReparsePragma(std::move(child));
-					for (auto &reparsed_statement : reparsed) {
-						result.statements.push_back(std::move(reparsed_statement));
-					}
-					continue;
-				}
-				result.statements.push_back(std::move(child));
-			}
-			continue;
-		}
-		if (expanded->type == StatementType::PRAGMA_STATEMENT) {
-			auto reparsed = TryReparsePragma(std::move(expanded));
-			for (auto &reparsed_statement : reparsed) {
-				result.statements.push_back(std::move(reparsed_statement));
-			}
-			continue;
-		}
-		result.statements.push_back(std::move(expanded));
+		NormalizeExpandedStatement(std::move(expanded), result.statements);
 	}
 
 	result.call_procedure = procedure.name.GetIdentifierName();
