@@ -1290,6 +1290,8 @@ ReturnsType <- 'RETURNS' Type
 CreateLanguageTableFunctionStmt <- 'FUNCTION' IfNotExists? QualifiedName Parens(MacroParameters?) ReturnsTableType 'LANGUAGE' Identifier 'AS' StringLiteral
 ReturnsTableType <- 'RETURNS' 'TABLE' ColIdTypeList?
 
+CreateLanguageProcedureStmt <- 'PROCEDURE' IfNotExists? QualifiedName Parens(MacroParameters?) ReturnsTableType? 'LANGUAGE' Identifier 'AS' StringLiteral
+
 MacroOrFunction <- MacroKeyword / FunctionKeyword
 MacroKeyword <- 'MACRO'
 FunctionKeyword <- 'FUNCTION'
@@ -1337,7 +1339,7 @@ MinValue <- 'MINVALUE'
 MaxValue <- 'MAXVALUE'
 
 CreateStatement <- 'CREATE' OrReplace? Temporary? CreateStatementVariation
-CreateStatementVariation <- CreateTableStmt / CreateLanguageTableFunctionStmt / CreateLanguageFunctionStmt / CreateMacroStmt / CreateSequenceStmt / CreateTypeStmt / CreateSchemaStmt / CreateViewStmt / CreateIndexStmt / CreateSecretStmt / CreateTriggerStmt
+CreateStatementVariation <- CreateTableStmt / CreateLanguageProcedureStmt / CreateLanguageTableFunctionStmt / CreateLanguageFunctionStmt / CreateMacroStmt / CreateSequenceStmt / CreateTypeStmt / CreateSchemaStmt / CreateViewStmt / CreateIndexStmt / CreateSecretStmt / CreateTriggerStmt
 OrReplace <- 'OR' 'REPLACE'
 Temporary <- Persistent / TempPersistent / TemporaryPersistent
 Persistent <- 'PERSISTENT'
@@ -1548,6 +1550,7 @@ DropStatement <- 'DROP' DropEntries DropBehavior?
 DropEntries <-
 	DropTable /
 	DropTableFunction /
+	DropProcedure /
 	DropFunction /
 	DropSchema /
 	DropIndex /
@@ -1561,6 +1564,7 @@ DropTrigger <- 'TRIGGER' IfExists? TriggerName 'ON' BaseTableName
 
 DropTable <- TableOrView IfExists? List(BaseTableName)
 DropTableFunction <- CommentMacroTable IfExists? List(QualifiedTableFunction) DropFunctionSignature?
+DropProcedure <- 'PROCEDURE' IfExists? List(FunctionIdentifier) DropFunctionSignature?
 DropFunction <- FunctionTypeMacro IfExists? List(FunctionIdentifier) DropFunctionSignature?
 DropFunctionSignature <- Parens(List(DropSignatureType)?)
 DropSignatureType <- DropSignatureAnyType / Type

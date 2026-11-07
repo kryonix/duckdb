@@ -192,6 +192,7 @@ CreateStatement:
     - CreateMacroStmt
     - CreateLanguageFunctionStmt
     - CreateLanguageTableFunctionStmt
+    - CreateLanguageProcedureStmt
     - CreateTypeStmt
     - CreateViewStmt
     - CreateTriggerStmt
@@ -203,6 +204,7 @@ DropStatement:
     - DropEntries
     - DropTable
     - DropTableFunction
+    - DropProcedure
     - DropFunction
     - DropSchema
     - DropIndex

@@ -1,6 +1,7 @@
 #include "duckdb/parser/peg/ast/macro_parameter.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/function/language_macro_function.hpp"
+#include "duckdb/function/language_procedure_function.hpp"
 #include "duckdb/function/language_table_macro_function.hpp"
 #include "duckdb/function/table_macro_function.hpp"
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
@@ -103,6 +104,36 @@ unique_ptr<CreateStatement> PEGTransformerFactory::TransformCreateLanguageTableF
 	for (auto &column : returns_table_type) {
 		member->return_names.push_back(column.first);
 		member->return_types.push_back(LogicalType::UNBOUND(std::move(column.second)));
+	}
+	if (macro_parameters) {
+		AddMacroParameters(*member, *macro_parameters);
+	}
+	info->macros.push_back(std::move(member));
+
+	result->info = std::move(info);
+	transformer.PivotEntryCheck("macro");
+	return result;
+}
+
+unique_ptr<CreateStatement> PEGTransformerFactory::TransformCreateLanguageProcedureStmt(
+    PEGTransformer &transformer, const optional<bool> &if_not_exists, const QualifiedName &qualified_name,
+    optional<vector<MacroParameter>> macro_parameters,
+    optional<vector<pair<Identifier, unique_ptr<ParsedExpression>>>> returns_table_type, const Identifier &language,
+    const string &source) {
+	auto result = make_uniq<CreateStatement>();
+	auto info = make_uniq<CreateMacroInfo>(CatalogType::PROCEDURE_ENTRY);
+
+	info->SetQualifiedName(qualified_name);
+	info->on_conflict = if_not_exists ? OnCreateConflict::IGNORE_ON_CONFLICT : OnCreateConflict::ERROR_ON_CONFLICT;
+
+	auto member = make_uniq<LanguageProcedureFunction>();
+	member->language = language.GetIdentifierName();
+	member->source = source;
+	if (returns_table_type) {
+		for (auto &column : *returns_table_type) {
+			member->return_names.push_back(column.first);
+			member->return_types.push_back(LogicalType::UNBOUND(std::move(column.second)));
+		}
 	}
 	if (macro_parameters) {
 		AddMacroParameters(*member, *macro_parameters);

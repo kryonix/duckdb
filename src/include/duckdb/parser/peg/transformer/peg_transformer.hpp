@@ -1230,6 +1230,8 @@ public:
 	FinalizeCreateLanguageTableFunctionStmtTrampoline(PEGTransformer &transformer, GeneratedTransformProcess &process);
 	static arena_ptr<TransformResultValue> FinalizeReturnsTableTypeTrampoline(PEGTransformer &transformer,
 	                                                                          GeneratedTransformProcess &process);
+	static arena_ptr<TransformResultValue>
+	FinalizeCreateLanguageProcedureStmtTrampoline(PEGTransformer &transformer, GeneratedTransformProcess &process);
 	static arena_ptr<TransformResultValue> FinalizeMacroKeywordTrampoline(PEGTransformer &transformer,
 	                                                                      GeneratedTransformProcess &process);
 	static arena_ptr<TransformResultValue> FinalizeFunctionKeywordTrampoline(PEGTransformer &transformer,
@@ -1540,6 +1542,8 @@ public:
 	                                                                   GeneratedTransformProcess &process);
 	static arena_ptr<TransformResultValue> FinalizeDropTableFunctionTrampoline(PEGTransformer &transformer,
 	                                                                           GeneratedTransformProcess &process);
+	static arena_ptr<TransformResultValue> FinalizeDropProcedureTrampoline(PEGTransformer &transformer,
+	                                                                       GeneratedTransformProcess &process);
 	static arena_ptr<TransformResultValue> FinalizeDropFunctionTrampoline(PEGTransformer &transformer,
 	                                                                      GeneratedTransformProcess &process);
 	static arena_ptr<TransformResultValue> FinalizeDropFunctionSignatureTrampoline(PEGTransformer &transformer,
@@ -3095,6 +3099,11 @@ public:
 	static vector<pair<Identifier, unique_ptr<ParsedExpression>>>
 	TransformReturnsTableType(PEGTransformer &transformer,
 	                          optional<vector<pair<Identifier, unique_ptr<ParsedExpression>>>> col_id_type_list);
+	static unique_ptr<CreateStatement> TransformCreateLanguageProcedureStmt(
+	    PEGTransformer &transformer, const optional<bool> &if_not_exists, const QualifiedName &qualified_name,
+	    optional<vector<MacroParameter>> macro_parameters,
+	    optional<vector<pair<Identifier, unique_ptr<ParsedExpression>>>> returns_table_type, const Identifier &language,
+	    const string &source);
 	static bool TransformMacroKeyword(PEGTransformer &transformer);
 	static bool TransformFunctionKeyword(PEGTransformer &transformer);
 	static unique_ptr<MacroFunction> TransformMacroDefinition(PEGTransformer &transformer,
@@ -3382,6 +3391,10 @@ public:
 	TransformDropTableFunction(PEGTransformer &transformer, const CatalogType &comment_macro_table,
 	                           const optional<bool> &if_exists, const vector<QualifiedName> &table_function_name,
 	                           const optional<vector<LogicalType>> &drop_function_signature);
+	static unique_ptr<DropStatement>
+	TransformDropProcedure(PEGTransformer &transformer, const optional<bool> &if_exists,
+	                       const vector<QualifiedName> &function_identifier,
+	                       const optional<vector<LogicalType>> &drop_function_signature);
 	static unique_ptr<DropStatement>
 	TransformDropFunction(PEGTransformer &transformer, const bool &function_type_macro, const optional<bool> &if_exists,
 	                      const vector<QualifiedName> &function_identifier,
