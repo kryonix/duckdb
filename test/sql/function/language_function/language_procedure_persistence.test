@@ -28,7 +28,7 @@ statement ok
 CREATE TABLE lpdb_sink(v BIGINT);
 
 statement ok
-CREATE PROCEDURE persistent_p() RETURNS TABLE(n BIGINT) LANGUAGE testlang AS 'sql:SELECT 1::BIGINT;';
+CREATE PROCEDURE persistent_p() RETURNS TABLE(n BIGINT) LANGUAGE testlang AS 'sql:SELECT 1::BIGINT AS n;';
 
 statement ok
 CREATE PROCEDURE persistent_p(x BIGINT) LANGUAGE testlang AS 'sql:INSERT INTO lpdb.main.lpdb_sink VALUES (__ARG0__);';
@@ -40,10 +40,10 @@ statement ok
 DROP PROCEDURE dropped_p;
 
 statement ok
-CREATE PROCEDURE replaced_p() RETURNS TABLE(n BIGINT) LANGUAGE testlang AS 'sql:SELECT 1::BIGINT;';
+CREATE PROCEDURE replaced_p() RETURNS TABLE(n BIGINT) LANGUAGE testlang AS 'sql:SELECT 1::BIGINT AS n;';
 
 statement ok
-CREATE OR REPLACE PROCEDURE replaced_p() RETURNS TABLE(n BIGINT) LANGUAGE testlang AS 'sql:SELECT 2::BIGINT;';
+CREATE OR REPLACE PROCEDURE replaced_p() RETURNS TABLE(n BIGINT) LANGUAGE testlang AS 'sql:SELECT 2::BIGINT AS n;';
 
 # Detach without checkpoint - the procedures must survive WAL replay
 statement ok
@@ -59,7 +59,7 @@ query TTT rowsort
 SELECT function_type, language, macro_definition FROM duckdb_functions() WHERE function_name = 'persistent_p' AND database_name = 'lpdb';
 ----
 procedure	testlang	sql:INSERT INTO lpdb.main.lpdb_sink VALUES (__ARG0__);
-procedure	testlang	sql:SELECT 1::BIGINT;
+procedure	testlang	sql:SELECT 1::BIGINT AS n;
 
 query I
 SELECT count(*) FROM duckdb_functions() WHERE function_name = 'dropped_p';
@@ -69,7 +69,7 @@ SELECT count(*) FROM duckdb_functions() WHERE function_name = 'dropped_p';
 query T
 SELECT macro_definition FROM duckdb_functions() WHERE function_name = 'replaced_p';
 ----
-sql:SELECT 2::BIGINT;
+sql:SELECT 2::BIGINT AS n;
 
 # the replayed procedure runs
 query I
@@ -126,7 +126,7 @@ query TT rowsort
 SELECT function_type, macro_definition FROM duckdb_functions() WHERE function_name = 'persistent_p' AND database_name = 'importdb';
 ----
 procedure	sql:INSERT INTO lpdb.main.lpdb_sink VALUES (__ARG0__);
-procedure	sql:SELECT 1::BIGINT;
+procedure	sql:SELECT 1::BIGINT AS n;
 
 statement ok
 USE memory;
@@ -147,7 +147,7 @@ query TT rowsort
 SELECT function_type, macro_definition FROM duckdb_functions() WHERE function_name = 'persistent_p';
 ----
 procedure	sql:INSERT INTO lpdb.main.lpdb_sink VALUES (__ARG0__);
-procedure	sql:SELECT 1::BIGINT;
+procedure	sql:SELECT 1::BIGINT AS n;
 
 # calling without the binder names the language and suggests loading it
 statement error

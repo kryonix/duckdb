@@ -183,6 +183,13 @@ TEST_CASE("A prepared CALL re-expands at every execution", "[api]") {
 	auto parameterized = con.Prepare("CALL prep_p($1)");
 	REQUIRE(parameterized->HasError());
 	REQUIRE(StringUtil::Contains(parameterized->GetError(), "parameters"));
+
+	// a CALL whose target is no procedure is the ordinary table-function path: it prepares,
+	// binds parameters, and executes like any statement
+	auto ordinary = con.Prepare("CALL range($1)");
+	REQUIRE_FALSE(ordinary->HasError());
+	result = ordinary->Execute(3);
+	REQUIRE(CHECK_COLUMN(result, 0, {0, 1, 2}));
 }
 
 // the publish-once and identity checks raise InternalException, which aborts the process when

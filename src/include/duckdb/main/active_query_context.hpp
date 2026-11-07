@@ -24,8 +24,18 @@ class QueryResult;
 //! several runs them one after another, each with its own executor, as one query
 struct ActiveQueryContext {
 public:
-	explicit ActiveQueryContext(PreprocessedStatement statements_p) : statements(std::move(statements_p.statements)) {
+	explicit ActiveQueryContext(PreprocessedStatement statements_p)
+	    : call_procedure(std::move(statements_p.call_procedure)),
+	      call_result_names(std::move(statements_p.call_result_names)),
+	      call_result_types(std::move(statements_p.call_result_types)), statements(std::move(statements_p.statements)) {
 	}
+
+	//! The procedure a top-level CALL expanded through; empty = no procedure expansion
+	string call_procedure;
+	//! The procedure's declared result schema, which the expansion's result statement must produce
+	vector<Identifier> call_result_names;
+	//! The result column types, parallel to call_result_names
+	vector<LogicalType> call_result_types;
 
 	//! The text of the statement that is running
 	string query;

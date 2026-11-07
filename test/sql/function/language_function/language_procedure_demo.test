@@ -54,14 +54,56 @@ CREATE PROCEDURE noop() LANGUAGE testlang AS 'sql:';
 statement ok
 CALL noop();
 
-# the declared schema casts the result statement column-wise
+# the result statement must produce exactly the declared schema: names, types, and width
 statement ok
-CREATE PROCEDURE narrow() RETURNS TABLE(t TINYINT) LANGUAGE testlang AS 'sql:SELECT 5::BIGINT;';
+CREATE PROCEDURE narrow() RETURNS TABLE(t TINYINT) LANGUAGE testlang AS 'sql:SELECT 5::TINYINT AS t;';
 
 query I
 CALL narrow();
 ----
 5
+
+statement ok
+CREATE PROCEDURE narrow_bad() RETURNS TABLE(t TINYINT) LANGUAGE testlang AS 'sql:SELECT 500::BIGINT AS actual;';
+
+statement error
+CALL narrow_bad();
+----
+<REGEX>:.*produces .actual BIGINT. but the procedure declares TABLE.t TINYINT.*
+
+statement ok
+CREATE PROCEDURE wide_bad() RETURNS TABLE(a BIGINT) LANGUAGE testlang AS 'sql:SELECT 1::BIGINT AS a, 2 AS extra;';
+
+statement error
+CALL wide_bad();
+----
+<REGEX>:.*row-returning statement produces.*but the procedure declares TABLE.a BIGINT.*
+
+# a procedure without a schema must not return rows
+statement ok
+CREATE PROCEDURE silent_rows() LANGUAGE testlang AS 'sql:SELECT 123 AS unexpected;';
+
+statement error
+CALL silent_rows();
+----
+<REGEX>:.*declares no result schema but its expansion contains a row-returning statement.*
+
+# a declared schema needs a row-returning statement
+statement ok
+CREATE PROCEDURE no_rows() RETURNS TABLE(x BIGINT) LANGUAGE testlang AS 'sql:INSERT INTO sink VALUES (0);';
+
+statement error
+CALL no_rows();
+----
+<REGEX>:.*declares TABLE.x BIGINT. but its expansion contains no row-returning statement.*
+
+statement ok
+CREATE PROCEDURE empty_declared() RETURNS TABLE(x BIGINT) LANGUAGE testlang AS 'sql:';
+
+statement error
+CALL empty_declared();
+----
+<REGEX>:.*declares TABLE.x BIGINT. but its expansion contains no row-returning statement.*
 
 # ---------------------------------------------------------------------------
 # transactions: atomic per CALL in autocommit
@@ -69,7 +111,7 @@ CALL narrow();
 
 statement ok
 CREATE PROCEDURE add_then_fail(x BIGINT) LANGUAGE testlang AS
-'sql:INSERT INTO sink VALUES (__ARG0__); SELECT error(''mid-call failure'');';
+'sql:INSERT INTO sink VALUES (__ARG0__); INSERT INTO sink SELECT error(''mid-call failure'');';
 
 statement error
 CALL add_then_fail(1000);
@@ -166,11 +208,11 @@ PREPARE call_versioned AS CALL noop();
 # ---------------------------------------------------------------------------
 
 statement ok
-CREATE PROCEDURE routed() RETURNS TABLE(n BIGINT) LANGUAGE testlang AS 'sql:SELECT 0::BIGINT;';
+CREATE PROCEDURE routed() RETURNS TABLE(n BIGINT) LANGUAGE testlang AS 'sql:SELECT 0::BIGINT AS n;';
 
 statement ok
 CREATE PROCEDURE routed(a BIGINT, b := 10) RETURNS TABLE(n BIGINT) LANGUAGE testlang AS
-'sql:SELECT (__ARG0__ + __ARG1__)::BIGINT;';
+'sql:SELECT (__ARG0__ + __ARG1__)::BIGINT AS n;';
 
 query I
 CALL routed();
@@ -253,3 +295,100 @@ statement error
 CALL selfcall();
 ----
 <REGEX>:.*is a procedure.*top-level CALL.*
+
+# ---------------------------------------------------------------------------
+# a transaction statement cannot hide under EXPLAIN ANALYZE, which executes it
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE PROCEDURE smuggle_explain() LANGUAGE testlang AS 'sql:EXPLAIN ANALYZE COMMIT;';
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO sink VALUES (9999);
+
+statement error
+CALL smuggle_explain();
+----
+<REGEX>:.*CALL expansion cannot contain a transaction statement.*
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM sink WHERE v = 9999;
+----
+0
+
+# ---------------------------------------------------------------------------
+# expansions normalize like top-level statements: multi-statement wrappers and
+# query pragmas plan instead of failing as MULTI/PRAGMA nodes
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE alter_target(i INTEGER);
+
+statement ok
+INSERT INTO alter_target VALUES (1);
+
+# ALTER ADD COLUMN with a default parses into a multi-statement wrapper
+statement ok
+CREATE PROCEDURE alter_p() LANGUAGE testlang AS
+'sql:ALTER TABLE alter_target ADD COLUMN j INT DEFAULT (2+2);';
+
+statement ok
+CALL alter_p();
+
+query II
+SELECT * FROM alter_target;
+----
+1	4
+
+statement ok
+CREATE PROCEDURE pivot_p() RETURNS TABLE(i INTEGER, "4" HUGEINT) LANGUAGE testlang AS
+'sql:PIVOT alter_target ON j USING sum(j);';
+
+query II
+CALL pivot_p();
+----
+1	4
+
+statement ok
+CREATE PROCEDURE pragma_p() RETURNS TABLE(database_name VARCHAR, database_size VARCHAR, block_size BIGINT, total_blocks BIGINT, used_blocks BIGINT, free_blocks BIGINT, wal_size VARCHAR, memory_usage VARCHAR, memory_limit VARCHAR) LANGUAGE testlang AS 'sql:PRAGMA database_size;';
+
+statement ok
+CALL pragma_p();
+
+# ---------------------------------------------------------------------------
+# defaults stay unevaluated but keep their type validation
+# ---------------------------------------------------------------------------
+
+statement error
+CREATE PROCEDURE typed_default(a INTEGER := '123'::VARCHAR) RETURNS TABLE(x INTEGER) LANGUAGE testlang AS 'sql:SELECT __ARG0__ AS x;';
+----
+<REGEX>:.*Default value.*cannot be implicitly cast to 'INTEGER'.*
+
+# an explicit cast in the default satisfies the declared type
+statement ok
+CREATE PROCEDURE typed_default(a INTEGER := CAST('123' AS INTEGER)) RETURNS TABLE(x INTEGER) LANGUAGE testlang AS 'sql:SELECT __ARG0__::INTEGER AS x;';
+
+query I
+CALL typed_default();
+----
+123
+
+# an erroring default is not evaluated at CREATE, only when a CALL uses it
+statement ok
+CREATE PROCEDURE lazy_default(a BIGINT := CAST('bad' AS BIGINT)) RETURNS TABLE(x BIGINT) LANGUAGE testlang AS 'sql:SELECT __ARG0__::BIGINT AS x;';
+
+query I
+CALL lazy_default(5);
+----
+5
+
+statement error
+CALL lazy_default();
+----
+<REGEX>:.*Conversion Error.*

@@ -11,6 +11,7 @@
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/statement/call_statement.hpp"
+#include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/parser/statement/multi_statement.hpp"
 #include "duckdb/parser/statement/transaction_statement.hpp"
 #include "duckdb/parser/parsed_data/bound_pragma_info.hpp"
@@ -46,12 +47,11 @@ vector<unique_ptr<SQLStatement>> StatementPreprocessor::TryReparsePragma(unique_
 	return res;
 }
 
-vector<unique_ptr<SQLStatement>> StatementPreprocessor::TryExpandCall(unique_ptr<SQLStatement> statement) const {
+void StatementPreprocessor::TryExpandCall(unique_ptr<SQLStatement> statement, PreprocessedStatement &result) const {
 	auto &call = statement->Cast<CallStatement>();
-	vector<unique_ptr<SQLStatement>> result;
 	if (!call.function || call.function->GetExpressionType() != ExpressionType::FUNCTION) {
-		result.push_back(std::move(statement));
-		return result;
+		result.statements.push_back(std::move(statement));
+		return;
 	}
 	auto &fexpr = call.function->Cast<FunctionExpression>();
 	// resolve the CALL's qualified name as a procedure; a miss is the ordinary CALL path untouched
@@ -61,10 +61,14 @@ vector<unique_ptr<SQLStatement>> StatementPreprocessor::TryExpandCall(unique_ptr
 	EntryLookupInfo procedure_lookup(CatalogType::PROCEDURE_ENTRY, bound_name, error_context);
 	auto entry = binder->GetCatalogEntry(procedure_lookup, OnEntryNotFound::RETURN_NULL);
 	if (!entry || entry->type != CatalogType::PROCEDURE_ENTRY) {
-		result.push_back(std::move(statement));
-		return result;
+		result.statements.push_back(std::move(statement));
+		return;
 	}
 	auto &procedure = entry->Cast<ProcedureCatalogEntry>();
+	if (!statement->named_param_map.empty()) {
+		// parameters cannot thread through a re-expanded statement sequence
+		throw InvalidInputException(ClientContext::EXPANDING_PARAMETERS_ERROR);
+	}
 
 	// structural member selection: arity, named arguments, defaults filled, declaration order
 	vector<unique_ptr<ParsedExpression>> positional_arguments;
@@ -91,8 +95,54 @@ vector<unique_ptr<SQLStatement>> StatementPreprocessor::TryExpandCall(unique_ptr
 
 	// raises a MissingExtensionException naming the procedure and language when none is registered
 	auto language_binder = LanguageCatalogEntry::GetBinder(context, member.language, procedure.name);
-	language_binder->ExpandCall(context, procedure, member, std::move(arguments), result);
-	return result;
+	vector<unique_ptr<SQLStatement>> expansion;
+	language_binder->ExpandCall(context, procedure, member, std::move(arguments), expansion);
+
+	// normalize the expansion like top-level statements: unpack multi-statements and reparse pragmas
+	for (auto &expanded : expansion) {
+		if (expanded->type == StatementType::MULTI_STATEMENT) {
+			for (auto &child : expanded->Cast<MultiStatement>().statements) {
+				if (child->type == StatementType::PRAGMA_STATEMENT) {
+					auto reparsed = TryReparsePragma(std::move(child));
+					for (auto &reparsed_statement : reparsed) {
+						result.statements.push_back(std::move(reparsed_statement));
+					}
+					continue;
+				}
+				result.statements.push_back(std::move(child));
+			}
+			continue;
+		}
+		if (expanded->type == StatementType::PRAGMA_STATEMENT) {
+			auto reparsed = TryReparsePragma(std::move(expanded));
+			for (auto &reparsed_statement : reparsed) {
+				result.statements.push_back(std::move(reparsed_statement));
+			}
+			continue;
+		}
+		result.statements.push_back(std::move(expanded));
+	}
+
+	result.call_procedure = procedure.name.GetIdentifierName();
+	result.call_result_names = member.return_names;
+	result.call_result_types = member.return_types;
+	if (result.statements.empty() && !result.call_result_types.empty()) {
+		throw BinderException("CALL of procedure %s: the procedure declares TABLE(%s) but its expansion contains no "
+		                      "row-returning statement",
+		                      result.call_procedure, member.ColumnsToSQL());
+	}
+}
+
+static bool ContainsTransactionStatement(const SQLStatement &statement) {
+	if (statement.type == StatementType::TRANSACTION_STATEMENT) {
+		return true;
+	}
+	// EXPLAIN ANALYZE executes its child, so a wrapped transaction statement would run
+	if (statement.type == StatementType::EXPLAIN_STATEMENT) {
+		auto &child = statement.Cast<ExplainStatement>().stmt;
+		return child && ContainsTransactionStatement(*child);
+	}
+	return false;
 }
 
 PreprocessedStatement StatementPreprocessor::ExpandStatement(unique_ptr<SQLStatement> statement) const {
@@ -107,11 +157,11 @@ PreprocessedStatement StatementPreprocessor::ExpandStatement(unique_ptr<SQLState
 		result.statements = TryReparsePragma(std::move(statement));
 		break;
 	case StatementType::CALL_STATEMENT: {
-		result.statements = TryExpandCall(std::move(statement));
+		TryExpandCall(std::move(statement), result);
 		// a CALL expansion of any size runs inside the call's transaction, so even a single
 		// statement must not be a transaction statement
 		for (auto &expanded : result.statements) {
-			if (expanded->type == StatementType::TRANSACTION_STATEMENT) {
+			if (ContainsTransactionStatement(*expanded)) {
 				throw InvalidInputException("A CALL expansion cannot contain a transaction statement: %s",
 				                            expanded->query);
 			}
@@ -125,7 +175,7 @@ PreprocessedStatement StatementPreprocessor::ExpandStatement(unique_ptr<SQLState
 	if (result.statements.size() > 1) {
 		for (auto &expanded : result.statements) {
 			// The statements run as one query in one transaction, which a transaction statement would end or take over
-			if (expanded->type == StatementType::TRANSACTION_STATEMENT) {
+			if (ContainsTransactionStatement(*expanded)) {
 				throw InvalidInputException(
 				    "A statement that expands into several cannot contain a transaction statement: %s",
 				    expanded->query);

@@ -236,6 +236,48 @@ void BindPreparedStatementParameters(ClientContext &context, PreparedStatementDa
 	statement.Bind(context, owned_values);
 }
 
+static string CallSchemaToString(const vector<Identifier> &names, const vector<LogicalType> &types) {
+	string result;
+	for (idx_t i = 0; i < types.size(); i++) {
+		if (i > 0) {
+			result += ", ";
+		}
+		result += names[i].GetIdentifierName() + " " + types[i].ToString();
+	}
+	return result;
+}
+
+void ClientContext::VerifyCallResultSchema(PreparedStatementData &statement_data) {
+	D_ASSERT(active_query && !active_query->call_procedure.empty());
+	auto &declared_names = active_query->call_result_names;
+	auto &declared_types = active_query->call_result_types;
+	if (statement_data.properties.return_type != StatementReturnType::QUERY_RESULT) {
+		// this statement yields no rows; once it is the last one, a declared schema has no producer left
+		if (!declared_types.empty() && !active_query->result_statement_started && !active_query->HasNextStatement()) {
+			throw BinderException("CALL of procedure %s: the procedure declares TABLE(%s) but its expansion contains "
+			                      "no row-returning statement",
+			                      active_query->call_procedure, CallSchemaToString(declared_names, declared_types));
+		}
+		return;
+	}
+	if (declared_types.empty()) {
+		throw BinderException("CALL of procedure %s: the procedure declares no result schema but its expansion "
+		                      "contains a row-returning statement",
+		                      active_query->call_procedure);
+	}
+	bool matches = statement_data.types.size() == declared_types.size();
+	for (idx_t i = 0; matches && i < declared_types.size(); i++) {
+		matches = statement_data.names[i] == declared_names[i] && statement_data.types[i] == declared_types[i];
+	}
+	if (!matches) {
+		throw BinderException(
+		    "CALL of procedure %s: the expansion's row-returning statement produces (%s) but the procedure "
+		    "declares TABLE(%s)",
+		    active_query->call_procedure, CallSchemaToString(statement_data.names, statement_data.types),
+		    CallSchemaToString(declared_names, declared_types));
+	}
+}
+
 unique_ptr<QueryResult> ClientContext::SubmitPreparedStatementInternal(
     ClientContextLock &lock, shared_ptr<PreparedStatementData> statement_data_p, const QueryParameters &parameters) {
 	D_ASSERT(active_query);
@@ -269,6 +311,9 @@ unique_ptr<QueryResult> ClientContext::SubmitPreparedStatementInternal(
 	if (expands && result_statement && active_query->HasNextStatement()) {
 		throw NotImplementedException("A statement that expands into a row-returning statement followed by others "
 		                              "cannot be served as one result");
+	}
+	if (!active_query->call_procedure.empty()) {
+		VerifyCallResultSchema(statement_data);
 	}
 
 	// Decide how to get the result collector.

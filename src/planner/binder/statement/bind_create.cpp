@@ -562,13 +562,11 @@ SchemaCatalogEntry &Binder::BindCreateFunctionInfo(CreateInfo &info) {
 		// every CALL expands anew and evaluates them like arguments, so a volatile default draws
 		// per call and a default of a call the procedure never reaches is never evaluated
 		identifier_map_t<Value> default_values;
+		identifier_map_t<LogicalType> default_types;
 		identifier_set_t integer_literal_defaults;
 		for (auto &it : function->default_parameters) {
 			auto &param_name = it.first;
 			auto &param_expr = it.second;
-			if (function->type == MacroType::LANGUAGE_PROCEDURE_MACRO) {
-				continue;
-			}
 
 			if (param_expr->GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
 				auto value = param_expr->Cast<ConstantExpression>().GetLiteral().ToValue();
@@ -582,6 +580,12 @@ SchemaCatalogEntry &Binder::BindCreateFunctionInfo(CreateInfo &info) {
 			ConstantBinder binder(*this, context, StringUtil::Format("Default value for parameter %s", param_name));
 			auto default_expr = param_expr->Copy();
 			auto bound_default = binder.Bind(default_expr);
+			if (function->type == MacroType::LANGUAGE_PROCEDURE_MACRO) {
+				// the default stays an unevaluated expression: every CALL expands anew and evaluates it like an
+				// argument, so a volatile default draws per call; binding still pins its type for validation
+				default_types[param_name] = bound_default->GetReturnType();
+				continue;
+			}
 			if (!bound_default->IsFoldable()) {
 				auto msg = StringUtil::Format("Default value '%s' for parameter %s is not a constant expression.",
 				                              param_expr->ToString(), param_name);
@@ -643,6 +647,14 @@ SchemaCatalogEntry &Binder::BindCreateFunctionInfo(CreateInfo &info) {
 					    function->default_parameters[param_name]->ToString(), param_name, type.ToString());
 					throw BinderException(msg + " Please add an explicit type cast.");
 				}
+			}
+			auto type_it = default_types.find(param_name);
+			if (type_it != default_types.end() &&
+			    CastFunctionSet::ImplicitCastCost(context, type_it->second, type) < 0) {
+				auto msg = StringUtil::Format("Default value '%s' for parameter %s cannot be implicitly cast to '%s'.",
+				                              function->default_parameters[param_name]->ToString(), param_name,
+				                              type.ToString());
+				throw BinderException(msg + " Please add an explicit type cast.");
 			}
 		}
 

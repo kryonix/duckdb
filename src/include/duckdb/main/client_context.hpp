@@ -398,6 +398,8 @@ private:
 	                                                        shared_ptr<PreparedStatementData> statement_data_p,
 	                                                        const QueryParameters &parameters);
 	void CheckIfPreparedStatementIsExecutable(PreparedStatementData &statement);
+	//! Verifies a statement of a procedure CALL expansion against the procedure's declared result schema
+	void VerifyCallResultSchema(PreparedStatementData &statement_data);
 
 	//! Internally prepare a SQL statement. Caller must hold the context_lock.
 	shared_ptr<PreparedStatementData> CreatePreparedStatement(ClientContextLock &lock,
